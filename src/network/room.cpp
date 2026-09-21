@@ -98,7 +98,7 @@ public:
      */
     void HandleModGetBanListPacket(const ENetEvent* event);
 	
-	void HandleAzaharPlusPecificPacket(const ENetEvent* event);
+	void HandleTangeloPecificPacket(const ENetEvent* event);
 
     /**
      * Returns whether the nickname is valid, ie. isn't already taken by someone else in the room.
@@ -288,8 +288,8 @@ void Room::RoomImpl::ServerLoop() {
                 case IdModGetBanList:
                     HandleModGetBanListPacket(&event);
                     break;
-                case idAzaharPlusSpecific:
-                    HandleAzaharPlusPecificPacket(&event);
+                case idTangeloSpecific:
+                    HandleTangeloPecificPacket(&event);
                     break;
                 }
                 enet_packet_destroy(event.packet);
@@ -584,9 +584,9 @@ void Room::RoomImpl::HandleModGetBanListPacket(const ENetEvent* event) {
     SendModBanListResponse(event->peer);
 }
 
-void Room::RoomImpl::HandleAzaharPlusPecificPacket(const ENetEvent* event) {
-    // handle azaharplus packet
-	LOG_ERROR(Network, "HandleAzaharPlusPecificPacket");
+void Room::RoomImpl::HandleTangeloPecificPacket(const ENetEvent* event) {
+    // handle tangelo packet
+	LOG_ERROR(Network, "HandleTangeloPecificPacket");
 	
 	Packet packet;
     packet.Append(event->packet->data, event->packet->dataLength);
@@ -694,9 +694,9 @@ bool Room::RoomImpl::HasModPermission(const ENetPeer* client) const {
 
 void Room::RoomImpl::SendZipPassAnnounce(ENetPeer* client) {
     Packet packet;
-    packet << static_cast<u8>(idAzaharPlusSpecific);
+    packet << static_cast<u8>(idTangeloSpecific);
     packet << static_cast<u8>(IdZipPassAnnounce);
-    packet << static_cast<u32>(azaharplus_network_version);
+    packet << static_cast<u32>(tangelo_network_version);
 
     ENetPacket* enet_packet =
         enet_packet_create(packet.GetData(), packet.GetDataSize(), ENET_PACKET_FLAG_RELIABLE);
@@ -706,7 +706,7 @@ void Room::RoomImpl::SendZipPassAnnounce(ENetPeer* client) {
 
 void Room::RoomImpl::SendZipPassDownload(ENetPeer* client, std::string nickname, char* data, int dataSize) {
 	Packet packet;
-	packet << static_cast<u8>(idAzaharPlusSpecific);
+	packet << static_cast<u8>(idTangeloSpecific);
 	packet << static_cast<u8>(IdZipPassDownload);
 	packet << static_cast<u32>(nickname.length());
 	packet.Append(nickname.data(), nickname.length());

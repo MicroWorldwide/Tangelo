@@ -257,7 +257,7 @@ private slots:
     void OnMenuSetUpSystemFiles();
     void OnMenuInstallCIA();
     void OnMenuConnectArticBase();
-    void OnMenuRemoveAzaharEncryption();
+    void OnMenuRemoveTangeloEncryption();
     void OnMenuRevertEncryptionRemoval();
 	void OnMenuLibzipLicence();
     void OnDownloadSystemFilesMenu(u32 region);
@@ -316,7 +316,7 @@ private slots:
     void OnStopVideoDumping();
     void OnCoreError(Core::System::ResultStatus, std::string);
     bool ShowExceptionDialog(Core::System::ResultStatus result, const std::string& details);
-    /// Called whenever a user selects Help->About Azahar
+    /// Called whenever a user selects Help->About Tangelo
     void OnMenuAboutCitra();
 
     void OnLanguageChanged(const QString& locale);

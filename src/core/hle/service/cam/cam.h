@@ -346,6 +346,96 @@ public:
         void SetTrimming(Kernel::HLERequestContext& ctx);
 
         /**
+         * Enables or disables the noise filter.
+         *  Inputs:
+         *      0: 0x00280080
+         *      1: u8 selected camera
+         *      2: u8 bool Enable noise filter if true
+         *  Outputs:
+         *      0: 0x00280040
+         *      1: Result
+         */
+        void SetNoiseFilter(Kernel::HLERequestContext& ctx);
+
+        /**
+         * Enables or disables auto exposure.
+         *  Inputs:
+         *      0: 0x00190080
+         *      1: u8 selected camera
+         *      2: u8 bool Enable auto exposure if true
+         *  Outputs:
+         *      0: 0x00190040
+         *      1: Result
+         */
+        void SetAutoExposure(Kernel::HLERequestContext& ctx);
+
+        /**
+         * Enables or disables auto white balance.
+         *  Inputs:
+         *      0: 0x001B0080
+         *      1: u8 selected camera
+         *      2: u8 bool Enable auto white balance if true
+         *  Outputs:
+         *      0: 0x001B0040
+         *      1: Result
+         */
+        void SetAutoWhiteBalance(Kernel::HLERequestContext& ctx);
+
+        /**
+         * Sets the region to base auto exposure off of for the specified camera.
+         *  Inputs:
+         *      0: 0x00260140
+         *      1: u8 selected camera
+         *      2: s16 X of the region
+         *      3: s16 Y of the region
+         *      4: s16 Width of the region
+         *      5: s16 Height of the region
+         *  Outputs:
+         *      0: 0x00260040
+         *      1: Result
+         */
+        void SetAutoExposureWindow(Kernel::HLERequestContext& ctx);
+
+        /**
+         * Sets the region to base auto white balance off of for the specified camera.
+         *  Inputs:
+         *      0: 0x00270140
+         *      1: u8 selected camera
+         *      2: s16 X of the region
+         *      3: s16 Y of the region
+         *      4: s16 Width of the region
+         *      5: s16 Height of the region
+         *  Outputs:
+         *      0: 0x00270040
+         *      1: Result
+         */
+        void SetAutoWhiteBalanceWindow(Kernel::HLERequestContext& ctx);
+
+        /**
+         * Gets whether auto exposure is enabled.
+         *  Inputs:
+         *      0: 0x001A0040
+         *      1: u8 selected camera
+         *  Outputs:
+         *      0: 0x001A0080
+         *      1: Result
+         *      2: u8 bool Enable auto exposure if true
+         */
+        void IsAutoExposure(Kernel::HLERequestContext& ctx);
+
+        /**
+         * Gets whether auto white balance is enabled.
+         *  Inputs:
+         *      0: 0x001C0040
+         *      1: u8 selected camera
+         *  Outputs:
+         *      0: 0x001C0080
+         *      1: Result
+         *      2: u8 bool Enable auto white balance if true
+         */
+        void IsAutoWhiteBalance(Kernel::HLERequestContext& ctx);
+
+        /**
          * Gets whether trimming is enabled.
          *  Inputs:
          *      0: 0x000F0040
@@ -677,6 +767,27 @@ private:
         std::array<ContextConfig, 2> contexts;
         int current_context{0};
         FrameRate frame_rate{FrameRate::Rate_15};
+        // These don't affect any current camera backend's actual output (there's no real
+        // sensor for a still-image/blank/system-webcam source to apply them to), but real
+        // hardware returns success and remembers the setting, so we do too rather than leave
+        // these as unimplemented no-ops - see PR description for the games this was observed
+        // affecting.
+        bool noise_filter{false};
+        bool auto_exposure{true};
+        bool auto_white_balance{true};
+        // Metering/white-balance region, real signature confirmed against libctru's own
+        // CAMU_SetAutoExposureWindow/CAMU_SetAutoWhiteBalanceWindow (s16 x, y, width, height) -
+        // stored verbatim for the same "no backend reads it, but remember what was set" reason
+        // as the flags above. Zero-initialized rather than defaulting to "whole frame", since
+        // no real capture path here would need to derive an actual frame size from this anyway.
+        s16 auto_exposure_window_x{0};
+        s16 auto_exposure_window_y{0};
+        s16 auto_exposure_window_width{0};
+        s16 auto_exposure_window_height{0};
+        s16 auto_white_balance_window_x{0};
+        s16 auto_white_balance_window_y{0};
+        s16 auto_white_balance_window_width{0};
+        s16 auto_white_balance_window_height{0};
 
     private:
         template <class Archive>
@@ -684,6 +795,21 @@ private:
             ar & contexts;
             ar & current_context;
             ar & frame_rate;
+            if (file_version >= 2) {
+                ar & noise_filter;
+                ar & auto_exposure;
+                ar & auto_white_balance;
+            }
+            if (file_version >= 3) {
+                ar & auto_exposure_window_x;
+                ar & auto_exposure_window_y;
+                ar & auto_exposure_window_width;
+                ar & auto_exposure_window_height;
+                ar & auto_white_balance_window_x;
+                ar & auto_white_balance_window_y;
+                ar & auto_white_balance_window_width;
+                ar & auto_white_balance_window_height;
+            }
         }
         friend class boost::serialization::access;
     };
@@ -772,4 +898,4 @@ void InstallInterfaces(Core::System& system);
 
 SERVICE_CONSTRUCT(Service::CAM::Module)
 BOOST_CLASS_VERSION(Service::CAM::Module, 1)
-BOOST_CLASS_VERSION(Service::CAM::Module::CameraConfig, 1)
+BOOST_CLASS_VERSION(Service::CAM::Module::CameraConfig, 3)

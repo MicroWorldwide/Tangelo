@@ -597,7 +597,7 @@ static constexpr retro_core_option_v2_definition option_definitions[] = {
         config::category::storage,
         {
             { "LibRetro Default", "LibRetro Default" },
-            { "Azahar Default", "Azahar Default" },
+            { "Tangelo Default", "Tangelo Default" },
             { nullptr, nullptr }
         },
         "LibRetro Default"
@@ -1064,11 +1064,11 @@ static void ParseStorageOptions(void) {
             if (!target_dir.ends_with("/"))
                 target_dir += "/";
 
-            target_dir += "Azahar/";
+            target_dir += "Tangelo/";
 
             // Ensure that this new dir exists
             if (!FileUtil::CreateDir(target_dir)) {
-                LOG_ERROR(Frontend, "Failed to create \"{}\". Using Azahar's default paths.",
+                LOG_ERROR(Frontend, "Failed to create \"{}\". Using Tangelo's default paths.",
                           target_dir);
             } else {
                 FileUtil::SetUserPath(target_dir);

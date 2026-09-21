@@ -130,7 +130,7 @@ public:
      */
     void HandleModBanListResponsePacket(const ENetEvent* event);
 	
-	void HandleAzaharPlusPecificPacket(const ENetEvent* event);
+	void HandleTangeloPecificPacket(const ENetEvent* event);
 
     /**
      * Disconnects the RoomMember from the Room
@@ -239,8 +239,8 @@ void RoomMember::RoomMemberImpl::MemberLoop() {
                 case IdModNoSuchUser:
                     SetError(Error::NoSuchUser);
                     break;
-                case idAzaharPlusSpecific:
-                    HandleAzaharPlusPecificPacket(&event);
+                case idTangeloSpecific:
+                    HandleTangeloPecificPacket(&event);
                     break;
                 }
                 enet_packet_destroy(event.packet);
@@ -422,9 +422,9 @@ void RoomMember::RoomMemberImpl::HandleModBanListResponsePacket(const ENetEvent*
     Invoke<Room::BanList>(ban_list);
 }
 
-void RoomMember::RoomMemberImpl::HandleAzaharPlusPecificPacket(const ENetEvent* event) {
-    // handle azaharplus packet
-	LOG_ERROR(Network, "HandleAzaharPlusPecificPacket");
+void RoomMember::RoomMemberImpl::HandleTangeloPecificPacket(const ENetEvent* event) {
+    // handle tangelo packet
+	LOG_ERROR(Network, "HandleTangeloPecificPacket");
 	
 	Packet packet;
     packet.Append(event->packet->data, event->packet->dataLength);
@@ -465,9 +465,9 @@ void RoomMember::RoomMemberImpl::HandleAzaharPlusPecificPacket(const ENetEvent* 
 				
 				if(tocopy > 0 && tocopy < 1000000) {
 					Packet packet;
-					packet << static_cast<u8>(idAzaharPlusSpecific);
+					packet << static_cast<u8>(idTangeloSpecific);
 					packet << static_cast<u8>(IdZipPassUpload);
-					packet << static_cast<u32>(azaharplus_network_version);
+					packet << static_cast<u32>(tangelo_network_version);
 					packet << static_cast<u32>(tocopy);
 					packet.Append(buffer, tocopy);
 					Send(std::move(packet));

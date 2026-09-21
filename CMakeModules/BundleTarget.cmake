@@ -118,7 +118,7 @@ if (BUNDLE_TARGET_EXECUTE)
         endif()
 
         # Set up app icon
-        file(COPY_FILE "${source_path}/dist/azahar.svg" "${CMAKE_BINARY_DIR}/dist/org.azahar_emu.Azahar.svg")
+        file(COPY_FILE "${source_path}/dist/tangelo.svg" "${CMAKE_BINARY_DIR}/dist/io.github.microworldwide.tangelo.svg")
 
         message(STATUS "Creating AppDir for executable ${executable_path}")
         execute_process(COMMAND ${CMAKE_COMMAND} -E env

@@ -377,7 +377,7 @@ void Apploader_Artic::EnsureClientConnected() {
         if (*reinterpret_cast<u32*>(ret_buf->first) != SETUP_TOOL_VERSION) {
             system.SetStatus(Core::System::ResultStatus::ErrorArticDisconnected,
                              "\nIncompatible Artic Setup Tool version.\nCheck for Artic Setup Tool "
-                             "or Azahar updates.");
+                             "or Tangelo updates.");
             client_connected = false;
             client->Stop();
         } else {

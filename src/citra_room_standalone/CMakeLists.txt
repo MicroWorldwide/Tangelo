@@ -2,7 +2,7 @@ add_executable(citra_room_standalone
     citra_room_standalone.cpp
 )
 
-set_target_properties(citra_room_standalone PROPERTIES OUTPUT_NAME "azahar-room")
+set_target_properties(citra_room_standalone PROPERTIES OUTPUT_NAME "tangelo-room")
 
 if (BSD STREQUAL "NetBSD")
     include(DisablePaxMprotect)

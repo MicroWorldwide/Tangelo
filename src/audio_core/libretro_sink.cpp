@@ -16,7 +16,7 @@ unsigned int LibRetroSink::GetNativeSampleRate() const {
 }
 
 void LibRetroSink::PushSamples(const void* data, std::size_t num_samples) {
-    // libretro calls stereo pairs "frames", Azahar calls them "samples"
+    // libretro calls stereo pairs "frames", Tangelo calls them "samples"
     LibRetro::SubmitAudio(static_cast<const s16*>(data), num_samples);
 }
 

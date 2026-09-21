@@ -759,10 +759,10 @@ int RevertEncryptionRemoval()
 	return res;
 }
 
-int RemoveAzaharEncryption(const std::string& path)
+int RemoveTangeloEncryption(const std::string& path)
 {
 	int ret = 0;
-	LOG_ERROR(HW, "RemoveAzaharEncryption {}", path);
+	LOG_ERROR(HW, "RemoveTangeloEncryption {}", path);
 	
 	if(FileUtil::Exists(path + ".decrypted"))
 	{

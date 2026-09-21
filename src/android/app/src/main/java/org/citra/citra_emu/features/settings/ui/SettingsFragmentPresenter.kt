@@ -476,7 +476,7 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView) 
                     R.string.username,
                     0,
                     null,
-                    "AzaharPlus",
+                    "Tangelo",
                     10
                 )
             )

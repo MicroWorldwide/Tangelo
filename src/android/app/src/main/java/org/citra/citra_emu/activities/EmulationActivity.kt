@@ -96,7 +96,7 @@ class EmulationActivity : AppCompatActivity() {
 
     private fun ensureUserDirectoryReady(): Boolean {
         if (DirectoryInitialization.areCitraDirectoriesReady()) return true
-        CitraDirectoryUtils.attemptAutomaticUpdateDirectory() // Lime3DS -> Azahar
+        CitraDirectoryUtils.attemptAutomaticUpdateDirectory() // Lime3DS -> Tangelo
         if (CitraDirectoryUtils.needToUpdateManually()) return false
         if (!PermissionsHandler.hasWriteAccess(applicationContext)) return false
         return DirectoryInitialization.start() ==

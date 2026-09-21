@@ -51,7 +51,7 @@ static std::optional<std::string> GetResponse(std::string url, std::string path)
 
 std::optional<std::string> UpdateChecker::GetLatestRelease(bool include_prereleases) {
     constexpr auto update_check_url = "http://api.github.com";
-    std::string update_check_path = "/repos/azahar-emu/azahar";
+    std::string update_check_path = "/repos/MicroWorldwide/Tangelo";
     try {
         if (include_prereleases) { // This can return either a prerelease or a stable release,
                                    // whichever is more recent.

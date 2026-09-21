@@ -231,7 +231,7 @@ class SettingsActivity :
             CitraApplication.documentsTree.setRoot(Uri.parse(DirectoryInitialization.userPath))
             NativeLibrary.createConfigFile()
         } else {
-            throw IllegalStateException("Azahar directory unavailable when accessing config file!")
+            throw IllegalStateException("Tangelo directory unavailable when accessing config file!")
         }
 
         // Set default values for system config file

@@ -51,7 +51,7 @@ void CubebInput::StartSampling(const InputParameters& params) {
     parameters = params;
     impl->sample_size_in_bytes = params.sample_size / 8;
 
-    auto init_result = cubeb_init(&impl->ctx, "Azahar Input", nullptr);
+    auto init_result = cubeb_init(&impl->ctx, "Tangelo Input", nullptr);
     if (init_result != CUBEB_OK) {
         LOG_CRITICAL(Audio, "cubeb_init failed: {}", init_result);
         return;
@@ -92,7 +92,7 @@ void CubebInput::StartSampling(const InputParameters& params) {
     }
 
     auto stream_init_result = cubeb_stream_init(
-        impl->ctx, &impl->stream, "Azahar Microphone", input_device, &input_params, nullptr,
+        impl->ctx, &impl->stream, "Tangelo Microphone", input_device, &input_params, nullptr,
         nullptr, latency_frames, Impl::DataCallback, Impl::StateCallback, impl.get());
     if (stream_init_result != CUBEB_OK) {
         LOG_CRITICAL(Audio, "cubeb_stream_init failed: {}", stream_init_result);
@@ -185,7 +185,7 @@ std::vector<std::string> ListCubebInputDevices() {
     std::vector<std::string> device_list;
     cubeb* ctx;
 
-    if (cubeb_init(&ctx, "Azahar Input Device Enumerator", nullptr) != CUBEB_OK) {
+    if (cubeb_init(&ctx, "Tangelo Input Device Enumerator", nullptr) != CUBEB_OK) {
         LOG_CRITICAL(Audio, "cubeb_init failed");
         return {};
     }

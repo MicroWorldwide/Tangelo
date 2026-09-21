@@ -12,11 +12,11 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string notr="true">Azahar</string>
+   <string notr="true">Tangelo</string>
   </property>
   <property name="windowIcon">
    <iconset>
-    <normaloff>dist/azahar.png</normaloff>dist/azahar.png</iconset>
+    <normaloff>dist/tangelo.png</normaloff>dist/tangelo.png</iconset>
   </property>
   <property name="tabShape">
    <enum>QTabWidget::Rounded</enum>
@@ -141,7 +141,7 @@
     </widget>
     <widget class="QMenu" name="menu_Open_Folder">
      <property name="title">
-      <string>Open Azahar Folder</string>
+      <string>Open Tangelo Folder</string>
      </property>
      <addaction name="action_Open_Citra_Folder"/>
      <addaction name="action_Open_NAND_Folder"/>
@@ -151,7 +151,7 @@
     <addaction name="action_Install_CIA"/>
     <addaction name="action_Connect_Artic"/>
     <addaction name="separator"/>
-    <addaction name="action_Remove_Azahar_Encryption"/>
+    <addaction name="action_Remove_Tangelo_Encryption"/>
     <addaction name="action_Revert_Encryption_Removal"/>
     <addaction name="separator"/>
     <addaction name="menu_Download_System_Files"/>
@@ -335,9 +335,9 @@
       <string>Connect to Artic Base...</string>
     </property>
   </action>
-  <action name="action_Remove_Azahar_Encryption">
+  <action name="action_Remove_Tangelo_Encryption">
     <property name="text">
-      <string>Remove Azahar Encryption</string>
+      <string>Remove Tangelo Encryption</string>
     </property>
   </action>
   <action name="action_Revert_Encryption_Removal">
@@ -469,7 +469,7 @@
   </action>
   <action name="action_About">
    <property name="text">
-    <string>About Azahar</string>
+    <string>About Tangelo</string>
    </property>
    <property name="menuRole">
     <enum>QAction::AboutRole</enum>
@@ -701,7 +701,7 @@
     <string>Open Log Folder</string>
    </property>
    <property name="toolTip">
-    <string>Opens the Azahar Log folder</string>
+    <string>Opens the Tangelo Log folder</string>
    </property>
   </action>
   <action name="action_Screen_Layout_Default">

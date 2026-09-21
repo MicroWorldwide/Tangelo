@@ -59,7 +59,7 @@ static void PrintHelp(const char* argv0) {
 }
 
 static void PrintVersion() {
-    std::cout << "Azahar dedicated room " << Common::g_scm_branch << " " << Common::g_scm_desc
+    std::cout << "Tangelo dedicated room " << Common::g_scm_branch << " " << Common::g_scm_desc
               << " Libnetwork: " << Network::network_version << std::endl;
 }
 

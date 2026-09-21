@@ -1,13 +1,13 @@
 # This Dockerfile assumes that it is being built from the project root directory, e.g.:
-# $ docker build -f docker/azahar-room/Dockerfile -t azahar-room .
+# $ docker build -f docker/tangelo-room/Dockerfile -t tangelo-room .
 
 # --- Builder ----------------
 FROM opensauce04/azahar-build-environment:latest AS builder
 
-COPY . /var/azahar-src
+COPY . /var/tangelo-src
 
 RUN mkdir builddir && cd builddir && \
-    cmake /var/azahar-src -G Ninja \
+    cmake /var/tangelo-src -G Ninja \
                           -DENABLE_QT=OFF \
                           -DENABLE_GDBSTUB=OFF \
                           -DENABLE_TESTS=OFF \
@@ -20,7 +20,7 @@ RUN mkdir builddir && cd builddir && \
                           -DENABLE_CUBEB=OFF \
                           -DENABLE_OPENAL=OFF && \
     ninja && \
-    mv bin/Release/azahar-room /usr/local/bin/ && \
+    mv bin/Release/tangelo-room /usr/local/bin/ && \
     cd .. && rm -rf builddir
 
 # --- Final ------------------
@@ -29,4 +29,4 @@ FROM debian:trixie AS final
 RUN apt-get update && apt-get -y full-upgrade
 RUN apt-get install -y iputils-ping net-tools
 
-COPY --from=builder /usr/local/bin/azahar-room /usr/local/bin/azahar-room
+COPY --from=builder /usr/local/bin/tangelo-room /usr/local/bin/tangelo-room

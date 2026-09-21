@@ -293,7 +293,7 @@ void retro_run() {
 
             switch (result) {
             case Core::System::ResultStatus::ErrorSystemFiles:
-                msg = "Azahar was unable to locate a 3DS system archive: " + errorContent;
+                msg = "Tangelo was unable to locate a 3DS system archive: " + errorContent;
                 break;
             default:
                 msg = "Fatal Error encountered (" + std::to_string(static_cast<int>(result)) +
@@ -383,7 +383,7 @@ static bool do_load_game() {
         return false;
     case Core::System::ResultStatus::ErrorLoader_ErrorEncrypted:
         LibRetro::DisplayMessage("The game that you are trying to load must be decrypted before "
-                                 "being used with Azahar.");
+                                 "being used with Tangelo.");
         return false;
     case Core::System::ResultStatus::ErrorLoader_ErrorInvalidFormat:
         LibRetro::DisplayMessage("Error while loading ROM: The ROM format is not supported.");
@@ -501,7 +501,7 @@ void retro_reset() {
  * libretro callback; Called when a game is to be loaded.
  */
 bool retro_load_game(const struct retro_game_info* info) {
-    LOG_INFO(Frontend, "Starting Azahar RetroArch game...");
+    LOG_INFO(Frontend, "Starting Tangelo RetroArch game...");
 
 #if CITRA_ARCH(x86_64) && CITRA_HAS_SSE42
     if (!Common::GetCPUCaps().sse4_2) {
@@ -514,7 +514,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 
     UpdateSettings();
 
-    // If using HW rendering, don't actually load the game here. azahar wants
+    // If using HW rendering, don't actually load the game here. tangelo wants
     // the graphics context ready and available before calling System::Load.
     LibRetro::settings.file_path = info->path;
 
@@ -534,7 +534,7 @@ bool retro_load_game(const struct retro_game_info* info) {
             switch (result) {
             case Loader::ResultStatus::ErrorEncrypted:
                 LibRetro::DisplayMessage(
-                    "This ROM is encrypted and must be decrypted before use with Azahar.");
+                    "This ROM is encrypted and must be decrypted before use with Tangelo.");
                 break;
             case Loader::ResultStatus::ErrorInvalidFormat:
                 LibRetro::DisplayMessage("The ROM format is not supported.");

@@ -138,7 +138,7 @@ object NetPlayManager {
         val prefs = PreferenceManager.getDefaultSharedPreferences(activity)
         var name = NativeLibrary.getSystemUsername()
         if (name.isEmpty()) {
-            name = "AzaharPlus${(Math.random() * 100).toInt()}"
+            name = "Tangelo${(Math.random() * 100).toInt()}"
         }
         return prefs.getString("NetPlayUsername", name) ?: name
     }

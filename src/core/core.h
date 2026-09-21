@@ -106,7 +106,7 @@ public:
         ErrorArticDisconnected,               ///< Error when artic base disconnects
         ErrorN3DSApplication,        ///< Error launching New 3DS application in Old 3DS mode
         ErrorCoreExceptionRaised,    ///< The CPU emulation raised an exception
-        ErrorSavestateBuildMismatch, ///< Tried to load savestate from a different Azahar version
+        ErrorSavestateBuildMismatch, ///< Tried to load savestate from a different Tangelo version
         ShutdownRequested,           ///< Emulated program requested a system shutdown
         ErrorUnknown                 ///< Any other error
     };

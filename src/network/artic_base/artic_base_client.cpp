@@ -293,7 +293,7 @@ bool Client::Connect() {
             closesocket(main_socket);
             LOG_ERROR(Network, "Incompatible server version: {}", version_value);
             SignalCommunicationError("\nIncompatible Artic Server version.\nCheck for updates "
-                                     "to the Artic Server or Azahar.");
+                                     "to the Artic Server or Tangelo.");
             return false;
         }
     } else {

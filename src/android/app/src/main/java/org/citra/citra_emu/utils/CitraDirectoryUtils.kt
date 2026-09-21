@@ -30,13 +30,13 @@ object CitraDirectoryUtils {
             return
         }
         if (directoryString == "" && limeDirectoryString != "") {
-            // Upgrade from Lime3DS to Azahar
+            // Upgrade from Lime3DS to Tangelo
             PermissionsHandler.setCitraDirectory(limeDirectoryString)
             removeLimeDirectoryPreference()
             DirectoryInitialization.resetCitraDirectoryState()
             DirectoryInitialization.start()
         } else if (directoryString != "" && directoryString == limeDirectoryString) {
-            // Both the Lime3DS and Azahar directories are the same,
+            // Both the Lime3DS and Tangelo directories are the same,
             // so delete the obsolete Lime3DS value.
             removeLimeDirectoryPreference()
         }

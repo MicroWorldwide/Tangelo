@@ -181,6 +181,6 @@ bool IsFullConsoleLinked();
 void UnlinkConsole();
 
 std::vector<std::string> GetAppFilepaths();
-int RemoveAzaharEncryption(const std::string& path);
+int RemoveTangeloEncryption(const std::string& path);
 int RevertEncryptionRemoval();
 } // namespace HW::UniqueData

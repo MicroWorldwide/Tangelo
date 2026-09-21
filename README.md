@@ -1,7 +1,7 @@
-<b>AzaharPlus</b> is a fork of the Azahar 3DS emulator with extra features.
+<b>Tangelo</b> is a 3DS emulator built upon the Citra and Azahar emulator projects.
 
-Each version is the same as the corresponding version of Azahar exept for this:
-- Compatibility with all game files. If a file works with any Citra fork, it works with AzaharPlus.
+Features:
+- Compatibility with all game files. If a file works with any Citra fork, it works with Tangelo.
 - Ability to download system files from official servers. No need for an actual 3DS.
 - Compatibility with older CPUs (no SSE4.2 required)
 - Compatibility with Android 9
@@ -10,37 +10,35 @@ Each version is the same as the corresponding version of Azahar exept for this:
 - Amiibo generation
 - Better multiplayer compatibility with other Citra forks
 
-The Azahar logo is the property of PabloMK7 and angyartanddraw
+Copyright © 2026 Tangelo Emulator Project.
+
 ---
 
-![Azahar Emulator](https://azahar-emu.org/resources/images/logo/azahar-name-and-logo.svg)
-![Plus](https://cdn-icons-png.flaticon.com/128/226/226974.png)
+![Tangelo](dist/tangelo.svg)
 
-![GitHub Release](https://img.shields.io/github/v/release/AzaharPlus/AzaharPlus?label=Current%20Release)
-![GitHub Downloads](https://img.shields.io/github/downloads/AzaharPlus/AzaharPlus/total?logo=github&label=GitHub%20Downloads)
+![GitHub Release](https://img.shields.io/github/v/release/MicroWorldwide/Tangelo?label=Current%20Release)
+![GitHub Downloads](https://img.shields.io/github/downloads/MicroWorldwide/Tangelo/total?logo=github&label=GitHub%20Downloads)
 
 # Installation
 
-Download the latest release from [Releases](https://github.com/AzaharPlus/AzaharPlus/releases).
+Download the latest release from [Releases](https://github.com/MicroWorldwide/Tangelo/releases).
 
 ### Android
 
-The Android build is available in 2 flavors.
-
-- Replace: It has the same application id as Azahar, so it will replace it on the device.
-Its display name is "AzaharPlus" and its icon background is blue.
-Use this one if you have other apps that target Azahar, like a frontend for example.
-
-- Coexist: It has a new application id so it can coexist with Azahar without issues.
-Its display name is "+AzaharPlus+" and its icon background is red.
+Tangelo has its own application ID (`io.github.microworldwide.tangelo`), so it installs and
+runs independently alongside any existing Azahar (or other Citra-fork) installation - no
+conflicts, no need to uninstall anything else first.
 
 ### Cocoon
 
-The easiest way to use AzaharPlus with Cocoon is to uninstall Azahar and install the replace variant of AzaharPlus. It wiil be seen as Azahar by Cocoon.
+Cocoon currently targets Azahar by name/application ID; since Tangelo now has its own distinct
+ID, it will not be recognized as Azahar by Cocoon. Check with that project for Tangelo-specific
+support.
 
 ### Batocera
 
-To use AzaharPlus with Batocera you can install the Batocera Unofficial Add-ons
+Third-party frontends like Batocera's unofficial add-ons currently target Azahar by name; check
+with that project for Tangelo-specific support:
 
  https://github.com/batocera-unofficial-addons/batocera-unofficial-addons
 
@@ -55,15 +53,14 @@ On desktop it is in File > ZipPass. On android it is in the main menu.
 - The export feature will save the StreetPass data of all your games in a xxx.pass.zip file.
 - The import feature lets you pick one or several xxx.pass.zip files and will simulate StreetPass tags.
 - You can pick as many files as you want for the import but every game has a limit for its queue and anything - beyond that will be ignored.
-- This is all pretty experimental so in case of issues, I added a menu to disable StreetPass on every game. You won't lose anything, you will simply need to enable StreetPass again.
-- I opened a topic on the github for people to share their data: [ZipPass Exchange](https://github.com/AzaharPlus/AzaharPlus/discussions/117)
+- This is all pretty experimental so in case of issues, there's a menu to disable StreetPass on every game. You won't lose anything, you will simply need to enable StreetPass again.
 
 # Build instructions
 
-Please refer this repository's [wiki](https://github.com/AzaharPlus/AzaharPlus/wiki/Building-From-Source) for build instructions
+Please refer this repository's [wiki](https://github.com/MicroWorldwide/Tangelo/wiki/Building-From-Source) for build instructions
 
 # Minimum requirements
-Below are the minimum requirements to run AzaharPlus:
+Below are the minimum requirements to run Tangelo:
 
 ### Desktop
 ```
@@ -81,5 +78,4 @@ Memory: 2GB of RAM. 4GB is recommended
 ```
 
 # Where to find this project
-- Github: https://github.com/AzaharPlus/AzaharPlus
-- Radicle: [rad:z3A98CGFJYqHnttims4N7jYNzRoDu](https://radicle.network/nodes/rosa.radicle.network/rad%3Az3A98CGFJYqHnttims4N7jYNzRoDu)
+- Github: https://github.com/MicroWorldwide/Tangelo

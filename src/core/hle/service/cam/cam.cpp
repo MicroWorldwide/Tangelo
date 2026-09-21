@@ -582,6 +582,154 @@ void Module::Interface::SetTrimming(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_CAM, "called, port_select={}, trim={}", port_select.m_val, trim);
 }
 
+void Module::Interface::SetNoiseFilter(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const CameraSet camera_select(rp.Pop<u8>());
+    const bool noise_filter = rp.Pop<bool>();
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    if (camera_select.IsValid()) {
+        for (int index : camera_select) {
+            cam->cameras[index].noise_filter = noise_filter;
+        }
+        rb.Push(ResultSuccess);
+    } else {
+        LOG_ERROR(Service_CAM, "invalid camera_select={}", camera_select.m_val);
+        rb.Push(ResultInvalidEnumValue);
+    }
+
+    LOG_DEBUG(Service_CAM, "called, camera_select={}, noise_filter={}", camera_select.m_val,
+              noise_filter);
+}
+
+void Module::Interface::SetAutoExposure(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const CameraSet camera_select(rp.Pop<u8>());
+    const bool auto_exposure = rp.Pop<bool>();
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    if (camera_select.IsValid()) {
+        for (int index : camera_select) {
+            cam->cameras[index].auto_exposure = auto_exposure;
+        }
+        rb.Push(ResultSuccess);
+    } else {
+        LOG_ERROR(Service_CAM, "invalid camera_select={}", camera_select.m_val);
+        rb.Push(ResultInvalidEnumValue);
+    }
+
+    LOG_DEBUG(Service_CAM, "called, camera_select={}, auto_exposure={}", camera_select.m_val,
+              auto_exposure);
+}
+
+void Module::Interface::SetAutoWhiteBalance(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const CameraSet camera_select(rp.Pop<u8>());
+    const bool auto_white_balance = rp.Pop<bool>();
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    if (camera_select.IsValid()) {
+        for (int index : camera_select) {
+            cam->cameras[index].auto_white_balance = auto_white_balance;
+        }
+        rb.Push(ResultSuccess);
+    } else {
+        LOG_ERROR(Service_CAM, "invalid camera_select={}", camera_select.m_val);
+        rb.Push(ResultInvalidEnumValue);
+    }
+
+    LOG_DEBUG(Service_CAM, "called, camera_select={}, auto_white_balance={}", camera_select.m_val,
+              auto_white_balance);
+}
+
+void Module::Interface::SetAutoExposureWindow(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const CameraSet camera_select(rp.Pop<u8>());
+    const s16 x = static_cast<s16>(rp.Pop<u16>());
+    const s16 y = static_cast<s16>(rp.Pop<u16>());
+    const s16 width = static_cast<s16>(rp.Pop<u16>());
+    const s16 height = static_cast<s16>(rp.Pop<u16>());
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    if (camera_select.IsValid()) {
+        for (int index : camera_select) {
+            cam->cameras[index].auto_exposure_window_x = x;
+            cam->cameras[index].auto_exposure_window_y = y;
+            cam->cameras[index].auto_exposure_window_width = width;
+            cam->cameras[index].auto_exposure_window_height = height;
+        }
+        rb.Push(ResultSuccess);
+    } else {
+        LOG_ERROR(Service_CAM, "invalid camera_select={}", camera_select.m_val);
+        rb.Push(ResultInvalidEnumValue);
+    }
+
+    LOG_DEBUG(Service_CAM, "called, camera_select={}, x={}, y={}, width={}, height={}",
+              camera_select.m_val, x, y, width, height);
+}
+
+void Module::Interface::SetAutoWhiteBalanceWindow(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const CameraSet camera_select(rp.Pop<u8>());
+    const s16 x = static_cast<s16>(rp.Pop<u16>());
+    const s16 y = static_cast<s16>(rp.Pop<u16>());
+    const s16 width = static_cast<s16>(rp.Pop<u16>());
+    const s16 height = static_cast<s16>(rp.Pop<u16>());
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    if (camera_select.IsValid()) {
+        for (int index : camera_select) {
+            cam->cameras[index].auto_white_balance_window_x = x;
+            cam->cameras[index].auto_white_balance_window_y = y;
+            cam->cameras[index].auto_white_balance_window_width = width;
+            cam->cameras[index].auto_white_balance_window_height = height;
+        }
+        rb.Push(ResultSuccess);
+    } else {
+        LOG_ERROR(Service_CAM, "invalid camera_select={}", camera_select.m_val);
+        rb.Push(ResultInvalidEnumValue);
+    }
+
+    LOG_DEBUG(Service_CAM, "called, camera_select={}, x={}, y={}, width={}, height={}",
+              camera_select.m_val, x, y, width, height);
+}
+
+void Module::Interface::IsAutoExposure(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const CameraSet camera_select(rp.Pop<u8>());
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+    if (camera_select.IsSingle()) {
+        int camera = *camera_select.begin();
+        rb.Push(ResultSuccess);
+        rb.Push(cam->cameras[camera].auto_exposure);
+    } else {
+        LOG_ERROR(Service_CAM, "invalid camera_select={}", camera_select.m_val);
+        rb.Push(ResultInvalidEnumValue);
+        rb.Skip(1, false);
+    }
+
+    LOG_DEBUG(Service_CAM, "called, camera_select={}", camera_select.m_val);
+}
+
+void Module::Interface::IsAutoWhiteBalance(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx);
+    const CameraSet camera_select(rp.Pop<u8>());
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+    if (camera_select.IsSingle()) {
+        int camera = *camera_select.begin();
+        rb.Push(ResultSuccess);
+        rb.Push(cam->cameras[camera].auto_white_balance);
+    } else {
+        LOG_ERROR(Service_CAM, "invalid camera_select={}", camera_select.m_val);
+        rb.Push(ResultInvalidEnumValue);
+        rb.Skip(1, false);
+    }
+
+    LOG_DEBUG(Service_CAM, "called, camera_select={}", camera_select.m_val);
+}
+
 void Module::Interface::IsTrimming(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx);
     const PortSet port_select(rp.Pop<u8>());

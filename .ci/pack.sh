@@ -3,14 +3,14 @@
 # Determine the full revision name.
 GITDATE="`git show -s --date=short --format='%ad' | sed 's/-//g'`"
 GITREV="`git show -s --format='%h'`"
-REV_NAME="azahar-$OS-$TARGET-$GITDATE-$GITREV"
+REV_NAME="tangelo-$OS-$TARGET-$GITDATE-$GITREV"
 
 # Determine the name of the release being built.
 if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-    RELEASE_NAME=azahar-$GITHUB_REF_NAME
-    REV_NAME="azahar-$OS-$TARGET-$GITHUB_REF_NAME"
+    RELEASE_NAME=tangelo-$GITHUB_REF_NAME
+    REV_NAME="tangelo-$OS-$TARGET-$GITHUB_REF_NAME"
 else
-    RELEASE_NAME=azahar-head
+    RELEASE_NAME=tangelo-head
 fi
 
 # Archive and upload the artifacts.

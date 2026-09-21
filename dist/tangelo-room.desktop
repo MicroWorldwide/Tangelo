@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Tangelo Room
+Comment=Multiplayer room host for Tangelo
+Icon=io.github.microworldwide.tangelo
+TryExec=tangelo-room
+Exec=tangelo-room %f
+Categories=Game;Emulator;
+Keywords=3DS;Nintendo
