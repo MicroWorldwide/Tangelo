@@ -30,7 +30,7 @@ jobs:
       matrix:
         target: ["appimage", "appimage-wayland", "fresh"]
     container:
-      image: opensauce04/azahar-build-environment:latest
+      image: opensauce04/tangelo-build-environment:latest
       options: -u 1001
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -59,7 +59,7 @@ jobs:
       - name: Rename AppImage
         if: ${{ matrix.target == 'appimage-wayland' }}
         run: |
-          mv artifacts/azahar.AppImage artifacts/azahar-wayland.AppImage
+          mv artifacts/tangelo.AppImage artifacts/tangelo-wayland.AppImage
       - name: Upload
         if: ${{ contains(matrix.target, 'appimage') }}
         uses: actions/upload-artifact@v4
