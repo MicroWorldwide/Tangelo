@@ -1,4 +1,0 @@
-ninja bundle
-strip -s bundle/*.exe
-cp ../externals/libzip/LICENSE ./bundle/libzip_license.txt
-mv ./bundle ./tangelo-VERSION-windows

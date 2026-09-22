@@ -30,7 +30,7 @@ jobs:
       matrix:
         target: ["appimage", "appimage-wayland", "fresh"]
     container:
-      image: opensauce04/tangelo-build-environment:latest
+      image: opensauce04/azahar-build-environment:latest
       options: -u 1001
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
