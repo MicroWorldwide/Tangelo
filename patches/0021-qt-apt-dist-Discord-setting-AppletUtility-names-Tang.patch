@@ -1,0 +1,211 @@
+From a743538a7bb6c35ff0c22ae58cf629f63852ccf6 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 01:27:32 +0200
+Subject: [PATCH] qt/apt/dist: Discord setting, AppletUtility names, Tangelo
+ icon file names
+
+- Network settings: the Discord checkbox was loaded under ENABLE_DISCORD_RPC
+  (never defined) but saved under USE_DISCORD_PRESENCE, so it always
+  showed unticked. Both now use USE_DISCORD_PRESENCE.
+- APT AppletUtility: the commands documented on 3dbrew (ClearPowerButtonState,
+  SleepIfShellClosed, LockTransition, TryLockTransition, UnlockTransition,
+  StartExitTask, ...) are logged by name at debug level instead of as a
+  stub warning around every applet launch. They need no emulation (the
+  lid is never closed, there is no transition locking). Unknown commands
+  still warn. Behaviour is unchanged.
+- The icon and manifest files already contain the Tangelo artwork; rename
+  azahar.ico / azahar.manifest / apple/azahar.icns to tangelo.* and update
+  the .rc files, the NSIS installer and the macOS bundle settings.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ dist/apple/{azahar.icns => tangelo.icns}      | Bin
+ dist/{azahar.ico => tangelo.ico}              | Bin
+ dist/{azahar.manifest => tangelo.manifest}    |   0
+ src/citra_meta/CMakeLists.txt                 |   4 +-
+ src/citra_meta/citra.rc                       |   4 +-
+ .../configuration/configure_network.cpp       |   2 +-
+ src/citra_room/citra_room.rc                  |   4 +-
+ src/core/hle/service/apt/apt.cpp              |  48 ++++++++++++++++--
+ src/installer/citra.nsi                       |   2 +-
+ 9 files changed, 52 insertions(+), 12 deletions(-)
+ rename dist/apple/{azahar.icns => tangelo.icns} (100%)
+ rename dist/{azahar.ico => tangelo.ico} (100%)
+ rename dist/{azahar.manifest => tangelo.manifest} (100%)
+
+diff --git a/dist/apple/azahar.icns b/dist/apple/tangelo.icns
+similarity index 100%
+rename from dist/apple/azahar.icns
+rename to dist/apple/tangelo.icns
+diff --git a/dist/azahar.ico b/dist/tangelo.ico
+similarity index 100%
+rename from dist/azahar.ico
+rename to dist/tangelo.ico
+diff --git a/dist/azahar.manifest b/dist/tangelo.manifest
+similarity index 100%
+rename from dist/azahar.manifest
+rename to dist/tangelo.manifest
+diff --git a/src/citra_meta/CMakeLists.txt b/src/citra_meta/CMakeLists.txt
+index 554b43c..d0f4d96 100644
+--- a/src/citra_meta/CMakeLists.txt
++++ b/src/citra_meta/CMakeLists.txt
+@@ -14,7 +14,7 @@ endif()
+ if (APPLE)
+     set(DIST_DIR "../../dist/apple")
+     set(APPLE_RESOURCES
+-        "${DIST_DIR}/azahar.icns"
++        "${DIST_DIR}/tangelo.icns"
+         "${DIST_DIR}/LaunchScreen.storyboard"
+         "${DIST_DIR}/launch_logo.png"
+     )
+@@ -32,7 +32,7 @@ if (APPLE)
+         MACOSX_BUNDLE_BUNDLE_VERSION "${BUILD_VERSION}"
+         MACOSX_BUNDLE_SHORT_VERSION_STRING "${BUILD_FULLNAME}"
+         MACOSX_BUNDLE_LONG_VERSION_STRING "${BUILD_FULLNAME}"
+-        MACOSX_BUNDLE_ICON_FILE "azahar.icns"
++        MACOSX_BUNDLE_ICON_FILE "tangelo.icns"
+         RESOURCE "${APPLE_RESOURCES}"
+     )
+ 
+diff --git a/src/citra_meta/citra.rc b/src/citra_meta/citra.rc
+index 04be4ca..77b3bbf 100644
+--- a/src/citra_meta/citra.rc
++++ b/src/citra_meta/citra.rc
+@@ -8,7 +8,7 @@
+ // remains consistent on all systems.
+ // QT requires that the default application icon is named IDI_ICON1
+ 
+-IDI_ICON1               ICON                    "../../dist/azahar.ico"
++IDI_ICON1               ICON                    "../../dist/tangelo.ico"
+ 
+ 
+ /////////////////////////////////////////////////////////////////////////////
+@@ -16,4 +16,4 @@ IDI_ICON1               ICON                    "../../dist/azahar.ico"
+ // RT_MANIFEST
+ //
+ 
+-0                       RT_MANIFEST             "../../dist/azahar.manifest"
++0                       RT_MANIFEST             "../../dist/tangelo.manifest"
+diff --git a/src/citra_qt/configuration/configure_network.cpp b/src/citra_qt/configuration/configure_network.cpp
+index 8782eb1..eafe865 100644
+--- a/src/citra_qt/configuration/configure_network.cpp
++++ b/src/citra_qt/configuration/configure_network.cpp
+@@ -40,7 +40,7 @@ void ConfigureWeb::SetConfiguration() {
+         QString::fromStdString(Settings::values.spotpass_server_url.GetValue()));
+     UpdateSpotPassFields(custom_spotpass);
+ 
+-#ifdef ENABLE_DISCORD_RPC
++#ifdef USE_DISCORD_PRESENCE
+     ui->toggle_discordrpc->setChecked(UISettings::values.enable_discord_presence.GetValue());
+ #endif
+ }
+diff --git a/src/citra_room/citra_room.rc b/src/citra_room/citra_room.rc
+index e4f9281..e8188c3 100644
+--- a/src/citra_room/citra_room.rc
++++ b/src/citra_room/citra_room.rc
+@@ -6,7 +6,7 @@
+ 
+ // Icon with lowest ID value placed first to ensure application icon
+ // remains consistent on all systems.
+-CITRA_ICON              ICON                    "../../dist/azahar.ico"
++CITRA_ICON              ICON                    "../../dist/tangelo.ico"
+ 
+ 
+ /////////////////////////////////////////////////////////////////////////////
+@@ -14,4 +14,4 @@ CITRA_ICON              ICON                    "../../dist/azahar.ico"
+ // RT_MANIFEST
+ //
+ 
+-0                       RT_MANIFEST             "../../dist/azahar.manifest"
++0                       RT_MANIFEST             "../../dist/tangelo.manifest"
+diff --git a/src/core/hle/service/apt/apt.cpp b/src/core/hle/service/apt/apt.cpp
+index e40bd9c..f33bc65 100644
+--- a/src/core/hle/service/apt/apt.cpp
++++ b/src/core/hle/service/apt/apt.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <string_view>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/vector.hpp>
+ #include "common/archives.h"
+@@ -721,18 +722,57 @@ void Module::APTInterface::CancelApplication(Kernel::HLERequestContext& ctx) {
+     rb.Push(apt->applet_manager->CancelApplication());
+ }
+ 
++namespace {
++/// Names of the AppletUtility commands documented on 3dbrew (APT:AppletUtility).
++std::string_view AppletUtilityName(u32 command) {
++    switch (command) {
++    case 0x0:
++        return "ClearPowerButtonState";
++    case 0x2:
++        return "SetCurrentAppletSlotToHomeMenu";
++    case 0x3:
++        return "ClearExclusiveControl";
++    case 0x4:
++        return "SleepIfShellClosed";
++    case 0x5:
++        return "LockTransition";
++    case 0x6:
++        return "TryLockTransition";
++    case 0x7:
++        return "UnlockTransition";
++    case 0xA:
++        return "StartExitTask";
++    case 0xB:
++        return "SetInitialSenderId";
++    case 0xC:
++        return "SetPowerButtonClick";
++    case 0x10:
++        return "UnlockCartAndSdSlot";
++    default:
++        return {};
++    }
++}
++} // namespace
++
+ void Module::APTInterface::AppletUtility(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+-    // These are from 3dbrew - I'm not really sure what they're used for.
+     const auto utility_command = rp.Pop<u32>();
+     const auto input_size = rp.Pop<u32>();
+     const auto output_size = rp.Pop<u32>();
+     [[maybe_unused]] const auto input = rp.PopStaticBuffer();
+ 
+-    LOG_WARNING(Service_APT,
+-                "(STUBBED) called command={:#010X}, input_size={:#010X}, output_size={:#010X}",
+-                utility_command, input_size, output_size);
++    // The documented commands need no emulation: the shell (lid) is never closed, and there is
++    // no transition locking or exclusive control to release, so they only have to succeed.
++    const std::string_view name = AppletUtilityName(utility_command);
++    if (!name.empty()) {
++        LOG_DEBUG(Service_APT, "called {} (command={:#x}), input_size={:#x}, output_size={:#x}",
++                  name, utility_command, input_size, output_size);
++    } else {
++        LOG_WARNING(Service_APT,
++                    "(STUBBED) called command={:#010X}, input_size={:#010X}, output_size={:#010X}",
++                    utility_command, input_size, output_size);
++    }
+ 
+     std::vector<u8> out(output_size);
+     if (utility_command == 0x6 && output_size > 0) {
+diff --git a/src/installer/citra.nsi b/src/installer/citra.nsi
+index 63b9e23..a76b607 100644
+--- a/src/installer/citra.nsi
++++ b/src/installer/citra.nsi
+@@ -48,7 +48,7 @@ ShowUnInstDetails show
+ !include "nsDialogs.nsh"
+ 
+ ; MUI Settings
+-!define MUI_ICON "../../dist/azahar.ico"
++!define MUI_ICON "../../dist/tangelo.ico"
+ !define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
+ 
+ ; License page
+-- 
+2.43.0
+
