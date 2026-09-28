@@ -1,0 +1,92 @@
+# Tangelo – Windows build (MSYS2 / clang64)
+#
+# Builds tangelo-qt for Windows and uploads a ready-to-run zip as a build artifact.
+# Any *.patch files in the repository's patches/ folder are applied before building,
+# so fixes can be tested without using git locally.
+#
+# Run it by hand: GitHub → Actions → "Windows build" → "Run workflow".
+
+name: Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: windows
+      TARGET: msys2
+    steps:
+      - name: Disable line ending translation
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply patches from patches/
+        shell: bash
+        run: |
+          shopt -s nullglob
+          patches=(patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches to apply."
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "Applying $p"
+            git apply --whitespace=nowarn "$p"
+          done
+
+      - name: Use the Tangelo compatibility list
+        shell: bash
+        run: |
+          # The repo still pins AzaharPlus's list; swap in the latest Tangelo list at build time,
+          # so edits to the fork reach the next build without touching this repo.
+          cd dist/compatibility_list
+          git remote set-url origin https://github.com/MicroWorldwide/tangelo-compatibility-list
+          git fetch --depth 1 origin master
+          git checkout --detach FETCH_HEAD
+          git log -1 --format='Compatibility list: %h %ad %s'
+          python -c "import json; print(len(json.load(open('compatibility_list.json', encoding='utf-8'))), 'games in list')"
+
+      - name: Set up cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-msys2-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-msys2-
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: clang64
+          update: true
+          install: git make p7zip
+          pacboy: >-
+            toolchain:p ccache:p cmake:p ninja:p spirv-tools:p
+            qt6-base:p qt6-multimedia:p qt6-multimedia-wmf:p qt6-tools:p qt6-translations:p
+
+      - name: Build
+        run: ./.ci/windows.sh
+
+      - name: Pack
+        run: ./.ci/pack.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: tangelo-windows-msys2
+          path: artifacts/

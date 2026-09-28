@@ -1,0 +1,127 @@
+From ee636fef9e176363a66e44b8cbdf4f8859a06c2e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 21:56:01 +0200
+Subject: [PATCH] audio_core: log HLE source settings at debug level
+
+LOG_TRACE is compiled out of release builds, so the HLE source settings
+(playback rate, sample format, mono/stereo, interpolation, reset and
+enable) and the buffers an application queues were invisible in the
+builds people test with. Nintendo 3DS Sound plays its voice clips
+high-pitched with HLE audio, and these are the values needed to see why.
+
+Log them at debug level; they only change when an application updates
+a source. Move the per-frame "mixers remaining_dirty" message, which
+flooded Audio.DSP debug logs (30,000 lines in two minutes), to trace.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/audio_core/hle/mixers.cpp |  3 ++-
+ src/audio_core/hle/source.cpp | 20 ++++++++++----------
+ 2 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/src/audio_core/hle/mixers.cpp b/src/audio_core/hle/mixers.cpp
+index 03dab65..8e44e0d 100644
+--- a/src/audio_core/hle/mixers.cpp
++++ b/src/audio_core/hle/mixers.cpp
+@@ -90,7 +90,8 @@ void Mixers::ParseConfig(DspConfiguration& config) {
+     }
+ 
+     if (config.dirty_raw) {
+-        LOG_DEBUG(Audio_DSP, "mixers remaining_dirty={:x}", config.dirty_raw);
++        // Logged every audio frame by some applications, so keep it out of Debug logs.
++        LOG_TRACE(Audio_DSP, "mixers remaining_dirty={:x}", config.dirty_raw);
+     }
+ 
+     config.dirty_raw = 0;
+diff --git a/src/audio_core/hle/source.cpp b/src/audio_core/hle/source.cpp
+index 4728526..48cef46 100755
+--- a/src/audio_core/hle/source.cpp
++++ b/src/audio_core/hle/source.cpp
+@@ -91,19 +91,19 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
+     if (config.reset_flag) {
+         config.reset_flag.Assign(0);
+         Reset();
+-        LOG_TRACE(Audio_DSP, "source_id={} reset", source_id);
++        LOG_DEBUG(Audio_DSP, "source_id={} reset", source_id);
+     }
+ 
+     if (config.partial_reset_flag) {
+         config.partial_reset_flag.Assign(0);
+         state.input_queue = std::priority_queue<Buffer, std::vector<Buffer>, BufferOrder>{};
+-        LOG_TRACE(Audio_DSP, "source_id={} partial_reset", source_id);
++        LOG_DEBUG(Audio_DSP, "source_id={} partial_reset", source_id);
+     }
+ 
+     if (config.enable_dirty) {
+         config.enable_dirty.Assign(0);
+         state.enabled = config.enable != 0;
+-        LOG_TRACE(Audio_DSP, "source_id={} enable={}", source_id, state.enabled);
++        LOG_DEBUG(Audio_DSP, "source_id={} enable={}", source_id, state.enabled);
+     }
+ 
+     if (config.sync_count_dirty) {
+@@ -115,7 +115,7 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
+     if (config.rate_multiplier_dirty) {
+         config.rate_multiplier_dirty.Assign(0);
+         state.rate_multiplier = config.rate_multiplier;
+-        LOG_TRACE(Audio_DSP, "source_id={} rate={}", source_id, state.rate_multiplier);
++        LOG_DEBUG(Audio_DSP, "source_id={} rate={}", source_id, state.rate_multiplier);
+ 
+         if (state.rate_multiplier <= 0) {
+             LOG_ERROR(Audio_DSP, "Was given an invalid rate multiplier: source_id={} rate={}",
+@@ -183,21 +183,21 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
+     if (config.interpolation_dirty) {
+         config.interpolation_dirty.Assign(0);
+         state.interpolation_mode = config.interpolation_mode;
+-        LOG_TRACE(Audio_DSP, "source_id={} interpolation_mode={}", source_id,
++        LOG_DEBUG(Audio_DSP, "source_id={} interpolation_mode={}", source_id,
+                   static_cast<std::size_t>(state.interpolation_mode));
+     }
+ 
+     if (config.format_dirty || config.embedded_buffer_dirty) {
+         config.format_dirty.Assign(0);
+         state.format = config.format;
+-        LOG_TRACE(Audio_DSP, "source_id={} format={}", source_id,
++        LOG_DEBUG(Audio_DSP, "source_id={} format={}", source_id,
+                   static_cast<std::size_t>(state.format));
+     }
+ 
+     if (config.mono_or_stereo_dirty || config.embedded_buffer_dirty) {
+         config.mono_or_stereo_dirty.Assign(0);
+         state.mono_or_stereo = config.mono_or_stereo;
+-        LOG_TRACE(Audio_DSP, "source_id={} mono_or_stereo={}", source_id,
++        LOG_DEBUG(Audio_DSP, "source_id={} mono_or_stereo={}", source_id,
+                   static_cast<std::size_t>(state.mono_or_stereo));
+     }
+ 
+@@ -274,7 +274,7 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
+                 }
+             }
+         }
+-        LOG_TRACE(Audio_DSP, "partially updating embedded buffer addr={:#010x} len={} id={}",
++        LOG_DEBUG(Audio_DSP, "partially updating embedded buffer addr={:#010x} len={} id={}",
+                   state.current_buffer_physical_address, static_cast<u32>(config.length),
+                   config.buffer_id);
+     }
+@@ -311,7 +311,7 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
+                 false,
+             });
+         }
+-        LOG_TRACE(Audio_DSP, "enqueuing embedded addr={:#010x} len={} id={} start={}",
++        LOG_DEBUG(Audio_DSP, "enqueuing embedded addr={:#010x} len={} id={} start={}",
+                   static_cast<u32>(config.physical_address), static_cast<u32>(config.length),
+                   config.buffer_id, static_cast<u32>(config.play_position));
+     }
+@@ -348,7 +348,7 @@ void Source::ParseConfig(SourceConfiguration::Configuration& config,
+                         false, // has_played
+                     });
+                 }
+-                LOG_TRACE(Audio_DSP, "enqueuing queued {} addr={:#010x} len={} id={}", i,
++                LOG_DEBUG(Audio_DSP, "enqueuing queued {} addr={:#010x} len={} id={}", i,
+                           static_cast<u32>(b.physical_address), static_cast<u32>(b.length),
+                           b.buffer_id);
+             }
+-- 
+2.43.0
+

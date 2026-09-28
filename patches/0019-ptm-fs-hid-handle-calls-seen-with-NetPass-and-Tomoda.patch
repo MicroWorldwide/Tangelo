@@ -1,0 +1,445 @@
+From fe282c45eea2d7f7950806b42f27c377eaacf21e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 23:36:48 +0200
+Subject: [PATCH] ptm/fs/hid: handle calls seen with NetPass and Tomodachi Life
+
+- ptm:sysm ConfigureNew3DSCPU (0x0818): NetPass calls it at start to
+  switch the New 3DS 804 MHz clock and L2 cache. Accept it; the emulated
+  CPU speed is an emulator setting.
+- fs:USER ReadExtSaveDataIcon (0x0853): NetPass reads its SpotPass
+  extdata icon. Return the icon Tangelo stores when the extdata is
+  created (ExtSaveDataInfo in words 1-4, size, mapped output buffer;
+  replies with the number of bytes written).
+- ptm GetStepHistory: Tomodachi Life asks for 24 hours from midnight.
+  Report the same virtual walk as GetTotalStepCount (patch 0009): each
+  hour gets the steps the counter advanced in it, the current hour up
+  to now, future hours none, so the history adds up to the total.
+- hid GetGyroscopeLowCalibrateParam: returning the default calibration
+  without a real console is intended; log it at debug instead of as a
+  stub warning.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/file_sys/archive_extsavedata.cpp | 19 +++++++
+ src/core/file_sys/archive_extsavedata.h   |  4 ++
+ src/core/hle/service/fs/archive.cpp       | 13 +++++
+ src/core/hle/service/fs/archive.h         |  3 +
+ src/core/hle/service/fs/fs_user.cpp       | 28 +++++++++-
+ src/core/hle/service/fs/fs_user.h         | 12 ++++
+ src/core/hle/service/hid/hid.cpp          |  3 +-
+ src/core/hle/service/ptm/ptm.cpp          | 67 +++++++++++++++++------
+ src/core/hle/service/ptm/ptm.h            | 17 ++++++
+ src/core/hle/service/ptm/ptm_sysm.cpp     |  2 +-
+ src/tests/CMakeLists.txt                  |  1 +
+ src/tests/core/hle/service/ptm_steps.cpp  | 47 ++++++++++++++++
+ 12 files changed, 195 insertions(+), 21 deletions(-)
+ create mode 100644 src/tests/core/hle/service/ptm_steps.cpp
+
+diff --git a/src/core/file_sys/archive_extsavedata.cpp b/src/core/file_sys/archive_extsavedata.cpp
+index 27096a1..8f76c81 100644
+--- a/src/core/file_sys/archive_extsavedata.cpp
++++ b/src/core/file_sys/archive_extsavedata.cpp
+@@ -392,6 +392,25 @@ Result ArchiveFactory_ExtSaveData::FormatAsExtData(const Path& path,
+     }
+ }
+ 
++ResultVal<std::vector<u8>> ArchiveFactory_ExtSaveData::ReadExtDataIcon(const Path& path) {
++    if (IsUsingArtic()) {
++        return ResultUnknown;
++    }
++    const std::string extdata_path = GetExtSaveDataPath(mount_point, GetCorrectedPath(path));
++    if (!FileUtil::Exists(extdata_path)) {
++        return ResultNotFoundInvalidState;
++    }
++    FileUtil::IOFile icon_file(extdata_path + "icon", "rb");
++    if (!icon_file.IsOpen()) {
++        return ResultNotFound;
++    }
++    std::vector<u8> icon(icon_file.GetSize());
++    if (icon_file.ReadBytes(icon.data(), icon.size()) != icon.size()) {
++        return ResultUnknown;
++    }
++    return icon;
++}
++
+ Result ArchiveFactory_ExtSaveData::DeleteExtData(Service::FS::MediaType media_type, u8 unknown,
+                                                  u32 high, u32 low) {
+     if (IsUsingArtic()) {
+diff --git a/src/core/file_sys/archive_extsavedata.h b/src/core/file_sys/archive_extsavedata.h
+index c1a2a3f..8a69b94 100644
+--- a/src/core/file_sys/archive_extsavedata.h
++++ b/src/core/file_sys/archive_extsavedata.h
+@@ -8,6 +8,7 @@
+ #include <optional>
+ #include <span>
+ #include <string>
++#include <vector>
+ #include <boost/serialization/export.hpp>
+ #include <boost/serialization/string.hpp>
+ #include "common/common_types.h"
+@@ -57,6 +58,9 @@ public:
+ 
+     Result DeleteExtData(Service::FS::MediaType media_type, u8 unknown, u32 high, u32 low);
+ 
++    /// Reads the SMDH icon stored when the ExtSaveData was created.
++    ResultVal<std::vector<u8>> ReadExtDataIcon(const Path& path);
++
+     void RegisterArtic(std::shared_ptr<Network::ArticBase::Client>& client) {
+         artic_client = client;
+     }
+diff --git a/src/core/hle/service/fs/archive.cpp b/src/core/hle/service/fs/archive.cpp
+index a3f003f..d5a7a9d 100644
+--- a/src/core/hle/service/fs/archive.cpp
++++ b/src/core/hle/service/fs/archive.cpp
+@@ -277,6 +277,19 @@ Result ArchiveManager::CreateExtSaveData(MediaType media_type, u8 unknown, u32 h
+     return ResultSuccess;
+ }
+ 
++ResultVal<std::vector<u8>> ArchiveManager::ReadExtSaveDataIcon(MediaType media_type, u32 high,
++                                                               u32 low) {
++    const FileSys::Path path =
++        FileSys::ConstructExtDataBinaryPath(static_cast<u32>(media_type), high, low);
++    auto archive = id_code_map.find(media_type == MediaType::NAND ? ArchiveIdCode::SharedExtSaveData
++                                                                  : ArchiveIdCode::ExtSaveData);
++    if (archive == id_code_map.end()) {
++        return UnimplementedFunction(ErrorModule::FS);
++    }
++    auto ext_savedata = static_cast<FileSys::ArchiveFactory_ExtSaveData*>(archive->second.get());
++    return ext_savedata->ReadExtDataIcon(path);
++}
++
+ Result ArchiveManager::DeleteExtSaveData(MediaType media_type, u8 unknown, u32 high, u32 low) {
+     auto archive = id_code_map.find(media_type == MediaType::NAND ? ArchiveIdCode::SharedExtSaveData
+                                                                   : ArchiveIdCode::ExtSaveData);
+diff --git a/src/core/hle/service/fs/archive.h b/src/core/hle/service/fs/archive.h
+index e3124a0..7159b3b 100644
+--- a/src/core/hle/service/fs/archive.h
++++ b/src/core/hle/service/fs/archive.h
+@@ -258,6 +258,9 @@ public:
+      */
+     Result DeleteExtSaveData(MediaType media_type, u8 unknown, u32 high, u32 low);
+ 
++    /// Reads the icon stored with an ExtSaveData archive.
++    ResultVal<std::vector<u8>> ReadExtSaveDataIcon(MediaType media_type, u32 high, u32 low);
++
+     /**
+      * Deletes the SystemSaveData archive folder for the specified save data id
+      * @param high The high word of the SystemSaveData archive to delete
+diff --git a/src/core/hle/service/fs/fs_user.cpp b/src/core/hle/service/fs/fs_user.cpp
+index b3961aa..14879b3 100644
+--- a/src/core/hle/service/fs/fs_user.cpp
++++ b/src/core/hle/service/fs/fs_user.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include <cryptopp/aes.h>
+ #include <cryptopp/cmac.h>
+ #include <cryptopp/modes.h>
+@@ -969,6 +970,31 @@ void FS_USER::GetNandArchiveResource(Kernel::HLERequestContext& ctx) {
+     rb.PushRaw(*resource);
+ }
+ 
++void FS_USER::ReadExtSaveDataIcon(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const auto info = rp.PopRaw<ExtSaveDataInfo>();
++    const u32 size = rp.Pop<u32>();
++    auto& buffer = rp.PopMappedBuffer();
++
++    const auto icon = archives.ReadExtSaveDataIcon(static_cast<MediaType>(info.media_type),
++                                                   info.save_id_high, info.save_id_low);
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
++    if (icon.Failed()) {
++        rb.Push(icon.Code());
++        rb.Push<u32>(0);
++    } else {
++        const u32 bytes = static_cast<u32>(
++            std::min<std::size_t>({icon->size(), size, buffer.GetSize()}));
++        buffer.Write(icon->data(), 0, bytes);
++        rb.Push(ResultSuccess);
++        rb.Push<u32>(bytes);
++    }
++    rb.PushMappedBuffer(buffer);
++
++    LOG_DEBUG(Service_FS, "called, media_type={} save_id={:08X}{:08X} size={:#x} result={:#x}",
++              info.media_type, info.save_id_high, info.save_id_low, size, icon.Code().raw);
++}
++
+ void FS_USER::CreateExtSaveData(Kernel::HLERequestContext& ctx) {
+     // TODO(Subv): Figure out the other parameters.
+     IPC::RequestParser rp(ctx);
+@@ -1893,7 +1919,7 @@ FS_USER::FS_USER(Core::System& system)
+         {0x0850, nullptr, "GetSpecialFileSize"},
+         {0x0851, &FS_USER::CreateExtSaveData, "CreateExtSaveData"},
+         {0x0852, &FS_USER::DeleteExtSaveData, "DeleteExtSaveData"},
+-        {0x0853, nullptr, "ReadExtSaveDataIcon"},
++        {0x0853, &FS_USER::ReadExtSaveDataIcon, "ReadExtSaveDataIcon"},
+         {0x0854, nullptr, "GetExtDataBlockSize"},
+         {0x0855, nullptr, "EnumerateExtSaveData"},
+         {0x0856, &FS_USER::CreateSystemSaveData, "CreateSystemSaveData"},
+diff --git a/src/core/hle/service/fs/fs_user.h b/src/core/hle/service/fs/fs_user.h
+index 851ab30..e405448 100644
+--- a/src/core/hle/service/fs/fs_user.h
++++ b/src/core/hle/service/fs/fs_user.h
+@@ -413,6 +413,18 @@ private:
+      *  Outputs:
+      *      1 : Result of function, 0 on success, otherwise error code
+      */
++    /**
++     * FS_User::ReadExtSaveDataIcon service function (0x0853)
++     *  Inputs:
++     *      1-4 : ExtSaveDataInfo
++     *      5 : Size of the output buffer
++     *      6-7 : Output buffer (mapped)
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     *      2 : Number of icon bytes written
++     */
++    void ReadExtSaveDataIcon(Kernel::HLERequestContext& ctx);
++
+     void CreateExtSaveData(Kernel::HLERequestContext& ctx);
+ 
+     /**
+diff --git a/src/core/hle/service/hid/hid.cpp b/src/core/hle/service/hid/hid.cpp
+index 9eb6e6c..8e5c468 100644
+--- a/src/core/hle/service/hid/hid.cpp
++++ b/src/core/hle/service/hid/hid.cpp
+@@ -631,7 +631,8 @@ void Module::Interface::GetGyroscopeLowCalibrateParam(Kernel::HLERequestContext&
+         };
+         rb.PushRaw(param);
+ 
+-        LOG_WARNING(Service_HID, "(STUBBED) called");
++        // Without a real console (Artic Base) there is no factory calibration to report.
++        LOG_DEBUG(Service_HID, "called, using default gyroscope calibration");
+     }
+ }
+ 
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index 740ede7..2a1bf22 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include "common/archives.h"
+ #include "common/common_paths.h"
+ #include "common/file_util.h"
+@@ -41,19 +42,34 @@ void Module::Interface::RegisterAlarmClient(Kernel::HLERequestContext& ctx) {
+     LOG_DEBUG(Service_PTM, "(STUBBED) called");
+ }
+ 
++u64 Module::VirtualStepsAt(u64 ms_since_2000) {
++    constexpr u64 MsPerHour = 60 * 60 * 1000;
++    const u64 steps_per_hour = Settings::values.steps_per_hour.GetValue();
++    return ms_since_2000 * steps_per_hour / MsPerHour;
++}
++
+ u32 Module::GetVirtualStepCount() const {
+     // There is no pedometer to read, so steps come from the "Steps per hour" setting: a virtual
+     // walk at that pace, measured on the emulated 3DS clock (it pauses with the emulator and
+-    // speeds up with fast-forward). This matches GetStepHistory, which reports the same pace for
+-    // every hour. The total is counted from 2000-01-01 and wraps like a 32-bit counter; games
+-    // work with differences between readings, which stay correct across the wrap.
+-    const u64 steps_per_hour = Settings::values.steps_per_hour.GetValue();
+-    if (steps_per_hour == 0) {
+-        return 0;
+-    }
+-    constexpr u64 MsPerHour = 60 * 60 * 1000;
++    // speeds up with fast-forward). GetStepHistory reports the same walk hour by hour. The total
++    // is counted from 2000-01-01 and wraps like a 32-bit counter; games work with differences
++    // between readings, which stay correct across the wrap.
+     const u64 ms_since_2000 = system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
+-    return static_cast<u32>(ms_since_2000 * steps_per_hour / MsPerHour);
++    return static_cast<u32>(VirtualStepsAt(ms_since_2000));
++}
++
++std::vector<u16> Module::VirtualStepHistory(u64 start_ms, u32 hours, u64 now_ms) {
++    constexpr u64 MsPerHour = 60 * 60 * 1000;
++    std::vector<u16> history(hours, 0);
++    for (u32 i = 0; i < hours; i++) {
++        const u64 from = start_ms + i * MsPerHour;
++        const u64 to = std::min(from + MsPerHour, now_ms);
++        if (to > from) {
++            const u64 steps = VirtualStepsAt(to) - VirtualStepsAt(from);
++            history[i] = static_cast<u16>(std::min<u64>(steps, 0xFFFF));
++        }
++    }
++    return history;
+ }
+ 
+ void Module::Interface::GetAdapterState(Kernel::HLERequestContext& ctx) {
+@@ -108,23 +124,38 @@ void Module::Interface::GetPedometerState(Kernel::HLERequestContext& ctx) {
+ void Module::Interface::GetStepHistory(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+-    u32 hours = rp.Pop<u32>();
+-    u64 start_time = rp.Pop<u64>();
++    const u32 hours = rp.Pop<u32>();
++    const u64 start_time = rp.Pop<u64>(); // milliseconds since 2000-01-01, start of the first hour
+     auto& buffer = rp.PopMappedBuffer();
+-    ASSERT_MSG(sizeof(u16) * hours == buffer.GetSize(),
+-               "Buffer for steps count has incorrect size");
+ 
+-    const u16_le steps_per_hour = Settings::values.steps_per_hour.GetValue();
+-    for (u32 i = 0; i < hours; ++i) {
+-        buffer.Write(&steps_per_hour, i * sizeof(u16), sizeof(u16));
++    // The same virtual walk as GetTotalStepCount: each hour gets the steps the counter advanced
++    // in it, the current hour only up to now, and hours still to come get none.
++    const u64 now = ptm->system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
++    const auto history = Module::VirtualStepHistory(start_time, hours, now);
++    const std::size_t count = std::min<std::size_t>(hours, buffer.GetSize() / sizeof(u16));
++    for (std::size_t i = 0; i < count; ++i) {
++        const u16_le steps = history[i];
++        buffer.Write(&steps, i * sizeof(u16), sizeof(u16));
+     }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_PTM, "(STUBBED) called, from time(raw): 0x{:x}, for {} hours", start_time,
+-                hours);
++    LOG_DEBUG(Service_PTM, "called, from {} ms since 2000, for {} hours", start_time, hours);
++}
++
++void Module::Interface::ConfigureNew3DSCPU(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    // Bit 0 selects the 804 MHz clock, bit 1 the L2 cache. The emulated CPU speed is set in the
++    // emulator's own settings, so there is nothing to switch here.
++    const u8 value = rp.Pop<u8>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_PTM, "called, value={:#04x} (804 MHz: {}, L2 cache: {})", value,
++              (value & 1) != 0, (value & 2) != 0);
+ }
+ 
+ void Module::Interface::GetTotalStepCount(Kernel::HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index 59edaa3..ce05807 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <vector>
++
+ #include <memory>
+ #include "common/common_types.h"
+ #include "core/hle/ipc_helpers.h"
+@@ -51,6 +53,12 @@ public:
+ 
+     /// Step count of the virtual pedometer driven by the "Steps per hour" setting.
+     u32 GetVirtualStepCount() const;
++
++    /// Steps of the virtual walk ("Steps per hour" setting) from 2000-01-01 up to the given time.
++    static u64 VirtualStepsAt(u64 ms_since_2000);
++
++    /// Hour-by-hour steps of the virtual walk, as GetStepHistory reports them.
++    static std::vector<u16> VirtualStepHistory(u64 start_ms, u32 hours, u64 now_ms);
+     ~Module() = default;
+ 
+     static u16 GetPlayCoins();
+@@ -117,6 +125,15 @@ public:
+          */
+         void GetStepHistory(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * PTM::ConfigureNew3DSCPU service function (ptm:sysm)
++         *  Inputs:
++         *      1 : u8, bit 0 = 804 MHz clock, bit 1 = L2 cache
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void ConfigureNew3DSCPU(Kernel::HLERequestContext& ctx);
++
+         /**
+          * PTM::RegisterAlarmClient service function
+          *  Inputs:
+diff --git a/src/core/hle/service/ptm/ptm_sysm.cpp b/src/core/hle/service/ptm/ptm_sysm.cpp
+index 82df8b7..97afeab 100644
+--- a/src/core/hle/service/ptm/ptm_sysm.cpp
++++ b/src/core/hle/service/ptm/ptm_sysm.cpp
+@@ -61,7 +61,7 @@ PTM_S_Common::PTM_S_Common(std::shared_ptr<Module> ptm, const char* name)
+         {0x0812, nullptr, "IsShutdownByBatteryEmpty"},
+         {0x0813, nullptr, "FormatSavedata"},
+         {0x0814, nullptr, "GetLegacyJumpProhibitedFlag"},
+-        {0x0818, nullptr, "ConfigureNew3DSCPU"},
++        {0x0818, &PTM_S_Common::ConfigureNew3DSCPU, "ConfigureNew3DSCPU"},
+         // clang-format on
+     };
+     RegisterHandlers(functions);
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 5f634ab..7e4c6b1 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -7,6 +7,7 @@ add_executable(tests
+     core/hle/kernel/cpu_limiter.cpp
+     core/hle/kernel/hle_ipc.cpp
+     core/hle/service/cecd_message.cpp
++    core/hle/service/ptm_steps.cpp
+     core/memory/memory.cpp
+     core/memory/vm_manager.cpp
+     core/system_titles.cpp
+diff --git a/src/tests/core/hle/service/ptm_steps.cpp b/src/tests/core/hle/service/ptm_steps.cpp
+new file mode 100644
+index 0000000..66e93d1
+--- /dev/null
++++ b/src/tests/core/hle/service/ptm_steps.cpp
+@@ -0,0 +1,47 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <numeric>
++#include <catch2/catch_test_macros.hpp>
++#include "common/settings.h"
++#include "core/hle/service/ptm/ptm.h"
++
++using Service::PTM::Module;
++
++namespace {
++constexpr u64 MsPerHour = 60 * 60 * 1000;
++constexpr u64 Midnight = 843'868'800'000; // 2026-09-28 00:00, as Tomodachi Life asks for it
++} // namespace
++
++TEST_CASE("PTM step history follows the virtual step counter", "[core][ptm]") {
++    const auto old_steps = Settings::values.steps_per_hour.GetValue();
++    Settings::values.steps_per_hour = 1000;
++
++    // 10.5 hours into the day: ten full hours, half of the current one, nothing after that.
++    const u64 now = Midnight + 10 * MsPerHour + MsPerHour / 2;
++    const auto history = Module::VirtualStepHistory(Midnight, 24, now);
++    REQUIRE(history.size() == 24);
++    for (int i = 0; i < 10; i++) {
++        CHECK(history[i] == 1000);
++    }
++    CHECK(history[10] == 500);
++    for (int i = 11; i < 24; i++) {
++        CHECK(history[i] == 0);
++    }
++
++    // The hours add up to exactly what the total step count advanced by.
++    const u64 sum = std::accumulate(history.begin(), history.end(), u64{0});
++    CHECK(sum == Module::VirtualStepsAt(now) - Module::VirtualStepsAt(Midnight));
++
++    // A 0 setting means no walking at all.
++    Settings::values.steps_per_hour = 0;
++    const auto still = Module::VirtualStepHistory(Midnight, 24, now);
++    CHECK(std::accumulate(still.begin(), still.end(), u64{0}) == 0);
++
++    // The setting is 16-bit, like a history entry, so even its maximum fits in one hour.
++    Settings::values.steps_per_hour = 0xFFFF;
++    CHECK(Module::VirtualStepHistory(Midnight, 1, now)[0] == 0xFFFF);
++
++    Settings::values.steps_per_hour = old_steps;
++}
+-- 
+2.43.0
+

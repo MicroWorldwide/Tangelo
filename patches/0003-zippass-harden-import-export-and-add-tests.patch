@@ -1,0 +1,1424 @@
+From 01f77769d2d8ffa982edeca07065eb01e3cdaf74 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 14:59:40 +0200
+Subject: [PATCH] zippass: harden import/export and add tests
+
+Import (importZipPass):
+- Validate BoxInfo_____ (size, 'bb' magic) before touching an inbox;
+  a corrupt BoxInfo used to be written into.
+- Check zip_fread, BoxInfo reads and all writes; on a failed write the
+  half-written message is removed.
+- Respect max_box_size as well as max_message_num when deciding whether
+  a message fits, and cap entry size before allocating.
+- Only accept entries shaped like <8 hex digits>/<_ + 11 chars>.
+- Write the BoxInfo entry before updating its counters.
+- Refuse to run while emulation is powered on (new code -4).
+
+Queue (importQueuedZipPass):
+- A zip that fails to import is moved to history instead of blocking
+  the queue forever; environment errors (-2/-3/-4) still stop early.
+- Parked external-inbox messages are size-checked and moved back if
+  BoxInfo can't be updated.
+
+Other:
+- Serialize all ZipPass operations with a mutex (UI, startup and the
+  room network thread can run them concurrently).
+- Qt: run the queued import after the emulator thread has shut down,
+  not before (it raced with the running game's LLE CECD module).
+- Room downloads: bounds-check the packet before copying the nickname,
+  restrict the nickname to safe characters (it becomes a file name and
+  could contain ../), and queue whenever a game is running.
+- History trim uses a multimap so files with equal mtimes are counted.
+- Progress logging moved from LOG_ERROR to LOG_DEBUG/INFO.
+- New Catch2 tests: export/import round trip, inbox overflow into the
+  external inbox and back, bad zips, corrupt BoxInfo, blocked queue,
+  environment checks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/citra_qt/citra_qt.cpp   |  10 +-
+ src/core/zip_pass.cpp       | 965 +++++++++++++++++++-----------------
+ src/core/zip_pass.h         |  17 +
+ src/network/room_member.cpp |  20 +-
+ src/tests/CMakeLists.txt    |   1 +
+ src/tests/core/zip_pass.cpp | 232 +++++++++
+ 6 files changed, 784 insertions(+), 461 deletions(-)
+ create mode 100644 src/tests/core/zip_pass.cpp
+
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index 8cd2ed4..51a7534 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -2849,9 +2849,6 @@ void GMainWindow::ShutdownGame() {
+     if (!emulation_running) {
+         return;
+     }
+-	
+-	Loader::resetProgramId();
+-	Core::importQueuedZipPass();
+ 
+     if (ui->action_Fullscreen->isChecked()) {
+         HideFullscreen();
+@@ -2939,6 +2936,11 @@ void GMainWindow::ShutdownGame() {
+ 
+     emulation_running = false;
+ 
++    // The emulated system is fully shut down now (emu_thread has exited), so the StreetPass
++    // boxes are no longer in use: safe to import ZipPass files queued during the game.
++    Loader::resetProgramId();
++    Core::importQueuedZipPass();
++
+     game_title.clear();
+     UpdateWindowTitle();
+ 
+@@ -4471,6 +4473,8 @@ void GMainWindow::OnImportZipPass() {
+ 				QMessageBox::critical(this, tr("Import ZipPass Data"), tr("ZipPass requires System Files installed"));
+ 			} else if(res == -3) {
+ 				QMessageBox::critical(this, tr("Import ZipPass Data"), tr("ZipPass requires LLE modules enabled"));
++			} else if(res == -4) {
++				QMessageBox::critical(this, tr("Import ZipPass Data"), tr("Stop the running game before importing ZipPass data"));
+ 			} else {
+ 				QMessageBox::critical(this, tr("Import ZipPass Data"), tr("Unknown ZipPass error"));
+ 			}
+diff --git a/src/core/zip_pass.cpp b/src/core/zip_pass.cpp
+index e6c2ee6..0af4e9d 100644
+--- a/src/core/zip_pass.cpp
++++ b/src/core/zip_pass.cpp
+@@ -1,490 +1,543 @@
+ #include "core/zip_pass.h"
+-#include "common/logging/log.h"
+-#include "common/file_util.h"
+-#include "common/common_paths.h"
+-#include "core/hle/service/cecd/cecd.h"
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <chrono>
++#include <cstring>
++#include <ctime>
++#include <map>
++#include <mutex>
++#include <vector>
+ #include <zip.h>
+-#include "core/hle/kernel/shared_page.h"
+ #include <cryptopp/osrng.h>
++#include "common/common_paths.h"
++#include "common/file_util.h"
++#include "common/logging/log.h"
++#include "common/settings.h"
++#include "core/core.h"
++#include "core/hle/kernel/shared_page.h"
++#include "core/hle/service/cecd/cecd.h"
+ #include "core/system_titles.h"
+ 
+ namespace Core {
+ 
+-static int addFileToZip(zip_t *za, const char* zipPath, const char* srcPath)
+-{
+-	int ret = -2;
+-	zip_source_t *src = zip_source_file_create(srcPath, 0, ZIP_LENGTH_TO_END, NULL);
+-	
+-	if(src == NULL) return -1;
+-	
+-	int err = zip_file_add(za, zipPath, src, 0);
+-	
+-	if(err == -1) zip_source_free(src);
+-	else ret = 0;
+-	
+-	return ret;
++namespace {
++
++using BoxInfoHeader = Service::CECD::Module::CecBoxInfoHeader;
++using MessageHeader = Service::CECD::Module::CecMessageHeader;
++
++constexpr u16 BoxInfoMagic = 0x6262;          // 'bb'
++constexpr u16 MessageMagic = 0x6060;          // '``'
++constexpr u64 MaxMessageFileSize = 0x100000;  // sanity cap before allocating (1 MiB)
++constexpr std::size_t MaxExternalInboxFiles = 100;
++constexpr std::size_t MaxHistoryFiles = 100;
++
++/// Serializes every ZipPass operation. Imports can be started from the UI thread, at startup
++/// and from the network thread (room downloads), and all of them rewrite BoxInfo_____ files.
++/// Recursive because importQueuedZipPass calls importZipPass.
++std::recursive_mutex zip_pass_mutex;
++
++std::string GetCecPath() {
++    return FileUtil::GetUserPath(FileUtil::UserPath::NANDDir) + DIR_SEP + "data" + DIR_SEP +
++           "00000000000000000000000000000000" + DIR_SEP + "sysdata" + DIR_SEP + "00010026" +
++           DIR_SEP + "00000000" + DIR_SEP + "CEC";
++}
++
++std::string GetInboxPath(const std::string& title_id) {
++    return GetCecPath() + DIR_SEP + title_id + DIR_SEP + "InBox___";
++}
++
++std::string GetZipPassPath(const std::string& sub_dir) {
++    return fmt::format("{}/zippass/{}", FileUtil::GetUserPath(FileUtil::UserPath::UserDir),
++                       sub_dir);
++}
++
++bool IsHexTitleId(const std::string& id) {
++    return id.size() == 8 &&
++           std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isxdigit(c); });
++}
++
++bool IsMessageFileName(const std::string& name) {
++    return name.size() == 12 && name[0] == '_';
++}
++
++std::size_t CountFiles(const std::string& dir) {
++    FileUtil::FSTEntry root;
++    std::vector<FileUtil::FSTEntry> files;
++    FileUtil::ScanDirectoryTree(dir, root, 2048);
++    FileUtil::GetAllFilesFromNestedEntries(root, files);
++    return files.size();
++}
++
++/// Reads and validates the header of an inbox's BoxInfo_____ file.
++bool ReadBoxInfo(FileUtil::IOFile& file, BoxInfoHeader& info) {
++    if (!file.IsOpen() || file.GetSize() < sizeof(BoxInfoHeader)) {
++        return false;
++    }
++    if (!file.Seek(0, SEEK_SET) || file.ReadBytes(&info, sizeof(info)) != sizeof(info)) {
++        return false;
++    }
++    return info.magic == BoxInfoMagic;
++}
++
++/// Whether one more message of `size` bytes fits in the inbox (count and total size).
++bool FitsInBox(const BoxInfoHeader& info, u64 size) {
++    if (info.message_num >= info.max_message_num) {
++        return false;
++    }
++    // A max_box_size of 0 would mean "no size limit"; real boxes always set it.
++    return info.max_box_size == 0 || u64{info.box_size} + size <= info.max_box_size;
++}
++
++/// Registers a message in BoxInfo_____: appends its 0x70-byte header entry, then updates the
++/// counters. The entry is written first so the counters never reference a missing entry.
++bool AppendToBox(FileUtil::IOFile& file, BoxInfoHeader& info, const u8* message_header,
++                 u64 message_size) {
++    BoxInfoHeader updated = info;
++    updated.message_num = updated.message_num + 1;
++    updated.box_info_size = updated.box_info_size + sizeof(MessageHeader);
++    updated.box_size = updated.box_size + static_cast<u32>(message_size);
++
++    if (!file.Seek(0, SEEK_END) ||
++        file.WriteBytes(message_header, sizeof(MessageHeader)) != sizeof(MessageHeader)) {
++        return false;
++    }
++    if (!file.Seek(0, SEEK_SET) || file.WriteBytes(&updated, sizeof(updated)) != sizeof(updated)) {
++        return false;
++    }
++    file.Flush();
++    info = updated;
++    return true;
++}
++
++bool AddFileToZip(zip_t* za, const std::string& zip_path, const std::string& src_path) {
++    zip_source_t* src = zip_source_file_create(src_path.c_str(), 0, ZIP_LENGTH_TO_END, nullptr);
++    if (src == nullptr) {
++        return false;
++    }
++    if (zip_file_add(za, zip_path.c_str(), src, 0) < 0) {
++        zip_source_free(src);
++        return false;
++    }
++    return true;
++}
++
++int ZipPassChecks() {
++    int n_homes = 0;
++    for (u32 region = 0; region < Core::NUM_SYSTEM_TITLE_REGIONS; region++) {
++        if (region == 3) {
++            continue;
++        }
++        const auto home_path = Core::GetHomeMenuNcchPath(region);
++        if (!home_path.empty() && FileUtil::Exists(home_path)) {
++            n_homes++;
++        }
++    }
++
++    if (n_homes < 1) {
++        LOG_ERROR(Frontend, "ZipPass import impossible without system files");
++        return -2;
++    }
++
++    if (!Settings::values.enable_required_online_lle_modules.GetValue()) {
++        LOG_ERROR(Frontend, "ZipPass import impossible without LLE modules");
++        return -3;
++    }
++
++    if (isEmulationRunning()) {
++        LOG_ERROR(Frontend, "ZipPass import refused while emulation is running");
++        return -4;
++    }
++
++    return 0;
+ }
+ 
+-int exportZipPass(std::string path)
+-{
+-	int ret = 0;
+-	
+-	LOG_ERROR(Frontend, "exportZipPass {}", path);
+-	
+-	int err = 0;
+-	zip_t *za = zip_open(path.c_str(), ZIP_CREATE|ZIP_TRUNCATE, &err);
+-	LOG_ERROR(HW, "zip_open {}", err);
+-	
+-	if(err != 0) return -1;
+-	
+-    const auto callback = [za](u64* num_entries_out, const std::string& directory,
+-                                          const std::string& virtual_name) -> bool {
+-        const std::string physical_name = directory + DIR_SEP + virtual_name;
+-        if (FileUtil::IsDirectory(physical_name) && virtual_name.length() == 8) {
+-            LOG_ERROR(Frontend, "streetpass directory {}", physical_name);
+-			
+-			const auto callback2 = [za, virtual_name](u64* num_entries_out, const std::string& directory,
+-												  const std::string& v_name) -> bool {
+-				std::string real_name = directory + DIR_SEP + v_name;
++} // namespace
++
++bool isEmulationRunning() {
++    return Core::System::GetInstance().IsPoweredOn();
++}
++
++int exportZipPass(std::string path) {
++    std::lock_guard lock(zip_pass_mutex);
++    LOG_INFO(Frontend, "Exporting ZipPass to {}", path);
++
++    int err = 0;
++    zip_t* za = zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &err);
++    if (za == nullptr) {
++        LOG_ERROR(Frontend, "ZipPass export: cannot create {} (libzip error {})", path, err);
++        return -1;
++    }
++
++    const auto on_title = [za](u64*, const std::string& directory,
++                               const std::string& title_id) -> bool {
++        const std::string title_path = directory + DIR_SEP + title_id;
++        if (!FileUtil::IsDirectory(title_path) || !IsHexTitleId(title_id)) {
++            return true;
++        }
++
++        const auto on_message = [za, &title_id](u64*, const std::string& box_dir,
++                                                const std::string& name) -> bool {
++            if (!IsMessageFileName(name)) {
++                return true;
++            }
++            std::string real_path = box_dir + DIR_SEP + name;
+ #ifdef ANDROID
+-				real_name = AndroidUtils::TranslateFilePath(real_name);
++            real_path = AndroidUtils::TranslateFilePath(real_path);
+ #endif
+-				if (v_name[0] == '_' && v_name.length() == 12) {
+-					LOG_ERROR(Frontend, "streetpass file {}", FileUtil::SanitizePath(real_name));
+-					addFileToZip(za, (virtual_name + "/" + v_name).c_str(), FileUtil::SanitizePath(real_name).c_str());
+-				}
+-				return true;
+-			};
+-			
+-			FileUtil::ForeachDirectoryEntry(nullptr, physical_name + DIR_SEP + "OutBox__", callback2);
+-        }
++            real_path = FileUtil::SanitizePath(real_path);
++            if (!AddFileToZip(za, title_id + "/" + name, real_path)) {
++                LOG_WARNING(Frontend, "ZipPass export: could not add {}", real_path);
++            } else {
++                LOG_DEBUG(Frontend, "ZipPass export: added {}", real_path);
++            }
++            return true;
++        };
++
++        FileUtil::ForeachDirectoryEntry(nullptr, title_path + DIR_SEP + "OutBox__", on_message);
+         return true;
+     };
+-	
+-	const std::string dir = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir)
+-		+ DIR_SEP + "data" + DIR_SEP + "00000000000000000000000000000000" 
+-		+ DIR_SEP + "sysdata" + DIR_SEP + "00010026" + DIR_SEP + "00000000" 
+-		+ DIR_SEP + "CEC";
+-
+-    FileUtil::ForeachDirectoryEntry(nullptr, dir, callback);
+-	
+-	ret = zip_get_num_entries(za, 0);
+-	
+-	err = zip_close(za);
+-	LOG_ERROR(HW, "zip_close {}", err);
+-	
+-	if(err < 0) ret = -1;
+-	
+-	return ret;
+-}
+ 
+-static int zipPassChecks()
+-{
+-	int nHomes = 0;
+-	
+-	for (u32 region = 0; region < Core::NUM_SYSTEM_TITLE_REGIONS; region++) {
+-		if(region == 3) continue;
+-		const auto hpath = Core::GetHomeMenuNcchPath(region);
+-	
+-		if(!hpath.empty() && FileUtil::Exists(hpath))
+-		{
+-			nHomes++;
+-		}
+-	}
+-
+-	if(nHomes < 1) {
+-		LOG_ERROR(Frontend, "importZipPass impossible without system files");
+-		return -2;
+-	}
+-	
+-	LOG_ERROR(Frontend, "nHomes {}", nHomes);
+-	
+-	if(!Settings::values.enable_required_online_lle_modules.GetValue()) {
+-		LOG_ERROR(Frontend, "importZipPass impossible without LLE modules");
+-		return -3;
+-	}
+-	
+-	return 0;
++    FileUtil::ForeachDirectoryEntry(nullptr, GetCecPath(), on_title);
++
++    const int num_entries = static_cast<int>(zip_get_num_entries(za, 0));
++
++    if (zip_close(za) < 0) {
++        LOG_ERROR(Frontend, "ZipPass export: failed to write {}: {}", path,
++                  zip_strerror(za));
++        zip_discard(za);
++        return -1;
++    }
++
++    LOG_INFO(Frontend, "ZipPass export: {} message(s)", num_entries);
++    return num_entries;
+ }
+ 
+-int importZipPass(std::string path)
+-{
+-	LOG_ERROR(Frontend, "importZipPass {}", path);
+-	
+-	int ret = zipPassChecks();
+-	int err = 0;
+-	
+-	if(ret) return ret;
+-	
+-	zip_t *za = zip_open(path.c_str(), ZIP_RDONLY, &err);
+-	LOG_ERROR(HW, "zip_open {}", err);
+-	
+-	if(err != 0) ret = -1;
+-	
+-	int num = zip_get_num_entries(za, 0);
+-	LOG_ERROR(HW, "zip_get_num_entries {}", num);
+-	
+-	for(int i=0; i<num; i++)
+-	{
+-		struct zip_stat st;
+-		err = zip_stat_index(za, i, 0, &st);
+-		LOG_ERROR(HW, "zip_stat_index {}", err);
+-		
+-		if(st.valid & ZIP_STAT_NAME)
+-		{
+-			LOG_ERROR(HW, "zip_stat_index name {}", st.name);
+-		} else continue;
+-		
+-		if(st.valid & ZIP_STAT_SIZE)
+-		{
+-			LOG_ERROR(HW, "zip_stat_index size {}", st.size);
+-		} else continue;
+-		
+-		if(st.size < 0x70)
+-		{
+-			LOG_ERROR(HW, "size too small {}", st.size);
+-			continue;
+-		}
+-		
+-		std::vector<std::string> elems = FileUtil::SplitPathComponents(st.name);
+-		
+-		if(elems.size() != 2)
+-		{
+-			LOG_ERROR(HW, "bad dir structure {}", st.name);
+-			continue;
+-		}
+-		
+-		std::string id = elems[0];
+-		std::string filename = elems[1];
+-		
+-		if(filename[0] != '_' || filename.length() != 12)
+-		{
+-			LOG_ERROR(HW, "bad filename {}", filename);
+-			continue;
+-		}
+-		
+-		std::string inboxPath = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir)
+-			+ DIR_SEP + "data" + DIR_SEP + "00000000000000000000000000000000" 
+-			+ DIR_SEP + "sysdata" + DIR_SEP + "00010026" + DIR_SEP + "00000000" 
+-			+ DIR_SEP + "CEC" + DIR_SEP + id + DIR_SEP + "InBox___";
+-		
+-		if (!FileUtil::IsDirectory(inboxPath))
+-		{
+-			LOG_ERROR(HW, "no inbox {}", inboxPath);
+-			continue;
+-		}
+-		
+-		std::string boxInfoPath = inboxPath + DIR_SEP + "BoxInfo_____";
+-		
+-		if (!FileUtil::Exists(boxInfoPath))
+-		{
+-			LOG_ERROR(HW, "no boxInfo {}", boxInfoPath);
+-			continue;
+-		}
+-		
+-		struct Service::CECD::Module::CecBoxInfoHeader boxInfo;
+-		FileUtil::IOFile bfile(boxInfoPath, "rb+");
+-		int nRead = bfile.ReadBytes(&boxInfo, sizeof(Service::CECD::Module::CecBoxInfoHeader));
+-		
+-		if(st.size > boxInfo.max_message_size)
+-		{
+-			bfile.Close();
+-			LOG_ERROR(HW, "message too big {} / {}", st.size, boxInfo.max_message_size);
+-			continue;
+-		}
+-		
+-		const std::string ext_inbox_path{fmt::format("{}/zippass/inboxes/{}/", 
+-					FileUtil::GetUserPath(FileUtil::UserPath::UserDir),
+-					id)};
+-		bool ext_inbox = false;
+-
+-		if(boxInfo.message_num >= boxInfo.max_message_num)
+-		{
+-			FileUtil::CreateFullPath(ext_inbox_path);
+-			ext_inbox = true;
+-			LOG_ERROR(HW, "streetpass inbox full {} / {} -> external inbox", boxInfo.message_num, boxInfo.max_message_num);
+-			
+-			FileUtil::FSTEntry data_dir;
+-			std::vector<FileUtil::FSTEntry> files;
+-			FileUtil::ScanDirectoryTree(ext_inbox_path, data_dir, 2048);
+-			FileUtil::GetAllFilesFromNestedEntries(data_dir, files);
+-			
+-			if (files.size() > 99) {
+-				bfile.Close();
+-				LOG_ERROR(Service_FS, "external inbox is full");
+-				continue;
+-			}
+-		}
+-		
+-		zip_file_t *file = zip_fopen_index(za, i, 0);
+-		
+-		unsigned char* buff = new unsigned char[st.size];
+-		
+-		int n = zip_fread(file, buff, st.size);
+-		LOG_ERROR(HW, "zip_fread n {}", n);
+-		zip_fclose(file);
+-		
+-		Service::CECD::Module::CecMessageHeader* messHead = (Service::CECD::Module::CecMessageHeader*)buff;
+-		
+-		std::string b64_messageId = "_" + Service::CECD::Module::EncodeBase64(messHead->message_id);
+-		
+-		std::string sTitleId = "";
+-		unsigned char* bTitleId = (unsigned char*)&messHead->title_id;
+-	
+-		for(int i=3; i>=0; i--)
+-		{
+-			std::string s = fmt::format("{:02x}", bTitleId[i]);
+-			sTitleId += s;
+-		}
+-	
+-		if(	messHead->magic != 0x6060
+-			|| messHead->message_size != st.size
+-			|| sTitleId != id
+-			|| b64_messageId != filename)
+-		{
+-			LOG_ERROR(HW, "bad message header {} {} {} {}", 
+-				messHead->magic, messHead->message_size, sTitleId, b64_messageId);
+-			
+-			bfile.Close();
+-			delete[] buff;
+-			
+-			continue;
+-		}
+-		
+-		auto initTime = SharedPage::GetInitTime(0);
+-		std::chrono::system_clock::time_point tp(initTime);
+-		std::time_t time = std::chrono::system_clock::to_time_t(tp);
+-		std::tm tm = *std::localtime(&time);
+-		
+-		LOG_ERROR(HW, "timestamp {} / {} / {} - {} : {} : {}",
+-			tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+-		
+-		messHead->send_time.year=tm.tm_year + 1900;
+-        messHead->send_time.month=tm.tm_mon + 1;
+-        messHead->send_time.day=tm.tm_mday;
+-        messHead->send_time.hour=tm.tm_hour;
+-        messHead->send_time.minute=tm.tm_min;
+-        messHead->send_time.second=tm.tm_sec;
+-        messHead->send_time.millisecond=1;
+-        messHead->send_time.microsecond=1;
+-        messHead->send_time.padding=1;
+-		
+-		messHead->recv_time = messHead->send_time;
+-		
+-		CryptoPP::AutoSeededRandomPool rng;
+-		rng.GenerateBlock(messHead->message_id.data(), messHead->message_id.size());
+-		filename = "_" + Service::CECD::Module::EncodeBase64(messHead->message_id);
+-		
+-		std::string path = inboxPath + DIR_SEP + filename;
+-		
+-		if(ext_inbox) {
+-			path = ext_inbox_path + filename;
+-		}
+-		
+-		FileUtil::IOFile dfile(path, "wb");
+-	
+-		int written = (int)dfile.WriteBytes(buff, st.size);
+-		LOG_ERROR(HW, "WriteBytes n {}", written);
+-
+-		dfile.Close();
+-		
+-		if(written != st.size)
+-		{
+-			LOG_ERROR(HW, "written != st.size {} / {}", written, st.size);
+-			
+-			bfile.Close();
+-			delete[] buff;
+-			
+-			ret = -1;
+-			break;
+-		}
+-		
+-		if(!ext_inbox) {
+-			boxInfo.message_num++;
+-			boxInfo.box_info_size += 0x70;
+-			boxInfo.box_size += st.size;
+-			
+-			bfile.Seek(0, SEEK_SET);
+-			bfile.WriteBytes(&boxInfo, sizeof(Service::CECD::Module::CecBoxInfoHeader));
+-			
+-			bfile.Seek(0, SEEK_END);
+-			bfile.WriteBytes(buff, 0x70);
+-		}
+-		
+-		bfile.Close();
+-		delete[] buff;
+-		
+-		ret++;
+-	}
+-	
+-	err = zip_close(za);
+-	LOG_ERROR(HW, "zip_close {}", err);
+-	
+-	return ret;
++int importZipPass(std::string path) {
++    std::lock_guard lock(zip_pass_mutex);
++    LOG_INFO(Frontend, "Importing ZipPass {}", path);
++
++    if (const int check = ZipPassChecks(); check != 0) {
++        return check;
++    }
++
++    int err = 0;
++    zip_t* za = zip_open(path.c_str(), ZIP_RDONLY, &err);
++    if (za == nullptr) {
++        LOG_ERROR(Frontend, "ZipPass import: cannot open {} (libzip error {})", path, err);
++        return -1;
++    }
++
++    const zip_int64_t num_entries = zip_get_num_entries(za, 0);
++    int imported = 0;
++    bool write_failed = false;
++
++    for (zip_int64_t i = 0; i < num_entries && !write_failed; i++) {
++        zip_stat_t st;
++        zip_stat_init(&st);
++        if (zip_stat_index(za, i, 0, &st) != 0 || !(st.valid & ZIP_STAT_NAME) ||
++            !(st.valid & ZIP_STAT_SIZE)) {
++            continue;
++        }
++
++        if (st.size < sizeof(MessageHeader) || st.size > MaxMessageFileSize) {
++            LOG_WARNING(Frontend, "ZipPass import: {} has invalid size {}", st.name, st.size);
++            continue;
++        }
++
++        const std::vector<std::string> elems = FileUtil::SplitPathComponents(st.name);
++        if (elems.size() != 2 || !IsHexTitleId(elems[0]) || !IsMessageFileName(elems[1])) {
++            LOG_WARNING(Frontend, "ZipPass import: unexpected entry {}", st.name);
++            continue;
++        }
++        const std::string& title_id = elems[0];
++        const std::string& file_name = elems[1];
++
++        const std::string inbox_path = GetInboxPath(title_id);
++        const std::string box_info_path = inbox_path + DIR_SEP + "BoxInfo_____";
++        if (!FileUtil::IsDirectory(inbox_path) || !FileUtil::Exists(box_info_path)) {
++            LOG_DEBUG(Frontend, "ZipPass import: no StreetPass inbox for {}", title_id);
++            continue;
++        }
++
++        FileUtil::IOFile box_file(box_info_path, "rb+");
++        BoxInfoHeader box_info{};
++        if (!ReadBoxInfo(box_file, box_info)) {
++            LOG_WARNING(Frontend, "ZipPass import: invalid BoxInfo for {}", title_id);
++            continue;
++        }
++
++        if (st.size > box_info.max_message_size) {
++            LOG_WARNING(Frontend, "ZipPass import: message too big for {} ({} > {})", title_id,
++                        st.size, box_info.max_message_size);
++            continue;
++        }
++
++        // Full inbox: park the message in the external inbox; importQueuedZipPass moves it
++        // into the real inbox once the game has read some messages.
++        const bool use_external_inbox = !FitsInBox(box_info, st.size);
++        const std::string external_inbox_path = GetZipPassPath("inboxes/" + title_id + "/");
++        if (use_external_inbox) {
++            FileUtil::CreateFullPath(external_inbox_path);
++            if (CountFiles(external_inbox_path) >= MaxExternalInboxFiles) {
++                LOG_WARNING(Frontend, "ZipPass import: external inbox for {} is full", title_id);
++                continue;
++            }
++        }
++
++        std::vector<u8> message(static_cast<std::size_t>(st.size));
++        zip_file_t* zf = zip_fopen_index(za, i, 0);
++        if (zf == nullptr) {
++            LOG_WARNING(Frontend, "ZipPass import: cannot open entry {}", st.name);
++            continue;
++        }
++        const zip_int64_t n_read = zip_fread(zf, message.data(), st.size);
++        zip_fclose(zf);
++        if (n_read < 0 || static_cast<zip_uint64_t>(n_read) != st.size) {
++            LOG_WARNING(Frontend, "ZipPass import: short read on {} ({} / {})", st.name, n_read,
++                        st.size);
++            continue;
++        }
++
++        MessageHeader header;
++        std::memcpy(&header, message.data(), sizeof(header));
++
++        const std::string header_title_id = fmt::format("{:08x}", u32{header.title_id});
++        const std::string header_file_name =
++            "_" + Service::CECD::Module::EncodeBase64(header.message_id);
++        if (header.magic != MessageMagic || header.message_size != st.size ||
++            header_title_id != title_id || header_file_name != file_name) {
++            LOG_WARNING(Frontend, "ZipPass import: bad message header in {} ({:#x} {} {} {})",
++                        st.name, u16{header.magic}, u32{header.message_size}, header_title_id,
++                        header_file_name);
++            continue;
++        }
++
++        // Stamp the message as received now, with a fresh ID so repeated imports don't collide.
++        const auto init_time = SharedPage::GetInitTime(0);
++        const std::time_t now =
++            std::chrono::system_clock::to_time_t(std::chrono::system_clock::time_point(init_time));
++        const std::tm tm = *std::localtime(&now);
++
++        header.send_time.year = tm.tm_year + 1900;
++        header.send_time.month = static_cast<u8>(tm.tm_mon + 1);
++        header.send_time.day = static_cast<u8>(tm.tm_mday);
++        header.send_time.hour = static_cast<u8>(tm.tm_hour);
++        header.send_time.minute = static_cast<u8>(tm.tm_min);
++        header.send_time.second = static_cast<u8>(tm.tm_sec);
++        header.send_time.millisecond = 1;
++        header.send_time.microsecond = 1;
++        header.send_time.padding = 1;
++        header.recv_time = header.send_time;
++
++        CryptoPP::AutoSeededRandomPool rng;
++        rng.GenerateBlock(header.message_id.data(), header.message_id.size());
++        std::memcpy(message.data(), &header, sizeof(header));
++
++        const std::string new_name = "_" + Service::CECD::Module::EncodeBase64(header.message_id);
++        const std::string dest_path = use_external_inbox ? external_inbox_path + new_name
++                                                         : inbox_path + DIR_SEP + new_name;
++
++        {
++            FileUtil::IOFile dest(dest_path, "wb");
++            if (!dest.IsOpen() || dest.WriteBytes(message.data(), message.size()) != message.size()) {
++                LOG_ERROR(Frontend, "ZipPass import: failed to write {}", dest_path);
++                dest.Close();
++                FileUtil::Delete(dest_path);
++                write_failed = true;
++                break;
++            }
++        }
++
++        if (!use_external_inbox &&
++            !AppendToBox(box_file, box_info, message.data(), message.size())) {
++            LOG_ERROR(Frontend, "ZipPass import: failed to update {}", box_info_path);
++            FileUtil::Delete(dest_path);
++            write_failed = true;
++            break;
++        }
++
++        LOG_DEBUG(Frontend, "ZipPass import: {} -> {}", st.name, dest_path);
++        imported++;
++    }
++
++    zip_discard(za);
++
++    LOG_INFO(Frontend, "ZipPass import: {} message(s) from {}", imported, path);
++    return write_failed ? -1 : imported;
+ }
+ 
+-int importQueuedZipPass()
+-{
+-	LOG_ERROR(HW, "importQueuedZipPass");
+-	
+-	int chck = zipPassChecks();
+-	if(chck) return chck;
+-	
+-	FileUtil::FSTEntry data_dir;
++int importQueuedZipPass() {
++    std::lock_guard lock(zip_pass_mutex);
++    LOG_DEBUG(Frontend, "Processing ZipPass queue");
++
++    if (const int check = ZipPassChecks(); check != 0) {
++        return check;
++    }
++
++    const std::string inboxes_path = GetZipPassPath("inboxes");
++    const std::string queue_path = GetZipPassPath("queue");
++    const std::string history_path = GetZipPassPath("history/");
++
++    if (!FileUtil::CreateFullPath(history_path)) {
++        LOG_ERROR(Frontend, "ZipPass: failed to create {}", history_path);
++        return -10;
++    }
++
++    // 1. Move parked messages from the external inboxes into the real inboxes, while they fit.
++    FileUtil::FSTEntry root;
+     std::vector<FileUtil::FSTEntry> files;
+-	const std::string inboxes_path{fmt::format("{}/zippass/inboxes", FileUtil::GetUserPath(FileUtil::UserPath::UserDir))};
+-	const std::string queue_path{fmt::format("{}/zippass/queue", FileUtil::GetUserPath(FileUtil::UserPath::UserDir))};
+-	const std::string history_path{fmt::format("{}/zippass/history/", FileUtil::GetUserPath(FileUtil::UserPath::UserDir))};
+-	
+-	if (!FileUtil::CreateFullPath(history_path)) {
+-		LOG_ERROR(Service_FS, "Failed to create history_path");
+-		return -10;
+-	}
+-	
+-    FileUtil::ScanDirectoryTree(inboxes_path, data_dir, 2048);
+-    FileUtil::GetAllFilesFromNestedEntries(data_dir, files);
+-	
+-	for(size_t i=0; i<files.size(); i++)
+-	{
+-		std::string file = files[i].physicalName;
+-		auto filepath_elems = FileUtil::SplitPathComponents(file);
+-		
+-		if(filepath_elems.size() > 1) {
+-			std::string filename = filepath_elems.back();
+-			filepath_elems.pop_back();
+-			std::string folder = filepath_elems.back();
+-			
+-			LOG_ERROR(Service_FS, "Import from ext inbox {} / {}", folder, filename);
+-			
+-			std::string inbox = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir)
+-			+ DIR_SEP + "data" + DIR_SEP + "00000000000000000000000000000000" 
+-			+ DIR_SEP + "sysdata" + DIR_SEP + "00010026" + DIR_SEP + "00000000" 
+-			+ DIR_SEP + "CEC" + DIR_SEP + folder + DIR_SEP + "InBox___";
+-			
+-			std::string boxInfoPath = inbox + DIR_SEP + "BoxInfo_____";
+-			
+-			if (FileUtil::IsDirectory(inbox) && FileUtil::Exists(boxInfoPath))
+-			{
+-				struct Service::CECD::Module::CecBoxInfoHeader boxInfo;
+-				FileUtil::IOFile bfile(boxInfoPath, "rb+");
+-				int nRead = bfile.ReadBytes(&boxInfo, sizeof(Service::CECD::Module::CecBoxInfoHeader));
+-				
+-				if(boxInfo.message_num >= boxInfo.max_message_num)
+-				{
+-					LOG_ERROR(Service_FS, "streetpass inbox full {} / {}", boxInfo.message_num, boxInfo.max_message_num);
+-					bfile.Close();
+-					continue;
+-				}
+-				
+-				unsigned char* buff = new unsigned char[0x70];
+-				FileUtil::IOFile spfile(file, "rb");
+-				
+-				spfile.ReadBytes(buff, 0x70);
+-				spfile.Close();
+-				
+-				u64 size = FileUtil::GetSize(file);
+-				FileUtil::Rename(file, inbox + DIR_SEP + filename);
+-				
+-				boxInfo.message_num++;
+-				boxInfo.box_info_size += 0x70;
+-				boxInfo.box_size += size;
+-				
+-				bfile.Seek(0, SEEK_SET);
+-				bfile.WriteBytes(&boxInfo, sizeof(Service::CECD::Module::CecBoxInfoHeader));
+-				
+-				bfile.Seek(0, SEEK_END);
+-				bfile.WriteBytes(buff, 0x70);
+-				
+-				delete[] buff;
+-				bfile.Close();
+-			}
+-		}
+-		
+-		FileUtil::Delete(file);
+-	}
+-	
+-	data_dir.children.clear();
+-	files.clear();
+-    FileUtil::ScanDirectoryTree(queue_path, data_dir, 2048);
+-    FileUtil::GetAllFilesFromNestedEntries(data_dir, files);
+-	
+-	for(size_t i=0; i<files.size(); i++)
+-	{
+-		std::string file = files[i].physicalName;
+-		
+-		if(file.ends_with(".pass.zip"))
+-		{
+-			std::string zip_path = file;
+-			
++    FileUtil::ScanDirectoryTree(inboxes_path, root, 2048);
++    FileUtil::GetAllFilesFromNestedEntries(root, files);
++
++    for (const auto& entry : files) {
++        const std::string& file = entry.physicalName;
++        auto elems = FileUtil::SplitPathComponents(file);
++        if (elems.size() < 2) {
++            continue;
++        }
++        const std::string file_name = elems.back();
++        const std::string title_id = elems[elems.size() - 2];
++
++        const u64 size = FileUtil::GetSize(file);
++        if (!IsHexTitleId(title_id) || !IsMessageFileName(file_name) ||
++            size < sizeof(MessageHeader) || size > MaxMessageFileSize) {
++            LOG_WARNING(Frontend, "ZipPass: removing invalid parked file {}", file);
++            FileUtil::Delete(file);
++            continue;
++        }
++
++        const std::string inbox = GetInboxPath(title_id);
++        const std::string box_info_path = inbox + DIR_SEP + "BoxInfo_____";
++        if (!FileUtil::IsDirectory(inbox)) {
++            // The game's StreetPass box is gone (StreetPass disabled or data cleared).
++            LOG_INFO(Frontend, "ZipPass: no inbox for {} any more, dropping {}", title_id,
++                     file_name);
++            FileUtil::Delete(file);
++            continue;
++        }
++
++        FileUtil::IOFile box_file(box_info_path, "rb+");
++        BoxInfoHeader box_info{};
++        if (!ReadBoxInfo(box_file, box_info)) {
++            LOG_WARNING(Frontend, "ZipPass: invalid BoxInfo for {}, keeping {} for later",
++                        title_id, file_name);
++            continue;
++        }
++        if (size > box_info.max_message_size) {
++            LOG_WARNING(Frontend, "ZipPass: parked {} is too big for {}, dropping", file_name,
++                        title_id);
++            FileUtil::Delete(file);
++            continue;
++        }
++        if (!FitsInBox(box_info, size)) {
++            LOG_DEBUG(Frontend, "ZipPass: inbox {} still full", title_id);
++            continue;
++        }
++
++        std::array<u8, sizeof(MessageHeader)> header{};
++        {
++            FileUtil::IOFile parked(file, "rb");
++            if (!parked.IsOpen() || parked.ReadBytes(header.data(), header.size()) != header.size()) {
++                LOG_WARNING(Frontend, "ZipPass: cannot read parked {}", file);
++                continue;
++            }
++        }
++
++        const std::string dest = inbox + DIR_SEP + file_name;
++        if (!FileUtil::Rename(file, dest)) {
++            LOG_ERROR(Frontend, "ZipPass: failed to move {} into {}", file, inbox);
++            continue;
++        }
++        if (!AppendToBox(box_file, box_info, header.data(), size)) {
++            LOG_ERROR(Frontend, "ZipPass: failed to update {}, moving {} back", box_info_path,
++                      file_name);
++            FileUtil::Rename(dest, file);
++            continue;
++        }
++        LOG_DEBUG(Frontend, "ZipPass: moved parked {} into {}", file_name, title_id);
++    }
++
++    // 2. Import queued .pass.zip files (received from a room while a game was running).
++    root.children.clear();
++    files.clear();
++    FileUtil::ScanDirectoryTree(queue_path, root, 2048);
++    FileUtil::GetAllFilesFromNestedEntries(root, files);
++
++    for (const auto& entry : files) {
++        const std::string& file = entry.physicalName;
++
++        if (!file.ends_with(".pass.zip")) {
++            FileUtil::Delete(file);
++            continue;
++        }
++
++        std::string zip_path = file;
+ #ifdef ANDROID
+-			zip_path = AndroidUtils::TranslateFilePath(file);
++        zip_path = AndroidUtils::TranslateFilePath(file);
+ #endif
+ 
+-			int ret = Core::importZipPass(zip_path);
+-			
+-			if(ret < 0) {
+-				return ret;
+-			}
+-			
+-			const std::string newPath = history_path + FileUtil::SplitPathComponents(file).back();
+-			
+-			FileUtil::Delete(newPath);
+-			FileUtil::Rename(file, newPath);
+-		}
+-		
+-		FileUtil::Delete(file);
+-	}
+-	
+-	Core::trimZipPassHistory();
+-	
+-	return 0;
++        const int ret = importZipPass(zip_path);
++        if (ret == -2 || ret == -3 || ret == -4) {
++            // Environment problem: keep the queue as it is and try again next time.
++            return ret;
++        }
++        if (ret < 0) {
++            LOG_WARNING(Frontend, "ZipPass: queued {} failed to import, moving to history",
++                        file);
++        }
++
++        // Done with this file either way, so a broken zip can't block the queue forever.
++        const std::string history_file = history_path + FileUtil::SplitPathComponents(file).back();
++        FileUtil::Delete(history_file);
++        if (!FileUtil::Rename(file, history_file)) {
++            FileUtil::Delete(file);
++        }
++    }
++
++    trimZipPassHistory();
++    return 0;
+ }
+ 
+-void trimZipPassHistory()
+-{
+-	const std::string history_path{fmt::format("{}/zippass/history/", FileUtil::GetUserPath(FileUtil::UserPath::UserDir))};
+-	FileUtil::FSTEntry data_dir;
++void trimZipPassHistory() {
++    std::lock_guard lock(zip_pass_mutex);
++
++    FileUtil::FSTEntry root;
+     std::vector<FileUtil::FSTEntry> files;
+-	
+-    FileUtil::ScanDirectoryTree(history_path, data_dir, 2048);
+-    FileUtil::GetAllFilesFromNestedEntries(data_dir, files);
+-	
+-	int toRemove = files.size() - 100;
+-	
+-	if(toRemove > 0) {
+-		std::map<time_t, std::string> historyFiles;
+-		
+-		for(auto file : files) {
+-			historyFiles[FileUtil::GetDate(file.physicalName)] = file.physicalName;
+-		}
+-		
+-		for(auto it = historyFiles.begin(); it != historyFiles.end() && toRemove > 0; it++) {
+-			FileUtil::Delete(it->second);
+-			toRemove--;
+-		}
+-	}
++    FileUtil::ScanDirectoryTree(GetZipPassPath("history/"), root, 2048);
++    FileUtil::GetAllFilesFromNestedEntries(root, files);
++
++    if (files.size() <= MaxHistoryFiles) {
++        return;
++    }
++    std::size_t to_remove = files.size() - MaxHistoryFiles;
++
++    // multimap: several files can share the same modification time.
++    std::multimap<time_t, std::string> by_date;
++    for (const auto& entry : files) {
++        by_date.emplace(FileUtil::GetDate(entry.physicalName), entry.physicalName);
++    }
++    for (auto it = by_date.begin(); it != by_date.end() && to_remove > 0; ++it, --to_remove) {
++        FileUtil::Delete(it->second);
++    }
+ }
+ 
+-int clearStreetPassConfig()
+-{
+-	const auto callback = [](u64* num_entries_out, const std::string& directory,
+-                                          const std::string& virtual_name) -> bool {
+-        const std::string physical_name = directory + DIR_SEP + virtual_name;
+-        if (FileUtil::IsDirectory(physical_name)) {
+-            LOG_ERROR(Frontend, "streetpass directory to delete {}", physical_name);
+-			FileUtil::DeleteDirRecursively(physical_name);
++int clearStreetPassConfig() {
++    std::lock_guard lock(zip_pass_mutex);
++
++    const auto on_entry = [](u64*, const std::string& directory,
++                             const std::string& name) -> bool {
++        const std::string path = directory + DIR_SEP + name;
++        if (FileUtil::IsDirectory(path)) {
++            LOG_INFO(Frontend, "Clearing StreetPass box {}", path);
++            FileUtil::DeleteDirRecursively(path);
+         }
+         return true;
+     };
+-	
+-	const std::string dir = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir)
+-		+ DIR_SEP + "data" + DIR_SEP + "00000000000000000000000000000000" 
+-		+ DIR_SEP + "sysdata" + DIR_SEP + "00010026" + DIR_SEP + "00000000" 
+-		+ DIR_SEP + "CEC";
+-
+-    FileUtil::ForeachDirectoryEntry(nullptr, dir, callback);
+ 
+-	return 0;
++    FileUtil::ForeachDirectoryEntry(nullptr, GetCecPath(), on_entry);
++    return 0;
+ }
+ 
+ } // namespace Core
+diff --git a/src/core/zip_pass.h b/src/core/zip_pass.h
+index b47d6c8..646dcfe 100644
+--- a/src/core/zip_pass.h
++++ b/src/core/zip_pass.h
+@@ -4,14 +4,31 @@
+ 
+ namespace Core {
+ 
++// Return codes shared by the import functions:
++//   >= 0  number of messages imported (0 = nothing usable in the file)
++//     -1  the file could not be read, or writing into the NAND failed
++//     -2  no system files installed
++//     -3  the required online LLE modules are disabled
++//     -4  emulation is running (StreetPass boxes are in use)
++//    -10  the ZipPass folders could not be created
++
++/// Exports every game's StreetPass outbox to a .pass.zip file.
++/// Returns the number of messages exported, or -1 on failure.
+ int exportZipPass(std::string path);
+ 
++/// Imports one .pass.zip file into the games' StreetPass inboxes.
+ int importZipPass(std::string path);
+ 
++/// Moves parked messages into inboxes that have room again, then imports queued .pass.zip files.
+ int importQueuedZipPass();
+ 
++/// Keeps only the most recent ZipPass history files.
+ void trimZipPassHistory();
+ 
++/// Deletes every game's StreetPass box (games recreate them when StreetPass is re-enabled).
+ int clearStreetPassConfig();
+ 
++/// Whether a game is currently running, so ZipPass must not touch the StreetPass boxes.
++bool isEmulationRunning();
++
+ } // namespace Core
+diff --git a/src/network/room_member.cpp b/src/network/room_member.cpp
+index 9371612..1772a39 100644
+--- a/src/network/room_member.cpp
++++ b/src/network/room_member.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cctype>
+ #include <list>
+ #include <mutex>
+ #include <set>
+@@ -490,10 +491,23 @@ void RoomMember::RoomMemberImpl::HandleTangeloPecificPacket(const ENetEvent* eve
+ 			u32 nicknameLength;
+ 			packet >> nicknameLength;
+ 			
+-			if(nicknameLength < 64) {
++			if(nicknameLength < 64
++			&& event->packet->dataLength >= 2*sizeof(u8) + sizeof(u32) + nicknameLength) {
+ 				nickname.resize(nicknameLength);
+ 				memcpy(nickname.data(), event->packet->data + 2*sizeof(u8) + sizeof(u32), nicknameLength);
+ 				packet.IgnoreBytes(nicknameLength);
++
++				// The nickname comes from another room member and becomes a file name:
++				// keep only safe characters so it can't escape the zippass folder.
++				for (char& c : nickname) {
++					const unsigned char uc = static_cast<unsigned char>(c);
++					if (!std::isalnum(uc) && c != '-' && c != '_' && c != ' ') {
++						c = '_';
++					}
++				}
++				if (nickname.empty()) {
++					nickname = "unknown";
++				}
+ 				
+ 				u32 dataSize;
+ 				packet >> dataSize;
+@@ -502,7 +516,9 @@ void RoomMember::RoomMemberImpl::HandleTangeloPecificPacket(const ENetEvent* eve
+ 				&& event->packet->dataLength == dataSize + 2*sizeof(u8) + 2*sizeof(u32) + nicknameLength ) {
+ 					std::string dir = "history";
+ 					
+-					if(Loader::getProgramId() != "") {
++					// Queue while a game runs (its StreetPass boxes are in use); the queue is
++					// imported once emulation has stopped.
++					if(Loader::getProgramId() != "" || Core::isEmulationRunning()) {
+ 						FileUtil::FSTEntry data_dir;
+ 						std::vector<FileUtil::FSTEntry> files;
+ 						const std::string queue_path{fmt::format("{}/zippass/queue", FileUtil::GetUserPath(FileUtil::UserPath::UserDir))};
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index f121d3e..eccd5b7 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -7,6 +7,7 @@ add_executable(tests
+     core/hle/kernel/hle_ipc.cpp
+     core/memory/memory.cpp
+     core/memory/vm_manager.cpp
++    core/zip_pass.cpp
+     precompiled_headers.h
+     audio_core/hle/hle.cpp
+     audio_core/hle/source.cpp
+diff --git a/src/tests/core/zip_pass.cpp b/src/tests/core/zip_pass.cpp
+new file mode 100644
+index 0000000..362ae31
+--- /dev/null
++++ b/src/tests/core/zip_pass.cpp
+@@ -0,0 +1,232 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <array>
++#include <cstring>
++#include <filesystem>
++#include <string>
++#include <vector>
++#include "common/file_util.h"
++#include "common/settings.h"
++#include "core/hle/service/cecd/cecd.h"
++#include "core/system_titles.h"
++#include "core/zip_pass.h"
++
++namespace {
++
++using BoxInfoHeader = Service::CECD::Module::CecBoxInfoHeader;
++using MessageHeader = Service::CECD::Module::CecMessageHeader;
++
++constexpr u32 TitleId = 0x0018af00;
++constexpr const char* TitleDir = "0018af00";
++constexpr u32 BodySize = 0x30;
++constexpr u32 MessageSize = sizeof(MessageHeader) + BodySize;
++
++/// A throwaway user folder laid out like the emulator's: nand/, zippass/, and a fake home menu
++/// so ZipPass's "system files installed" check passes.
++struct ZipPassFixture {
++    std::string root;
++
++    ZipPassFixture() {
++        root = (std::filesystem::temp_directory_path() /
++                ("tangelo_zippass_test_" + std::to_string(std::rand())))
++                   .string() +
++               "/";
++        FileUtil::CreateFullPath(root + "nand/");
++        FileUtil::SetUserPath(root);
++        FileUtil::UpdateUserPath(FileUtil::UserPath::UserDir, root);
++        FileUtil::UpdateUserPath(FileUtil::UserPath::NANDDir, root + "nand/");
++
++        const std::string home = Core::GetHomeMenuNcchPath(0);
++        FileUtil::CreateFullPath(home);
++        FileUtil::WriteStringToFile(false, home, "not a real home menu");
++
++        Settings::values.enable_required_online_lle_modules.SetValue(true);
++    }
++
++    ~ZipPassFixture() {
++        FileUtil::DeleteDirRecursively(root);
++    }
++
++    std::string Cec() const {
++        return root + "nand/data/00000000000000000000000000000000/sysdata/00010026/00000000/CEC/";
++    }
++    std::string Inbox() const {
++        return Cec() + TitleDir + "/InBox___/";
++    }
++    std::string Outbox() const {
++        return Cec() + TitleDir + "/OutBox__/";
++    }
++    std::string ZipPass(const std::string& sub) const {
++        return root + "zippass/" + sub;
++    }
++
++    void WriteBoxInfo(u32 message_num, u32 max_message_num) const {
++        BoxInfoHeader info{};
++        info.magic = 0x6262;
++        info.box_info_size = sizeof(BoxInfoHeader) + message_num * sizeof(MessageHeader);
++        info.max_box_size = 0x10000;
++        info.box_size = message_num * MessageSize;
++        info.max_message_num = max_message_num;
++        info.message_num = message_num;
++        info.max_batch_size = 1;
++        info.max_message_size = 0x1000;
++
++        std::vector<u8> data(info.box_info_size);
++        std::memcpy(data.data(), &info, sizeof(info));
++        FileUtil::CreateFullPath(Inbox());
++        FileUtil::IOFile file(Inbox() + "BoxInfo_____", "wb");
++        file.WriteBytes(data.data(), data.size());
++    }
++
++    BoxInfoHeader ReadBoxInfo() const {
++        BoxInfoHeader info{};
++        FileUtil::IOFile file(Inbox() + "BoxInfo_____", "rb");
++        file.ReadBytes(&info, sizeof(info));
++        return info;
++    }
++
++    /// Puts one valid StreetPass message in the outbox and returns its file name.
++    std::string WriteOutboxMessage() const {
++        MessageHeader header{};
++        header.magic = 0x6060;
++        header.message_size = MessageSize;
++        header.header_size = sizeof(MessageHeader);
++        header.body_size = BodySize;
++        header.title_id = TitleId;
++        header.message_id = {1, 2, 3, 4, 5, 6, 7, 8};
++
++        std::vector<u8> data(MessageSize, 0xAB);
++        std::memcpy(data.data(), &header, sizeof(header));
++
++        const std::string name = "_" + Service::CECD::Module::EncodeBase64(header.message_id);
++        FileUtil::CreateFullPath(Outbox());
++        FileUtil::IOFile file(Outbox() + name, "wb");
++        file.WriteBytes(data.data(), data.size());
++        return name;
++    }
++
++    /// Message files in a folder (everything except BoxInfo_____).
++    std::vector<std::string> Messages(const std::string& dir) const {
++        std::vector<std::string> names;
++        if (!std::filesystem::exists(dir)) {
++            return names;
++        }
++        for (const auto& entry : std::filesystem::directory_iterator(dir)) {
++            const std::string name = entry.path().filename().string();
++            if (name != "BoxInfo_____") {
++                names.push_back(name);
++            }
++        }
++        return names;
++    }
++};
++
++} // namespace
++
++TEST_CASE("ZipPass export and import round trip", "[core][zippass]") {
++    ZipPassFixture fx;
++    const std::string original_name = fx.WriteOutboxMessage();
++    fx.WriteBoxInfo(0, 2);
++
++    const std::string zip = fx.root + "test.pass.zip";
++    REQUIRE(Core::exportZipPass(zip) == 1);
++    REQUIRE(FileUtil::Exists(zip));
++
++    // First import lands in the real inbox and is registered in BoxInfo.
++    REQUIRE(Core::importZipPass(zip) == 1);
++    auto inbox = fx.Messages(fx.Inbox());
++    REQUIRE(inbox.size() == 1);
++    CHECK(inbox[0] != original_name); // a fresh message ID is assigned
++    CHECK(FileUtil::GetSize(fx.Inbox() + inbox[0]) == MessageSize);
++
++    BoxInfoHeader info = fx.ReadBoxInfo();
++    CHECK(info.message_num == 1);
++    CHECK(info.box_size == MessageSize);
++    CHECK(info.box_info_size == sizeof(BoxInfoHeader) + sizeof(MessageHeader));
++    CHECK(FileUtil::GetSize(fx.Inbox() + "BoxInfo_____") == info.box_info_size);
++
++    // The imported message keeps a valid header.
++    MessageHeader header{};
++    {
++        FileUtil::IOFile file(fx.Inbox() + inbox[0], "rb");
++        file.ReadBytes(&header, sizeof(header));
++    }
++    CHECK(header.magic == 0x6060);
++    CHECK(header.title_id == TitleId);
++    CHECK("_" + Service::CECD::Module::EncodeBase64(header.message_id) == inbox[0]);
++
++    // Second import fills the inbox (max 2 messages).
++    REQUIRE(Core::importZipPass(zip) == 1);
++    CHECK(fx.ReadBoxInfo().message_num == 2);
++
++    // Third import: inbox full, so the message is parked in the external inbox.
++    REQUIRE(Core::importZipPass(zip) == 1);
++    CHECK(fx.ReadBoxInfo().message_num == 2);
++    CHECK(fx.Messages(fx.Inbox()).size() == 2);
++    CHECK(fx.Messages(fx.ZipPass("inboxes/") + TitleDir).size() == 1);
++
++    // The game "reads" a message: room again, so the queue pass moves the parked one in.
++    fx.WriteBoxInfo(1, 2);
++    std::filesystem::remove(fx.Inbox() + fx.Messages(fx.Inbox())[0]);
++    REQUIRE(Core::importQueuedZipPass() == 0);
++    CHECK(fx.Messages(fx.ZipPass("inboxes/") + TitleDir).empty());
++    CHECK(fx.ReadBoxInfo().message_num == 2);
++    CHECK(fx.Messages(fx.Inbox()).size() == 2);
++}
++
++TEST_CASE("ZipPass import rejects bad input without crashing", "[core][zippass]") {
++    ZipPassFixture fx;
++    fx.WriteBoxInfo(0, 2);
++
++    SECTION("file that is not a zip") {
++        const std::string bad = fx.root + "broken.pass.zip";
++        FileUtil::WriteStringToFile(false, bad, "this is not a zip file");
++        CHECK(Core::importZipPass(bad) == -1);
++    }
++
++    SECTION("missing file") {
++        CHECK(Core::importZipPass(fx.root + "does_not_exist.pass.zip") == -1);
++    }
++
++    SECTION("inbox with a corrupt BoxInfo is left untouched") {
++        fx.WriteOutboxMessage();
++        const std::string zip = fx.root + "test.pass.zip";
++        REQUIRE(Core::exportZipPass(zip) == 1);
++
++        FileUtil::WriteStringToFile(false, fx.Inbox() + "BoxInfo_____", "garbage");
++        CHECK(Core::importZipPass(zip) == 0);
++        CHECK(fx.Messages(fx.Inbox()).empty());
++    }
++
++    CHECK(fx.ReadBoxInfo().message_num == 0);
++}
++
++TEST_CASE("ZipPass queue is not blocked by a broken file", "[core][zippass]") {
++    ZipPassFixture fx;
++    FileUtil::CreateFullPath(fx.ZipPass("queue/"));
++    FileUtil::WriteStringToFile(false, fx.ZipPass("queue/broken.pass.zip"), "not a zip");
++
++    REQUIRE(Core::importQueuedZipPass() == 0);
++    CHECK(fx.Messages(fx.ZipPass("queue/")).empty());
++    CHECK(FileUtil::Exists(fx.ZipPass("history/broken.pass.zip")));
++}
++
++TEST_CASE("ZipPass environment checks", "[core][zippass]") {
++    ZipPassFixture fx;
++    const std::string zip = fx.root + "any.pass.zip";
++
++    SECTION("LLE modules disabled") {
++        Settings::values.enable_required_online_lle_modules.SetValue(false);
++        CHECK(Core::importZipPass(zip) == -3);
++        Settings::values.enable_required_online_lle_modules.SetValue(true);
++    }
++
++    SECTION("no system files") {
++        FileUtil::Delete(Core::GetHomeMenuNcchPath(0));
++        CHECK(Core::importZipPass(zip) == -2);
++    }
++}
+-- 
+2.43.0
+

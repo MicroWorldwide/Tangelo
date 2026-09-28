@@ -1,0 +1,302 @@
+From dcf292c634b3292e5bc86e9ca9975de2dde4a639 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 17:38:24 +0200
+Subject: [PATCH] ac/fs/frd: handle calls made when enabling SpotPass
+
+Disney Magical World's SpotPass setup (and games on the HLE friends
+service) hit these unimplemented calls. Layouts are from 3dbrew.
+
+- ac GetCurrentAPInfo (0x000E): returns the 0x34-byte AP info. While
+  connected it describes a fixed virtual AP (SSID "Tangelo", locally
+  administered BSSID); otherwise it is empty.
+- ac GetNZoneApNumService (0x0011): returns the 0x24-byte Nintendo Zone
+  info, always empty (no Nintendo Zone hotspots).
+- fs CheckAuthorityToAccessExtSaveData (0x083D): answers "has access";
+  Tangelo does not enforce extdata access rights.
+- frd AttachToEventNotification (0x0020): keeps the event; it is never
+  signalled since there is no friend server.
+
+ac GetConnectingLocation (0x0014) is left on the fallback: it is
+undocumented. ps VerifyRsaSha256 is left as is on purpose; it needs a
+real implementation, not a stub.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp      | 48 +++++++++++++++++++++++++++++
+ src/core/hle/service/ac/ac.h        | 24 +++++++++++++++
+ src/core/hle/service/ac/ac_i.cpp    |  4 +--
+ src/core/hle/service/ac/ac_u.cpp    |  4 +--
+ src/core/hle/service/frd/frd.cpp    | 11 +++++++
+ src/core/hle/service/frd/frd.h      | 10 ++++++
+ src/core/hle/service/frd/frd_a.cpp  |  2 +-
+ src/core/hle/service/frd/frd_u.cpp  |  2 +-
+ src/core/hle/service/fs/fs_user.cpp | 19 +++++++++++-
+ src/core/hle/service/fs/fs_user.h   | 12 ++++++++
+ 10 files changed, 129 insertions(+), 7 deletions(-)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 868f5d8..40f40b3 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -2,6 +2,10 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <string_view>
+ #include <vector>
+ #include "common/archives.h"
+ #include "common/common_types.h"
+@@ -195,6 +199,50 @@ void Module::Interface::GetConnectingProxyEnable(Kernel::HLERequestContext& ctx)
+     LOG_WARNING(Service_AC, "(STUBBED) called");
+ }
+ 
++void Module::Interface::GetCurrentAPInfo(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 size = rp.Pop<u32>();
++    rp.PopPID();
++
++    // Layout from 3dbrew: 0x0 SSID length, 0x4 SSID (32 bytes), 0x24 BSSID (6 bytes), rest
++    // unknown. Tangelo has no real access point, so while "connected" it reports a fixed virtual
++    // one; when not connected the structure is left empty.
++    constexpr std::size_t APInfoSize = 0x34;
++    std::vector<u8> info(std::min<std::size_t>(size, APInfoSize), 0);
++    if (ac->ac_connected && info.size() == APInfoSize) {
++        constexpr std::string_view ssid = "Tangelo";
++        const u32 ssid_length = static_cast<u32>(ssid.size());
++        std::memcpy(info.data(), &ssid_length, sizeof(ssid_length));
++        std::memcpy(info.data() + 0x4, ssid.data(), ssid.size());
++        // Locally administered unicast MAC, so it can't clash with a real vendor's address.
++        constexpr std::array<u8, 6> bssid{0x02, 0x54, 0x47, 0x4C, 0x4F, 0x01};
++        std::memcpy(info.data() + 0x24, bssid.data(), bssid.size());
++    }
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(info), 0);
++
++    LOG_DEBUG(Service_AC, "called, size=0x{:X}, connected={}", size, ac->ac_connected);
++}
++
++void Module::Interface::GetNZoneApNumService(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 size = rp.Pop<u32>();
++    rp.PopPID();
++
++    // Layout from 3dbrew: 0x0 ApNum (10 bytes), 0xA padding, 0xC service name (UTF-8, 24 bytes).
++    // Nintendo Zone hotspots don't exist for Tangelo, so the structure is always empty.
++    constexpr std::size_t NZoneInfoSize = 0x24;
++    std::vector<u8> info(std::min<std::size_t>(size, NZoneInfoSize), 0);
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(info), 0);
++
++    LOG_DEBUG(Service_AC, "called, size=0x{:X}", size);
++}
++
+ void Module::Interface::IsConnected(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     u32 unk = rp.Pop<u32>();
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index 317f052..c4700cc 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -168,6 +168,30 @@ public:
+          */
+         void IsConnected(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::GetCurrentAPInfo service function (0x000E)
++         *  Inputs:
++         *      1 : Size of the output buffer (0x34)
++         *      2 : ProcessID header (0x20)
++         *      3 : ProcessID
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2-3 : Static buffer (id 0) with the AP info structure
++         */
++        void GetCurrentAPInfo(Kernel::HLERequestContext& ctx);
++
++        /**
++         * AC::GetNZoneApNumService service function (0x0011)
++         *  Inputs:
++         *      1 : Size of the output buffer (0x24)
++         *      2 : ProcessID header (0x20)
++         *      3 : ProcessID
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2-3 : Static buffer (id 0) with the Nintendo Zone info structure
++         */
++        void GetNZoneApNumService(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::SetClientVersion service function
+          *  Inputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index cfe3e68..e6ce6d3 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -19,9 +19,9 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x000A, nullptr, "GetLastErrorCode"},
+         {0x000C, &AC_I::GetStatus, "GetStatus"},
+         {0x000D, &AC_I::GetWifiStatus, "GetWifiStatus"},
+-        {0x000E, nullptr, "GetCurrentAPInfo"},
++        {0x000E, &AC_I::GetCurrentAPInfo, "GetCurrentAPInfo"},
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+-        {0x0011, nullptr, "GetNZoneApNumService"},
++        {0x0011, &AC_I::GetNZoneApNumService, "GetNZoneApNumService"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0027, &AC_I::GetInfraPriority, "GetInfraPriority"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 4b4d7e9..af44539 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -19,9 +19,9 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x000A, nullptr, "GetLastErrorCode"},
+         {0x000C, &AC_U::GetStatus, "GetStatus"},
+         {0x000D, &AC_U::GetWifiStatus, "GetWifiStatus"},
+-        {0x000E, nullptr, "GetCurrentAPInfo"},
++        {0x000E, &AC_U::GetCurrentAPInfo, "GetCurrentAPInfo"},
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+-        {0x0011, nullptr, "GetNZoneApNumService"},
++        {0x0011, &AC_U::GetNZoneApNumService, "GetNZoneApNumService"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0027, &AC_U::GetInfraPriority, "GetInfraPriority"},
+diff --git a/src/core/hle/service/frd/frd.cpp b/src/core/hle/service/frd/frd.cpp
+index cc54285..5ebb5e3 100644
+--- a/src/core/hle/service/frd/frd.cpp
++++ b/src/core/hle/service/frd/frd.cpp
+@@ -255,6 +255,17 @@ void Module::Interface::SetNotificationMask(Kernel::HLERequestContext& ctx) {
+     LOG_DEBUG(Service_FRD, "(STUBBED) called, mask=0x{:08X}", mask);
+ }
+ 
++void Module::Interface::AttachToEventNotification(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    // No friend server means no friend notifications, so the event is kept but never signalled.
++    [[maybe_unused]] const auto event = rp.PopObject<Kernel::Event>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_FRD, "(STUBBED) called");
++}
++
+ void Module::Interface::IsOnline(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+diff --git a/src/core/hle/service/frd/frd.h b/src/core/hle/service/frd/frd.h
+index f617437..39e733e 100644
+--- a/src/core/hle/service/frd/frd.h
++++ b/src/core/hle/service/frd/frd.h
+@@ -240,6 +240,16 @@ public:
+          */
+         void SetNotificationMask(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * FRD::AttachToEventNotification service function (0x0020)
++         *  Inputs:
++         *      1 : Handle translation header (0)
++         *      2 : Event signalled when a friend notification arrives
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void AttachToEventNotification(Kernel::HLERequestContext& ctx);
++
+         /**
+          * FRD::Login service function
+          *  Inputs:
+diff --git a/src/core/hle/service/frd/frd_a.cpp b/src/core/hle/service/frd/frd_a.cpp
+index 2d5fcef..fa6c660 100644
+--- a/src/core/hle/service/frd/frd_a.cpp
++++ b/src/core/hle/service/frd/frd_a.cpp
+@@ -42,7 +42,7 @@ FRD_A::FRD_A(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x001D, &FRD_A::UpdateGameModeDescription, "UpdateGameModeDescription"},
+         {0x001E, nullptr, "UpdateGameMode"},
+         {0x001F, nullptr, "SendInvitation"},
+-        {0x0020, nullptr, "AttachToEventNotification"},
++        {0x0020, &FRD_A::AttachToEventNotification, "AttachToEventNotification"},
+         {0x0021, &FRD_A::SetNotificationMask, "SetNotificationMask"},
+         {0x0022, nullptr, "GetEventNotification"},
+         {0x0023, &FRD_A::GetLastResponseResult, "GetLastResponseResult"},
+diff --git a/src/core/hle/service/frd/frd_u.cpp b/src/core/hle/service/frd/frd_u.cpp
+index 41f76da..3761c99 100644
+--- a/src/core/hle/service/frd/frd_u.cpp
++++ b/src/core/hle/service/frd/frd_u.cpp
+@@ -42,7 +42,7 @@ FRD_U::FRD_U(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x001D, &FRD_U::UpdateGameModeDescription, "UpdateGameModeDescription"},
+         {0x001E, nullptr, "UpdateGameMode"},
+         {0x001F, nullptr, "SendInvitation"},
+-        {0x0020, nullptr, "AttachToEventNotification"},
++        {0x0020, &FRD_U::AttachToEventNotification, "AttachToEventNotification"},
+         {0x0021, &FRD_U::SetNotificationMask, "SetNotificationMask"},
+         {0x0022, nullptr, "GetEventNotification"},
+         {0x0023, &FRD_U::GetLastResponseResult, "GetLastResponseResult"},
+diff --git a/src/core/hle/service/fs/fs_user.cpp b/src/core/hle/service/fs/fs_user.cpp
+index 4f53840..b3961aa 100644
+--- a/src/core/hle/service/fs/fs_user.cpp
++++ b/src/core/hle/service/fs/fs_user.cpp
+@@ -1327,6 +1327,23 @@ void FS_USER::GetSpecialContentIndex(Kernel::HLERequestContext& ctx) {
+     }
+ }
+ 
++void FS_USER::CheckAuthorityToAccessExtSaveData(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const auto media_type = rp.PopEnum<MediaType>();
++    const u32 save_low = rp.Pop<u32>();
++    const u32 save_high = rp.Pop<u32>();
++    const u32 process_id = rp.Pop<u32>();
++
++    // Tangelo doesn't enforce extdata access rights (opening the archive always works), so the
++    // honest answer to "may this process access it" is yes.
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u8>(1);
++
++    LOG_DEBUG(Service_FS, "called, media_type={}, save={:08X}{:08X}, process_id={}", media_type,
++              save_high, save_low, process_id);
++}
++
+ void FS_USER::GetNumSeeds(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+@@ -1854,7 +1871,7 @@ FS_USER::FS_USER(Core::System& system)
+         {0x083A, &FS_USER::GetSpecialContentIndex, "GetSpecialContentIndex"},
+         {0x083B, nullptr, "GetLegacyRomHeader"},
+         {0x083C, nullptr, "GetLegacyBannerData"},
+-        {0x083D, nullptr, "CheckAuthorityToAccessExtSaveData"},
++        {0x083D, &FS_USER::CheckAuthorityToAccessExtSaveData, "CheckAuthorityToAccessExtSaveData"},
+         {0x083E, nullptr, "QueryTotalQuotaSize"},
+         {0x083F, nullptr, "GetExtDataBlockSize"},
+         {0x0840, nullptr, "AbnegateAccessRight"},
+diff --git a/src/core/hle/service/fs/fs_user.h b/src/core/hle/service/fs/fs_user.h
+index d6a3337..851ab30 100644
+--- a/src/core/hle/service/fs/fs_user.h
++++ b/src/core/hle/service/fs/fs_user.h
+@@ -646,6 +646,18 @@ private:
+      *      1 : Result of function, 0 on success, otherwise error code
+      *      2 : Number of seeds in the SEEDDB
+      */
++    /**
++     * FS_User::CheckAuthorityToAccessExtSaveData service function (0x083D)
++     *  Inputs:
++     *      1 : Media type
++     *      2-3 : Extdata ID (low, high)
++     *      4 : Process ID
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     *      2 : u8, whether the process may access the extdata
++     */
++    void CheckAuthorityToAccessExtSaveData(Kernel::HLERequestContext& ctx);
++
+     void GetNumSeeds(Kernel::HLERequestContext& ctx);
+ 
+     void SetUnknown0x80Data(Kernel::HLERequestContext& ctx);
+-- 
+2.43.0
+

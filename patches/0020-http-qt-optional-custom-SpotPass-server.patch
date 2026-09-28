@@ -1,0 +1,526 @@
+From 6af2066a92472be0a9aae8d23bdf0d071a6711e1 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 00:36:31 +0200
+Subject: [PATCH] http/qt: optional custom SpotPass server
+
+Adds a SpotPass group to Configure > General > Network (under Network /
+Room): "Nintendo SpotPass" (default, unchanged behaviour) or "Custom
+SpotPass server" with an address field.
+
+With a custom server, http:C requests for Nintendo's SpotPass hosts
+(npdl.cdn.nintendowifi.net content, nppl.c.app.nintendowifi.net policy
+list, npul.c.app.nintendowifi.net uploads) are rewritten to the custom
+address, keeping the original path and query. Without a scheme, https
+is assumed. The original host is sent as X-Tangelo-Original-Host so one
+server can serve all three. Each redirect is logged at Info level.
+
+This works for both LLE and HLE BOSS, since both download through
+http:C, which doesn't verify server certificates.
+
+New settings: use_custom_spotpass_server, spotpass_server_url
+([WebService] group; also read on Android).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ CMakeModules/GenerateSettingKeys.cmake        |  2 +
+ src/android/app/src/main/jni/config.cpp       |  2 +
+ src/android/app/src/main/jni/default_ini.h    |  7 +-
+ src/citra_qt/configuration/config.cpp         |  4 +
+ .../configuration/configure_network.cpp       | 17 ++++
+ .../configuration/configure_network.h         |  2 +
+ .../configuration/configure_network.ui        | 55 +++++++++++
+ src/common/settings.h                         |  3 +
+ src/core/CMakeLists.txt                       |  2 +
+ src/core/hle/service/http/http_c.cpp          | 25 ++++-
+ .../hle/service/http/spotpass_redirect.cpp    | 96 +++++++++++++++++++
+ src/core/hle/service/http/spotpass_redirect.h | 30 ++++++
+ src/tests/CMakeLists.txt                      |  1 +
+ .../core/hle/service/spotpass_redirect.cpp    | 50 ++++++++++
+ 14 files changed, 294 insertions(+), 2 deletions(-)
+ create mode 100644 src/core/hle/service/http/spotpass_redirect.cpp
+ create mode 100644 src/core/hle/service/http/spotpass_redirect.h
+ create mode 100644 src/tests/core/hle/service/spotpass_redirect.cpp
+
+diff --git a/CMakeModules/GenerateSettingKeys.cmake b/CMakeModules/GenerateSettingKeys.cmake
+index f75bfe5..527f5a2 100644
+--- a/CMakeModules/GenerateSettingKeys.cmake
++++ b/CMakeModules/GenerateSettingKeys.cmake
+@@ -148,6 +148,8 @@ foreach(KEY IN ITEMS
+     "language" # FIXME: DUPLICATE KEY (libretro equivalent: language_value)
+     "web_api_url"
+     "network_token"
++    "use_custom_spotpass_server"
++    "spotpass_server_url"
+     "check_for_update_on_start"
+     "update_check_channel"
+ )
+diff --git a/src/android/app/src/main/jni/config.cpp b/src/android/app/src/main/jni/config.cpp
+index f5f80bf..127bc8b 100644
+--- a/src/android/app/src/main/jni/config.cpp
++++ b/src/android/app/src/main/jni/config.cpp
+@@ -331,6 +331,8 @@ void Config::ReadValues() {
+     // Web Service
+     ReadSetting("WebService", Settings::values.web_api_url);
+     ReadSetting("WebService", Settings::values.network_token);
++    ReadSetting("WebService", Settings::values.use_custom_spotpass_server);
++    ReadSetting("WebService", Settings::values.spotpass_server_url);
+ }
+ 
+ void Config::Reload() {
+diff --git a/src/android/app/src/main/jni/default_ini.h b/src/android/app/src/main/jni/default_ini.h
+index 49ebadc..eaa729b 100644
+--- a/src/android/app/src/main/jni/default_ini.h
++++ b/src/android/app/src/main/jni/default_ini.h
+@@ -590,7 +590,12 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
+ # URL for Web API
+ )") DECLARE_KEY(web_api_url) BOOST_HANA_STRING(R"(
+ # Token for Web Service
+-)") DECLARE_KEY(network_token) BOOST_HANA_STRING("\n")
++)") DECLARE_KEY(network_token) BOOST_HANA_STRING(R"(
++# Send SpotPass traffic meant for Nintendo's servers to your own server
++# 0: Nintendo SpotPass (default), 1: Custom server
++)") DECLARE_KEY(use_custom_spotpass_server) BOOST_HANA_STRING(R"(
++# Custom SpotPass server address, e.g. https://spotpass.example.local:8443
++)") DECLARE_KEY(spotpass_server_url) BOOST_HANA_STRING("\n")
+ 
+ ).c_str();
+ 
+diff --git a/src/citra_qt/configuration/config.cpp b/src/citra_qt/configuration/config.cpp
+index 9485e53..3fa9a00 100644
+--- a/src/citra_qt/configuration/config.cpp
++++ b/src/citra_qt/configuration/config.cpp
+@@ -920,6 +920,8 @@ void QtConfig::ReadWebServiceValues() {
+ 
+     ReadBasicSetting(Settings::values.web_api_url);
+     ReadBasicSetting(Settings::values.network_token);
++    ReadBasicSetting(Settings::values.use_custom_spotpass_server);
++    ReadBasicSetting(Settings::values.spotpass_server_url);
+ 
+     qt_config->endGroup();
+ }
+@@ -1453,6 +1455,8 @@ void QtConfig::SaveWebServiceValues() {
+ 
+     WriteBasicSetting(Settings::values.web_api_url);
+     WriteBasicSetting(Settings::values.network_token);
++    WriteBasicSetting(Settings::values.use_custom_spotpass_server);
++    WriteBasicSetting(Settings::values.spotpass_server_url);
+ 
+     qt_config->endGroup();
+ }
+diff --git a/src/citra_qt/configuration/configure_network.cpp b/src/citra_qt/configuration/configure_network.cpp
+index 5bbc3bf..8782eb1 100644
+--- a/src/citra_qt/configuration/configure_network.cpp
++++ b/src/citra_qt/configuration/configure_network.cpp
+@@ -20,6 +20,8 @@ ConfigureWeb::ConfigureWeb(QWidget* parent)
+     ui->web_api_url_lineedit->setEnabled(false);
+     ui->token_lineedit->setEnabled(false);
+ #endif
++    connect(ui->spotpass_custom_radio, &QRadioButton::toggled, this,
++            [this](bool checked) { UpdateSpotPassFields(checked); });
+     SetConfiguration();
+ }
+ 
+@@ -31,6 +33,13 @@ void ConfigureWeb::SetConfiguration() {
+         QString::fromStdString(Settings::values.web_api_url.GetValue()));
+     ui->token_lineedit->setText(QString::fromStdString(Settings::values.network_token.GetValue()));
+ 
++    const bool custom_spotpass = Settings::values.use_custom_spotpass_server.GetValue();
++    ui->spotpass_nintendo_radio->setChecked(!custom_spotpass);
++    ui->spotpass_custom_radio->setChecked(custom_spotpass);
++    ui->spotpass_url_lineedit->setText(
++        QString::fromStdString(Settings::values.spotpass_server_url.GetValue()));
++    UpdateSpotPassFields(custom_spotpass);
++
+ #ifdef ENABLE_DISCORD_RPC
+     ui->toggle_discordrpc->setChecked(UISettings::values.enable_discord_presence.GetValue());
+ #endif
+@@ -43,6 +52,14 @@ void ConfigureWeb::ApplyConfiguration() {
+ 
+     Settings::values.web_api_url = ui->web_api_url_lineedit->text().toStdString();
+     Settings::values.network_token = ui->token_lineedit->text().toStdString();
++    Settings::values.use_custom_spotpass_server = ui->spotpass_custom_radio->isChecked();
++    Settings::values.spotpass_server_url =
++        ui->spotpass_url_lineedit->text().trimmed().toStdString();
++}
++
++void ConfigureWeb::UpdateSpotPassFields(bool custom) {
++    ui->spotpass_url_label->setEnabled(custom);
++    ui->spotpass_url_lineedit->setEnabled(custom);
+ }
+ 
+ void ConfigureWeb::RetranslateUI() {
+diff --git a/src/citra_qt/configuration/configure_network.h b/src/citra_qt/configuration/configure_network.h
+index 7467dac..5c1bd37 100644
+--- a/src/citra_qt/configuration/configure_network.h
++++ b/src/citra_qt/configuration/configure_network.h
+@@ -23,5 +23,7 @@ public:
+     void SetConfiguration();
+ 
+ private:
++    void UpdateSpotPassFields(bool custom);
++
+     std::unique_ptr<Ui::ConfigureWeb> ui;
+ };
+diff --git a/src/citra_qt/configuration/configure_network.ui b/src/citra_qt/configuration/configure_network.ui
+index 1faea3a..3d8850d 100644
+--- a/src/citra_qt/configuration/configure_network.ui
++++ b/src/citra_qt/configuration/configure_network.ui
+@@ -56,6 +56,56 @@
+      </layout>
+     </widget>
+    </item>
++   <item>
++    <widget class="QGroupBox" name="spotpass_group">
++     <property name="title">
++      <string>SpotPass</string>
++     </property>
++     <layout class="QVBoxLayout" name="verticalLayout_23">
++      <item>
++       <widget class="QRadioButton" name="spotpass_nintendo_radio">
++        <property name="text">
++         <string>Nintendo SpotPass</string>
++        </property>
++        <property name="checked">
++         <bool>true</bool>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QRadioButton" name="spotpass_custom_radio">
++        <property name="text">
++         <string>Custom SpotPass server</string>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QLabel" name="spotpass_url_label">
++        <property name="text">
++         <string>SpotPass server address:</string>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QLineEdit" name="spotpass_url_lineedit">
++        <property name="placeholderText">
++         <string>https://spotpass.example.local:8443</string>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QLabel" name="spotpass_hint_label">
++        <property name="text">
++         <string>With a custom server, SpotPass requests meant for Nintendo (content downloads, the policy list and uploads) go to this address instead. The original path is kept, e.g. /p01/nsa/…</string>
++        </property>
++        <property name="wordWrap">
++         <bool>true</bool>
++        </property>
++       </widget>
++      </item>
++     </layout>
++    </widget>
++   </item>
+    <item>
+     <spacer name="verticalSpacer">
+      <property name="orientation">
+@@ -73,6 +123,11 @@
+  </widget>
+  <tabstops>
+   <tabstop>toggle_discordrpc</tabstop>
++  <tabstop>web_api_url_lineedit</tabstop>
++  <tabstop>token_lineedit</tabstop>
++  <tabstop>spotpass_nintendo_radio</tabstop>
++  <tabstop>spotpass_custom_radio</tabstop>
++  <tabstop>spotpass_url_lineedit</tabstop>
+  </tabstops>
+  <resources/>
+  <connections/>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index cd629b1..2f066c3 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -660,6 +660,9 @@ struct Values {
+     // WebService
+     Setting<std::string> web_api_url{"http://88.198.47.46:5000", Keys::web_api_url};
+     Setting<std::string> network_token{"", Keys::network_token};
++    /// Send SpotPass (BOSS) traffic for Nintendo's servers to spotpass_server_url instead.
++    Setting<bool> use_custom_spotpass_server{false, Keys::use_custom_spotpass_server};
++    Setting<std::string> spotpass_server_url{"", Keys::spotpass_server_url};
+ 
+     // Miscellaneous
+     Setting<std::string> log_filter{"*:Info", Keys::log_filter};
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index a2aecf3..cd2d363 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -332,6 +332,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
+     hle/service/hid/hid_user.h
+     hle/service/http/http_c.cpp
+     hle/service/http/http_c.h
++    hle/service/http/spotpass_redirect.cpp
++    hle/service/http/spotpass_redirect.h
+     hle/service/ir/extra_hid.cpp
+     hle/service/ir/extra_hid.h
+     hle/service/ir/ir.cpp
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index d5ad6c2..7c2b471 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -13,6 +13,7 @@
+ #include "common/assert.h"
+ #include "common/file_util.h"
+ #include "common/scope_exit.h"
++#include "common/settings.h"
+ #include "common/string_util.h"
+ #include "common/web_util.h"
+ #include "core/core.h"
+@@ -23,6 +24,7 @@
+ #include "core/hle/romfs.h"
+ #include "core/hle/service/fs/archive.h"
+ #include "core/hle/service/http/http_c.h"
++#include "core/hle/service/http/spotpass_redirect.h"
+ #include "core/hw/aes/key.h"
+ 
+ SERIALIZE_EXPORT_IMPL(Service::HTTP::HTTP_C)
+@@ -245,10 +247,31 @@ void Context::MakeRequest() {
+         {RequestMethod::PutEmpty, "PUT"},
+     };
+ 
+-    Common::URLInfo url_info = Common::SplitUrl(url);
++    std::string request_url = url;
++    std::optional<std::string> spotpass_host;
++    if (Settings::values.use_custom_spotpass_server.GetValue()) {
++        if (auto redirected =
++                RedirectSpotPassUrl(url, Settings::values.spotpass_server_url.GetValue())) {
++            LOG_INFO(Service_HTTP, "SpotPass request redirected: {} -> {}", url, *redirected);
++            spotpass_host = GetUrlHost(url);
++            request_url = std::move(*redirected);
++        } else if (IsSpotPassHost(GetUrlHost(url))) {
++            LOG_WARNING(Service_HTTP,
++                        "Custom SpotPass server is enabled but its address is empty or invalid; "
++                        "sending {} to Nintendo",
++                        url);
++        }
++    }
++
++    Common::URLInfo url_info = Common::SplitUrl(request_url);
+ 
+     httplib::Request request;
+     std::vector<Context::RequestHeader> pending_headers;
++    if (spotpass_host) {
++        // Lets one server tell content, policy list and upload requests apart.
++        pending_headers.push_back(
++            Context::RequestHeader("X-Tangelo-Original-Host", *spotpass_host));
++    }
+     request.method = request_method_strings.at(method);
+     request.path = url_info.path;
+ 
+diff --git a/src/core/hle/service/http/spotpass_redirect.cpp b/src/core/hle/service/http/spotpass_redirect.cpp
+new file mode 100644
+index 0000000..31e3438
+--- /dev/null
++++ b/src/core/hle/service/http/spotpass_redirect.cpp
+@@ -0,0 +1,96 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include "core/hle/service/http/spotpass_redirect.h"
++
++namespace Service::HTTP {
++
++namespace {
++
++constexpr std::array<std::string_view, 3> SpotPassHosts{
++    "npdl.cdn.nintendowifi.net",   // SpotPass content (/p01/nsa/<boss code>/<task>/<file>)
++    "nppl.c.app.nintendowifi.net", // Policy list (/p01/policylist/...)
++    "npul.c.app.nintendowifi.net", // SpotPass uploads (/p01/recv/...)
++};
++
++std::string ToLower(std::string_view text) {
++    std::string result(text);
++    std::transform(result.begin(), result.end(), result.begin(),
++                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++    return result;
++}
++
++std::string_view Trim(std::string_view text) {
++    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
++        text.remove_prefix(1);
++    }
++    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
++        text.remove_suffix(1);
++    }
++    return text;
++}
++
++/// Splits "scheme://authority/rest" into authority and rest ("/..." or "?..." or empty).
++std::pair<std::string_view, std::string_view> SplitAuthority(std::string_view url) {
++    const auto scheme_end = url.find("://");
++    if (scheme_end != std::string_view::npos) {
++        url.remove_prefix(scheme_end + 3);
++    }
++    const auto rest_start = url.find_first_of("/?#");
++    if (rest_start == std::string_view::npos) {
++        return {url, {}};
++    }
++    return {url.substr(0, rest_start), url.substr(rest_start)};
++}
++
++} // namespace
++
++std::string GetUrlHost(std::string_view url) {
++    std::string_view authority = SplitAuthority(url).first;
++    const auto at = authority.rfind('@');
++    if (at != std::string_view::npos) {
++        authority.remove_prefix(at + 1);
++    }
++    const auto colon = authority.find(':');
++    if (colon != std::string_view::npos) {
++        authority = authority.substr(0, colon);
++    }
++    return ToLower(authority);
++}
++
++bool IsSpotPassHost(std::string_view host) {
++    const std::string name = GetUrlHost(host);
++    return std::find(SpotPassHosts.begin(), SpotPassHosts.end(), name) != SpotPassHosts.end();
++}
++
++std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server) {
++    server = Trim(server);
++    if (server.empty() || !IsSpotPassHost(GetUrlHost(url))) {
++        return std::nullopt;
++    }
++
++    std::string base(server);
++    if (base.find("://") == std::string::npos) {
++        base = "https://" + base;
++    }
++    if (GetUrlHost(base).empty()) {
++        return std::nullopt;
++    }
++    // Drop trailing slashes of the base path only (never the "//" after the scheme).
++    const std::size_t authority_end = base.find("://") + 3 + SplitAuthority(base).first.size();
++    while (base.size() > authority_end && base.back() == '/') {
++        base.pop_back();
++    }
++
++    std::string rest(SplitAuthority(url).second);
++    if (rest.empty() || rest.front() != '/') {
++        rest.insert(rest.begin(), '/');
++    }
++    return base + rest;
++}
++
++} // namespace Service::HTTP
+diff --git a/src/core/hle/service/http/spotpass_redirect.h b/src/core/hle/service/http/spotpass_redirect.h
+new file mode 100644
+index 0000000..f974a03
+--- /dev/null
++++ b/src/core/hle/service/http/spotpass_redirect.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace Service::HTTP {
++
++/// Returns true if `host` (optionally with ":port") is one of Nintendo's SpotPass (BOSS) hosts:
++/// content downloads, the policy list and SpotPass uploads.
++bool IsSpotPassHost(std::string_view host);
++
++/**
++ * Rewrites a SpotPass URL so it points at a custom server.
++ * `server` is "[scheme://]host[:port][/base/path]"; without a scheme, https is assumed.
++ * The original path and query are appended to the server's base path, so
++ * "https://npdl.cdn.nintendowifi.net/p01/nsa/abc/task/file" with server "http://my.host:8080/sp"
++ * becomes "http://my.host:8080/sp/p01/nsa/abc/task/file".
++ * Returns nullopt if `url` isn't a SpotPass URL or `server` is empty.
++ */
++std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server);
++
++/// The host part of `url` without scheme, port, path or query.
++std::string GetUrlHost(std::string_view url);
++
++} // namespace Service::HTTP
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 7e4c6b1..130ac5c 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -8,6 +8,7 @@ add_executable(tests
+     core/hle/kernel/hle_ipc.cpp
+     core/hle/service/cecd_message.cpp
+     core/hle/service/ptm_steps.cpp
++    core/hle/service/spotpass_redirect.cpp
+     core/memory/memory.cpp
+     core/memory/vm_manager.cpp
+     core/system_titles.cpp
+diff --git a/src/tests/core/hle/service/spotpass_redirect.cpp b/src/tests/core/hle/service/spotpass_redirect.cpp
+new file mode 100644
+index 0000000..594da79
+--- /dev/null
++++ b/src/tests/core/hle/service/spotpass_redirect.cpp
+@@ -0,0 +1,50 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/service/http/spotpass_redirect.h"
++
++using Service::HTTP::GetUrlHost;
++using Service::HTTP::IsSpotPassHost;
++using Service::HTTP::RedirectSpotPassUrl;
++
++TEST_CASE("SpotPass hosts are recognised", "[service][http][spotpass]") {
++    CHECK(IsSpotPassHost("npdl.cdn.nintendowifi.net"));
++    CHECK(IsSpotPassHost("NPDL.CDN.NintendoWiFi.net:443"));
++    CHECK(IsSpotPassHost("nppl.c.app.nintendowifi.net"));
++    CHECK(IsSpotPassHost("npul.c.app.nintendowifi.net"));
++    CHECK_FALSE(IsSpotPassHost("nasc.nintendowifi.net"));
++    CHECK_FALSE(IsSpotPassHost("npdl.cdn.nintendowifi.net.evil.example"));
++    CHECK_FALSE(IsSpotPassHost(""));
++}
++
++TEST_CASE("URL host extraction", "[service][http][spotpass]") {
++    CHECK(GetUrlHost("https://npdl.cdn.nintendowifi.net/p01/nsa/x") == "npdl.cdn.nintendowifi.net");
++    CHECK(GetUrlHost("http://User@Example.local:8080?q=1") == "example.local");
++    CHECK(GetUrlHost("example.local") == "example.local");
++}
++
++TEST_CASE("SpotPass URLs are redirected to the custom server", "[service][http][spotpass]") {
++    const std::string content =
++        "https://npdl.cdn.nintendowifi.net/p01/nsa/0N4QxEv2JVgYrMtZ/data/0000001?x=1";
++
++    CHECK(RedirectSpotPassUrl(content, "http://192.168.1.10:8080") ==
++          "http://192.168.1.10:8080/p01/nsa/0N4QxEv2JVgYrMtZ/data/0000001?x=1");
++    CHECK(RedirectSpotPassUrl(content, "  https://spot.local/base/  ") ==
++          "https://spot.local/base/p01/nsa/0N4QxEv2JVgYrMtZ/data/0000001?x=1");
++    // No scheme: https is assumed.
++    CHECK(RedirectSpotPassUrl(content, "spot.local:8443") ==
++          "https://spot.local:8443/p01/nsa/0N4QxEv2JVgYrMtZ/data/0000001?x=1");
++    CHECK(RedirectSpotPassUrl("https://nppl.c.app.nintendowifi.net/p01/policylist/3/NL",
++                              "http://spot.local") == "http://spot.local/p01/policylist/3/NL");
++    CHECK(RedirectSpotPassUrl("https://npdl.cdn.nintendowifi.net", "http://spot.local") ==
++          "http://spot.local/");
++}
++
++TEST_CASE("Other URLs and empty servers are left alone", "[service][http][spotpass]") {
++    CHECK_FALSE(RedirectSpotPassUrl("https://nasc.nintendowifi.net/ac", "http://spot.local"));
++    CHECK_FALSE(RedirectSpotPassUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c", ""));
++    CHECK_FALSE(RedirectSpotPassUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c", "   "));
++    CHECK_FALSE(RedirectSpotPassUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c", "http://"));
++}
+-- 
+2.43.0
+

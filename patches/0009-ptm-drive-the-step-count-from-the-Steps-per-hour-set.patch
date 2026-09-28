@@ -1,0 +1,98 @@
+From 9dd486e83b2fa9dc15e7afb201852a7663b90c4f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 16:57:35 +0200
+Subject: [PATCH] ptm: drive the step count from the "Steps per hour" setting
+
+GetTotalStepCount always returned 0 while GetStepHistory already used
+the Steps per hour setting, so games that watch the live total never saw
+a step. Mario & Sonic at the Rio 2016 Olympic Games' Pocket Marathon
+polls it thousands of times on its "Walk 10 steps" screen and could not
+continue.
+
+Add a virtual pedometer: the total grows at the configured pace on the
+emulated 3DS clock (pauses with the emulator, follows fast-forward),
+consistent with the per-hour history. It is counted from 2000-01-01 and
+wraps like the 32-bit counter; games use differences between readings.
+GetPedometerState reports counting whenever a pace is set. With the
+setting at its default of 0, behaviour is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ptm/ptm.cpp | 23 ++++++++++++++++++++---
+ src/core/hle/service/ptm/ptm.h   |  3 +++
+ 2 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index f503081..740ede7 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -12,6 +12,7 @@
+ #include "core/file_sys/errors.h"
+ #include "core/file_sys/file_backend.h"
+ #include "core/hle/kernel/event.h"
++#include "core/hle/kernel/kernel.h"
+ #include "core/hle/kernel/shared_page.h"
+ #include "core/hle/service/mcu/mcu_rtc.h"
+ #include "core/hle/service/ptm/ptm.h"
+@@ -40,6 +41,21 @@ void Module::Interface::RegisterAlarmClient(Kernel::HLERequestContext& ctx) {
+     LOG_DEBUG(Service_PTM, "(STUBBED) called");
+ }
+ 
++u32 Module::GetVirtualStepCount() const {
++    // There is no pedometer to read, so steps come from the "Steps per hour" setting: a virtual
++    // walk at that pace, measured on the emulated 3DS clock (it pauses with the emulator and
++    // speeds up with fast-forward). This matches GetStepHistory, which reports the same pace for
++    // every hour. The total is counted from 2000-01-01 and wraps like a 32-bit counter; games
++    // work with differences between readings, which stay correct across the wrap.
++    const u64 steps_per_hour = Settings::values.steps_per_hour.GetValue();
++    if (steps_per_hour == 0) {
++        return 0;
++    }
++    constexpr u64 MsPerHour = 60 * 60 * 1000;
++    const u64 ms_since_2000 = system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
++    return static_cast<u32>(ms_since_2000 * steps_per_hour / MsPerHour);
++}
++
+ void Module::Interface::GetAdapterState(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+@@ -83,7 +99,8 @@ void Module::Interface::GetPedometerState(Kernel::HLERequestContext& ctx) {
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push(ptm->pedometer_is_counting);
++    // With a virtual walking pace configured, the pedometer is always counting.
++    rb.Push(ptm->pedometer_is_counting || Settings::values.steps_per_hour.GetValue() > 0);
+ 
+     LOG_DEBUG(Service_PTM, "(STUBBED) called");
+ }
+@@ -115,9 +132,9 @@ void Module::Interface::GetTotalStepCount(Kernel::HLERequestContext& ctx) {
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push<u32>(0);
++    rb.Push<u32>(ptm->GetVirtualStepCount());
+ 
+-    LOG_WARNING(Service_PTM, "(STUBBED) called");
++    LOG_TRACE(Service_PTM, "called");
+ }
+ 
+ void Module::Interface::GetSoftwareClosedFlag(Kernel::HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index 7cbf43b..59edaa3 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -48,6 +48,9 @@ void CheckNew3DS(IPC::RequestBuilder& rb);
+ class Module final {
+ public:
+     explicit Module(Core::System& system_);
++
++    /// Step count of the virtual pedometer driven by the "Steps per hour" setting.
++    u32 GetVirtualStepCount() const;
+     ~Module() = default;
+ 
+     static u16 GetPlayCoins();
+-- 
+2.43.0
+

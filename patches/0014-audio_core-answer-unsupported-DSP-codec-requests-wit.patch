@@ -1,0 +1,110 @@
+From d0fe3bfdaddf7eb33e18ab8909039f64d7c117b2 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 19:38:19 +0200
+Subject: [PATCH] audio_core: answer unsupported DSP codec requests with an
+ error
+
+Nintendo 3DS Sound saves voice clips by asking the DSP to encode AAC
+(codec 2) over the binary pipe. HLE audio only implements AAC decoding:
+it logged "Unimplemented code!" and never answered, so the application
+waited forever for the reply.
+
+Reply with the request echoed back and result Error, and raise the pipe
+interrupt, as the DSP does for requests it cannot handle. The log line
+points to LLE audio, which does implement the encoder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/audio_core/hle/hle.cpp       | 18 ++++++++++----
+ src/tests/audio_core/hle/hle.cpp | 40 ++++++++++++++++++++++++++++++++
+ 2 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/src/audio_core/hle/hle.cpp b/src/audio_core/hle/hle.cpp
+index 05ff9d7..8d351b9 100644
+--- a/src/audio_core/hle/hle.cpp
++++ b/src/audio_core/hle/hle.cpp
+@@ -272,12 +272,20 @@ void DspHle::Impl::PipeWrite(DspPipe pipe_number, std::span<const u8> buffer) {
+             return;
+         }
+         std::memcpy(&request, buffer.data(), buffer.size());
+-        if (request.header.codec != HLE::DecoderCodec::DecodeAAC) {
+-            LOG_CRITICAL(Audio_DSP, "got unknown codec {}", static_cast<u16>(request.header.codec));
+-            UNIMPLEMENTED();
+-            return;
++        HLE::BinaryMessage response{};
++        if (request.header.codec == HLE::DecoderCodec::DecodeAAC) {
++            response = aac_decoder->ProcessRequest(request);
++        } else {
++            // AAC encoding (used by Nintendo 3DS Sound to save voice clips) is not implemented.
++            // Answer with an error, like the DSP does for requests it cannot handle, instead of
++            // never answering, which left the application waiting forever.
++            LOG_ERROR(Audio_DSP,
++                      "Codec {} (command {}) is not supported by HLE audio, replying with an "
++                      "error. Use LLE audio for this application.",
++                      static_cast<u16>(request.header.codec), static_cast<u16>(request.header.cmd));
++            response = request;
++            response.header.result = HLE::ResultStatus::Error;
+         }
+-        const HLE::BinaryMessage response = aac_decoder->ProcessRequest(request);
+         pipe_data[static_cast<u32>(pipe_number)].resize(sizeof(response));
+         std::memcpy(pipe_data[static_cast<u32>(pipe_number)].data(), &response, sizeof(response));
+ 
+diff --git a/src/tests/audio_core/hle/hle.cpp b/src/tests/audio_core/hle/hle.cpp
+index 320da6d..d82c7e2 100644
+--- a/src/tests/audio_core/hle/hle.cpp
++++ b/src/tests/audio_core/hle/hle.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <cstring>
++#include <vector>
+ #include <catch2/catch_test_macros.hpp>
+ #include <fmt/core.h>
+ 
+@@ -138,3 +140,41 @@ TEST_CASE("DSP LLE vs HLE", "[audio_core][hle]") {
+         REQUIRE(hle_read_buffer == lle_read_buffer);
+     }
+ }
++
++TEST_CASE("HLE DSP answers AAC encode requests with an error", "[audio_core][hle]") {
++    Core::System system;
++    Memory::MemorySystem memory{system};
++    Core::Timing core_timing(1, 100);
++    AudioCore::DspHle hle(system, memory, core_timing);
++
++    bool binary_interrupt = false;
++    hle.SetInterruptHandler([&](Service::DSP::InterruptType type, AudioCore::DspPipe pipe) {
++        if (type == Service::DSP::InterruptType::Pipe && pipe == AudioCore::DspPipe::Binary) {
++            binary_interrupt = true;
++        }
++    });
++
++    // Nintendo 3DS Sound initialises the AAC encoder like this before saving a voice clip.
++    AudioCore::HLE::BinaryMessage request{};
++    request.header.codec = AudioCore::HLE::DecoderCodec::EncodeAAC;
++    request.header.cmd = AudioCore::HLE::DecoderCommand::Init;
++    request.header.result = AudioCore::HLE::ResultStatus::Success;
++    request.encode_aac_init.unknown1 = 1;
++    request.encode_aac_init.sample_rate = AudioCore::HLE::DecoderSampleRate::Rate16000;
++    request.encode_aac_init.unknown3 = 2;
++
++    std::vector<u8> buffer(sizeof(request));
++    std::memcpy(buffer.data(), &request, sizeof(request));
++    hle.PipeWrite(AudioCore::DspPipe::Binary, buffer);
++
++    // The application waits for this answer; without it, it hangs.
++    REQUIRE(binary_interrupt);
++    REQUIRE(hle.GetPipeReadableSize(AudioCore::DspPipe::Binary) == sizeof(request));
++
++    AudioCore::HLE::BinaryMessage response{};
++    const auto data = hle.PipeRead(AudioCore::DspPipe::Binary, sizeof(response));
++    std::memcpy(&response, data.data(), sizeof(response));
++    REQUIRE(response.header.codec == AudioCore::HLE::DecoderCodec::EncodeAAC);
++    REQUIRE(response.header.cmd == AudioCore::HLE::DecoderCommand::Init);
++    REQUIRE(response.header.result == AudioCore::HLE::ResultStatus::Error);
++}
+-- 
+2.43.0
+

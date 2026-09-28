@@ -1,0 +1,422 @@
+From 6755cbb73aacda88b86e57b521e53b4daa22bef8 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 16:12:17 +0200
+Subject: [PATCH] services: handle frd/ptm calls, answer GetProcessInfo,
+ quieter FS log
+
+- frd:u / frd:a UpdateGameModeDescription (0x001D) and
+  SetNotificationMask (0x0021): accept the request and return success.
+  There is no friend server, so there's nothing to update or filter.
+  Previously logged as unimplemented (Animal Crossing, 3DS Sound).
+- ptm:* RegisterAlarmClient (0x0001): accept the event and return
+  success; RTC alarms aren't emulated, so it is never signalled.
+  Called by a system module on every boot.
+- svcGetProcessInfo types 1/3 (supervisor stacks + handle table size),
+  4 (used handles), 5 (highest handles, reported as current), 6 and 8
+  (always 0) and 7 (thread count) now return values instead of leaving
+  the output unset. Adds HandleTable::GetUsedCount with a test.
+- "Delay generator was not initialized" is a normal fallback: log at
+  debug level instead of error (it appeared on nearly every file open),
+  and fix the "initalized" typo.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/file_sys/archive_backend.h   |  2 +-
+ src/core/file_sys/file_backend.h      |  4 +--
+ src/core/hle/kernel/handle_table.cpp  |  6 ++++
+ src/core/hle/kernel/handle_table.h    |  3 ++
+ src/core/hle/kernel/svc.cpp           | 40 ++++++++++++++++++++++++---
+ src/core/hle/service/frd/frd.cpp      | 22 +++++++++++++++
+ src/core/hle/service/frd/frd.h        | 19 +++++++++++++
+ src/core/hle/service/frd/frd_a.cpp    |  4 +--
+ src/core/hle/service/frd/frd_u.cpp    |  4 +--
+ src/core/hle/service/ptm/ptm.cpp      | 12 ++++++++
+ src/core/hle/service/ptm/ptm.h        | 10 +++++++
+ src/core/hle/service/ptm/ptm_gets.cpp |  2 +-
+ src/core/hle/service/ptm/ptm_play.cpp |  2 +-
+ src/core/hle/service/ptm/ptm_sysm.cpp |  2 +-
+ src/core/hle/service/ptm/ptm_u.cpp    |  2 +-
+ src/tests/core/hle/kernel/hle_ipc.cpp | 24 ++++++++++++++++
+ 16 files changed, 143 insertions(+), 15 deletions(-)
+
+diff --git a/src/core/file_sys/archive_backend.h b/src/core/file_sys/archive_backend.h
+index 893e0a0..1220cdc 100644
+--- a/src/core/file_sys/archive_backend.h
++++ b/src/core/file_sys/archive_backend.h
+@@ -218,7 +218,7 @@ public:
+         if (delay_generator != nullptr) {
+             return delay_generator->GetOpenDelayNs();
+         }
+-        LOG_ERROR(Service_FS, "Delay generator was not initalized. Using default");
++        LOG_DEBUG(Service_FS, "Delay generator was not initialized. Using default");
+         delay_generator = std::make_unique<DefaultDelayGenerator>();
+         return delay_generator->GetOpenDelayNs();
+     }
+diff --git a/src/core/file_sys/file_backend.h b/src/core/file_sys/file_backend.h
+index b61cfad..3ef53b0 100644
+--- a/src/core/file_sys/file_backend.h
++++ b/src/core/file_sys/file_backend.h
+@@ -48,7 +48,7 @@ public:
+         if (delay_generator != nullptr) {
+             return delay_generator->GetReadDelayNs(length);
+         }
+-        LOG_ERROR(Service_FS, "Delay generator was not initalized. Using default");
++        LOG_DEBUG(Service_FS, "Delay generator was not initialized. Using default");
+         delay_generator = std::make_unique<DefaultDelayGenerator>();
+         return delay_generator->GetReadDelayNs(length);
+     }
+@@ -57,7 +57,7 @@ public:
+         if (delay_generator != nullptr) {
+             return delay_generator->GetOpenDelayNs();
+         }
+-        LOG_ERROR(Service_FS, "Delay generator was not initalized. Using default");
++        LOG_DEBUG(Service_FS, "Delay generator was not initialized. Using default");
+         delay_generator = std::make_unique<DefaultDelayGenerator>();
+         return delay_generator->GetOpenDelayNs();
+     }
+diff --git a/src/core/hle/kernel/handle_table.cpp b/src/core/hle/kernel/handle_table.cpp
+index 622719c..fa91376 100644
+--- a/src/core/hle/kernel/handle_table.cpp
++++ b/src/core/hle/kernel/handle_table.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include <utility>
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/shared_ptr.hpp>
+@@ -91,6 +92,11 @@ std::shared_ptr<Object> HandleTable::GetGeneric(Handle handle) const {
+     return objects[GetSlot(handle)];
+ }
+ 
++std::size_t HandleTable::GetUsedCount() const {
++    return static_cast<std::size_t>(
++        std::count_if(objects.begin(), objects.end(), [](const auto& obj) { return obj != nullptr; }));
++}
++
+ void HandleTable::Clear() {
+     for (u16 i = 0; i < MAX_COUNT; ++i) {
+         generations[i] = i + 1;
+diff --git a/src/core/hle/kernel/handle_table.h b/src/core/hle/kernel/handle_table.h
+index 5bb34ff..63c7b8a 100644
+--- a/src/core/hle/kernel/handle_table.h
++++ b/src/core/hle/kernel/handle_table.h
+@@ -91,6 +91,9 @@ public:
+     /// Closes all handles held in this table.
+     void Clear();
+ 
++    /// Number of handles currently open in this table.
++    std::size_t GetUsedCount() const;
++
+ private:
+     /**
+      * This is the maximum limit of handles allowed per process in CTR-OS. It can be further
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 14d0998..7d99082 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -13,6 +13,7 @@
+ #include "common/settings.h"
+ #include "core/arm/arm_interface.h"
+ #include "core/arm/exception_handler.h"
++#include "common/alignment.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ #ifdef ENABLE_GDBSTUB
+@@ -1944,6 +1945,21 @@ Result SVC::GetSystemInfo(s64* out, u32 type, s32 param) {
+     return ResultSuccess;
+ }
+ 
++/// Number of live threads owned by `process`, across all cores.
++static u64 CountProcessThreads(const Process& process) {
++    auto& system = Core::System::GetInstance();
++    u64 count = 0;
++    for (u32 core = 0; core < system.GetNumCores(); ++core) {
++        for (const auto& thread : system.Kernel().GetThreadManager(core).GetThreadList()) {
++            const auto owner = thread->owner_process.lock();
++            if (owner.get() == &process && thread->status != ThreadStatus::Dead) {
++                ++count;
++            }
++        }
++    }
++    return count;
++}
++
+ Result SVC::GetProcessInfo(s64* out, Handle process_handle, u32 type) {
+     LOG_TRACE(Kernel_SVC, "called process=0x{:08X} type={}", process_handle, type);
+ 
+@@ -1963,14 +1979,30 @@ Result SVC::GetProcessInfo(s64* out, Handle process_handle, u32 type) {
+         }
+         break;
+     case ProcessInfoType::SUPERVISOR_AND_HANDLE_USED_MEMORY:
+-    case ProcessInfoType::SUPERVISOR_AND_HANDLE_USED_MEMORY2:
++    case ProcessInfoType::SUPERVISOR_AND_HANDLE_USED_MEMORY2: {
++        // The kernel's own bookkeeping for the process: one 0x1000-byte supervisor stack per
++        // thread plus the page-rounded handle table (8 bytes per entry). Citra doesn't allocate
++        // these, so this is computed from the same inputs the real kernel uses.
++        constexpr u64 SupervisorStackSize = 0x1000;
++        const u64 handle_table_bytes = static_cast<u64>(process->handle_table_size) * 8;
++        *out = static_cast<s64>(CountProcessThreads(*process) * SupervisorStackSize +
++                                Common::AlignUp(handle_table_bytes, Memory::CITRA_PAGE_SIZE));
++        break;
++    }
+     case ProcessInfoType::USED_HANDLE_COUNT:
++        *out = static_cast<s64>(process->handle_table.GetUsedCount());
++        break;
+     case ProcessInfoType::HIGHEST_HANDLE_COUNT:
++        // The peak isn't tracked; the current count is the closest known lower bound.
++        *out = static_cast<s64>(process->handle_table.GetUsedCount());
++        break;
+     case ProcessInfoType::KPROCESS_0X234:
+-    case ProcessInfoType::THREAD_COUNT:
+     case ProcessInfoType::MAX_THREAD_AMOUNT:
+-        // These are valid, but not implemented yet
+-        LOG_ERROR(Kernel_SVC, "unimplemented GetProcessInfo type={}", type);
++        // Always 0 on hardware.
++        *out = 0;
++        break;
++    case ProcessInfoType::THREAD_COUNT:
++        *out = static_cast<s64>(CountProcessThreads(*process));
+         break;
+     case ProcessInfoType::LINEAR_BASE_ADDR_OFFSET:
+         *out = Memory::FCRAM_PADDR - process->GetLinearHeapAreaAddress();
+diff --git a/src/core/hle/service/frd/frd.cpp b/src/core/hle/service/frd/frd.cpp
+index ff87849..cc54285 100644
+--- a/src/core/hle/service/frd/frd.cpp
++++ b/src/core/hle/service/frd/frd.cpp
+@@ -233,6 +233,28 @@ void Module::Interface::SetClientSdkVersion(Kernel::HLERequestContext& ctx) {
+     LOG_WARNING(Service_FRD, "(STUBBED) called, version: 0x{:08X}", version);
+ }
+ 
++void Module::Interface::UpdateGameModeDescription(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    // There is no friend server to show the description on, so it is only accepted.
++    [[maybe_unused]] const auto& description = rp.PopStaticBuffer();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_FRD, "(STUBBED) called");
++}
++
++void Module::Interface::SetNotificationMask(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 mask = rp.Pop<u32>();
++
++    // Friend notifications are never generated offline, so the mask has nothing to filter.
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_FRD, "(STUBBED) called, mask=0x{:08X}", mask);
++}
++
+ void Module::Interface::IsOnline(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+diff --git a/src/core/hle/service/frd/frd.h b/src/core/hle/service/frd/frd.h
+index 34c873e..f617437 100644
+--- a/src/core/hle/service/frd/frd.h
++++ b/src/core/hle/service/frd/frd.h
+@@ -221,6 +221,25 @@ public:
+          */
+         void SetClientSdkVersion(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * FRD::UpdateGameModeDescription service function
++         *  Inputs:
++         *      1 : Static buffer descriptor (size 0x100, id 2)
++         *      2 : Game mode description (UTF-16, shown to friends as "playing ...")
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void UpdateGameModeDescription(Kernel::HLERequestContext& ctx);
++
++        /**
++         * FRD::SetNotificationMask service function
++         *  Inputs:
++         *      1 : Mask of friend notifications the client does not want to receive
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void SetNotificationMask(Kernel::HLERequestContext& ctx);
++
+         /**
+          * FRD::Login service function
+          *  Inputs:
+diff --git a/src/core/hle/service/frd/frd_a.cpp b/src/core/hle/service/frd/frd_a.cpp
+index 64ea53d..2d5fcef 100644
+--- a/src/core/hle/service/frd/frd_a.cpp
++++ b/src/core/hle/service/frd/frd_a.cpp
+@@ -39,11 +39,11 @@ FRD_A::FRD_A(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x001A, nullptr, "GetFriendInfo"},
+         {0x001B, nullptr, "IsIncludedInFriendList"},
+         {0x001C, &FRD_A::UnscrambleLocalFriendCode, "UnscrambleLocalFriendCode"},
+-        {0x001D, nullptr, "UpdateGameModeDescription"},
++        {0x001D, &FRD_A::UpdateGameModeDescription, "UpdateGameModeDescription"},
+         {0x001E, nullptr, "UpdateGameMode"},
+         {0x001F, nullptr, "SendInvitation"},
+         {0x0020, nullptr, "AttachToEventNotification"},
+-        {0x0021, nullptr, "SetNotificationMask"},
++        {0x0021, &FRD_A::SetNotificationMask, "SetNotificationMask"},
+         {0x0022, nullptr, "GetEventNotification"},
+         {0x0023, &FRD_A::GetLastResponseResult, "GetLastResponseResult"},
+         {0x0024, nullptr, "PrincipalIdToFriendCode"},
+diff --git a/src/core/hle/service/frd/frd_u.cpp b/src/core/hle/service/frd/frd_u.cpp
+index ed545c8..41f76da 100644
+--- a/src/core/hle/service/frd/frd_u.cpp
++++ b/src/core/hle/service/frd/frd_u.cpp
+@@ -39,11 +39,11 @@ FRD_U::FRD_U(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x001A, nullptr, "GetFriendInfo"},
+         {0x001B, nullptr, "IsIncludedInFriendList"},
+         {0x001C, &FRD_U::UnscrambleLocalFriendCode, "UnscrambleLocalFriendCode"},
+-        {0x001D, nullptr, "UpdateGameModeDescription"},
++        {0x001D, &FRD_U::UpdateGameModeDescription, "UpdateGameModeDescription"},
+         {0x001E, nullptr, "UpdateGameMode"},
+         {0x001F, nullptr, "SendInvitation"},
+         {0x0020, nullptr, "AttachToEventNotification"},
+-        {0x0021, nullptr, "SetNotificationMask"},
++        {0x0021, &FRD_U::SetNotificationMask, "SetNotificationMask"},
+         {0x0022, nullptr, "GetEventNotification"},
+         {0x0023, &FRD_U::GetLastResponseResult, "GetLastResponseResult"},
+         {0x0024, nullptr, "PrincipalIdToFriendCode"},
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index 549732b..f503081 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -11,6 +11,7 @@
+ #include "core/file_sys/archive_extsavedata.h"
+ #include "core/file_sys/errors.h"
+ #include "core/file_sys/file_backend.h"
++#include "core/hle/kernel/event.h"
+ #include "core/hle/kernel/shared_page.h"
+ #include "core/hle/service/mcu/mcu_rtc.h"
+ #include "core/hle/service/ptm/ptm.h"
+@@ -28,6 +29,17 @@ namespace Service::PTM {
+ /// Values for the default gamecoin.dat file
+ static const GameCoin default_game_coin = {0x4F00, 42, 0, 0, 0, 2014, 12, 29};
+ 
++void Module::Interface::RegisterAlarmClient(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    // RTC alarms aren't emulated, so the event is accepted but never signalled.
++    [[maybe_unused]] const auto event = rp.PopObject<Kernel::Event>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_PTM, "(STUBBED) called");
++}
++
+ void Module::Interface::GetAdapterState(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index 7f0200b..7cbf43b 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -114,6 +114,16 @@ public:
+          */
+         void GetStepHistory(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * PTM::RegisterAlarmClient service function
++         *  Inputs:
++         *      1 : Handle translation header (0)
++         *      2 : Event signalled when an RTC alarm fires
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void RegisterAlarmClient(Kernel::HLERequestContext& ctx);
++
+         /**
+          * PTM::GetTotalStepCount service function
+          *  Outputs:
+diff --git a/src/core/hle/service/ptm/ptm_gets.cpp b/src/core/hle/service/ptm/ptm_gets.cpp
+index a1a5dc7..25ece18 100644
+--- a/src/core/hle/service/ptm/ptm_gets.cpp
++++ b/src/core/hle/service/ptm/ptm_gets.cpp
+@@ -14,7 +14,7 @@ PTM_Gets::PTM_Gets(std::shared_ptr<Module> ptm)
+     static const FunctionInfo functions[] = {
+         // ptm:u common commands
+         // clang-format off
+-        {0x0001, nullptr, "RegisterAlarmClient"},
++        {0x0001, &PTM_Gets::RegisterAlarmClient, "RegisterAlarmClient"},
+         {0x0002, nullptr, "SetRtcAlarm"},
+         {0x0003, nullptr, "GetRtcAlarm"},
+         {0x0004, nullptr, "CancelRtcAlarm"},
+diff --git a/src/core/hle/service/ptm/ptm_play.cpp b/src/core/hle/service/ptm/ptm_play.cpp
+index 823b45b..64f8942 100644
+--- a/src/core/hle/service/ptm/ptm_play.cpp
++++ b/src/core/hle/service/ptm/ptm_play.cpp
+@@ -14,7 +14,7 @@ PTM_Play::PTM_Play(std::shared_ptr<Module> ptm)
+     static const FunctionInfo functions[] = {
+         // ptm:u common commands
+         // clang-format off
+-        {0x0001, nullptr, "RegisterAlarmClient"},
++        {0x0001, &PTM_Play::RegisterAlarmClient, "RegisterAlarmClient"},
+         {0x0002, nullptr, "SetRtcAlarm"},
+         {0x0003, nullptr, "GetRtcAlarm"},
+         {0x0004, nullptr, "CancelRtcAlarm"},
+diff --git a/src/core/hle/service/ptm/ptm_sysm.cpp b/src/core/hle/service/ptm/ptm_sysm.cpp
+index c29bda4..82df8b7 100644
+--- a/src/core/hle/service/ptm/ptm_sysm.cpp
++++ b/src/core/hle/service/ptm/ptm_sysm.cpp
+@@ -15,7 +15,7 @@ PTM_S_Common::PTM_S_Common(std::shared_ptr<Module> ptm, const char* name)
+     static const FunctionInfo functions[] = {
+         // ptm:u common commands
+         // clang-format off
+-        {0x0001, nullptr, "RegisterAlarmClient"},
++        {0x0001, &PTM_S_Common::RegisterAlarmClient, "RegisterAlarmClient"},
+         {0x0002, nullptr, "SetRtcAlarm"},
+         {0x0003, nullptr, "GetRtcAlarm"},
+         {0x0004, nullptr, "CancelRtcAlarm"},
+diff --git a/src/core/hle/service/ptm/ptm_u.cpp b/src/core/hle/service/ptm/ptm_u.cpp
+index 7234a0c..6eefa75 100644
+--- a/src/core/hle/service/ptm/ptm_u.cpp
++++ b/src/core/hle/service/ptm/ptm_u.cpp
+@@ -12,7 +12,7 @@ namespace Service::PTM {
+ PTM_U::PTM_U(std::shared_ptr<Module> ptm) : Module::Interface(std::move(ptm), "ptm:u", 26) {
+     static const FunctionInfo functions[] = {
+         // clang-format off
+-        {0x0001, nullptr, "RegisterAlarmClient"},
++        {0x0001, &PTM_U::RegisterAlarmClient, "RegisterAlarmClient"},
+         {0x0002, nullptr, "SetRtcAlarm"},
+         {0x0003, nullptr, "GetRtcAlarm"},
+         {0x0004, nullptr, "CancelRtcAlarm"},
+diff --git a/src/tests/core/hle/kernel/hle_ipc.cpp b/src/tests/core/hle/kernel/hle_ipc.cpp
+index 67c194f..48a29e9 100644
+--- a/src/tests/core/hle/kernel/hle_ipc.cpp
++++ b/src/tests/core/hle/kernel/hle_ipc.cpp
+@@ -398,4 +398,28 @@ TEST_CASE("HLERequestContext::WriteToOutgoingCommandBuffer", "[core][kernel]") {
+     }
+ }
+ 
++
++
++TEST_CASE("HandleTable::GetUsedCount", "[core][kernel]") {
++    Core::Timing timing(1, 100);
++    Core::System system;
++    Memory::MemorySystem memory{system};
++    Kernel::KernelSystem kernel(memory, timing, [] {}, Kernel::MemoryMode::NewProd, 1);
++    auto process = kernel.CreateProcess(kernel.CreateCodeSet("", 0));
++    auto& table = process->handle_table;
++
++    const std::size_t initial = table.GetUsedCount();
++
++    Handle a{}, b{};
++    REQUIRE(table.Create(std::addressof(a), MakeObject(kernel)).IsSuccess());
++    REQUIRE(table.Create(std::addressof(b), MakeObject(kernel)).IsSuccess());
++    CHECK(table.GetUsedCount() == initial + 2);
++
++    REQUIRE(table.Close(a).IsSuccess());
++    CHECK(table.GetUsedCount() == initial + 1);
++
++    table.Clear();
++    CHECK(table.GetUsedCount() == 0);
++}
++
+ } // namespace Kernel
+-- 
+2.43.0
+

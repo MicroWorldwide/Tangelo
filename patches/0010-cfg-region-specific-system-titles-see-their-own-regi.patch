@@ -1,0 +1,132 @@
+From 588f349188eb21f6e2c9fbec85b0beeebae0c52e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 17:17:50 +0200
+Subject: [PATCH] cfg: region-specific system titles see their own region
+
+Patch "apt: fall back to an installed region's applet title" can start
+the EUR software keyboard for a USA game (region-free, EUR system
+files). CFG then told that EUR applet the console is USA, the region
+chosen for the game. That never happens on hardware, and the keyboard
+crashed right after starting (Disney Magical World name entry).
+
+cfg:GetRegion and the Canada/USA query now answer per caller: a
+region-specific system title (applets, system apps) gets its own
+region, like on a real console; games keep the Region setting or the
+game-region override. Adds a test for the title-to-region mapping.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cfg/cfg.cpp | 19 +++++++++++++++++--
+ src/core/hle/service/cfg/cfg.h   |  6 ++++++
+ src/tests/CMakeLists.txt         |  1 +
+ src/tests/core/system_titles.cpp | 17 +++++++++++++++++
+ 4 files changed, 41 insertions(+), 2 deletions(-)
+ create mode 100644 src/tests/core/system_titles.cpp
+
+diff --git a/src/core/hle/service/cfg/cfg.cpp b/src/core/hle/service/cfg/cfg.cpp
+index b89ceab..88da5df 100644
+--- a/src/core/hle/service/cfg/cfg.cpp
++++ b/src/core/hle/service/cfg/cfg.cpp
+@@ -25,6 +25,7 @@
+ #include "core/hle/kernel/process.h"
+ #include "core/hle/result.h"
+ #include "core/hle/service/cfg/cfg.h"
++#include "core/system_titles.h"
+ #include "core/hle/service/cfg/cfg_defaults.h"
+ #include "core/hle/service/cfg/cfg_i.h"
+ #include "core/hle/service/cfg/cfg_nor.h"
+@@ -419,6 +420,20 @@ u32 Module::GetRegionValue(bool from_secure_info) {
+     return Settings::values.region_value.GetValue();
+ }
+ 
++u32 Module::GetRegionValueFor(u64 caller_title_id, bool from_secure_info) {
++    // A region-specific system title (applet, system app) only ever runs on a console of its own
++    // region, so it always sees that region. The game keeps its region override. Without this, a
++    // EUR applet started for a USA game (region-free, EUR system files) was told the console is
++    // USA, which never happens on hardware; the EUR software keyboard then crashed.
++    if (const auto own_region = Core::GetSystemTitleRegion(caller_title_id)) {
++        const u32 region = *own_region;
++        LOG_DEBUG(Service_CFG, "System title {:016X} sees its own region {}", caller_title_id,
++                  region);
++        return region;
++    }
++    return GetRegionValue(from_secure_info);
++}
++
+ bool Module::UseGameRegion() {
+     const s32 forced_region = Settings::values.region_value.GetValue();
+     if (forced_region == Settings::REGION_VALUE_AUTO_SELECT) {
+@@ -487,7 +502,7 @@ void Module::Interface::GetRegion(Kernel::HLERequestContext& ctx) {
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push<u8>(static_cast<u8>(cfg->GetRegionValue(from_secure_info)));
++    rb.Push<u8>(static_cast<u8>(cfg->GetRegionValueFor(caller_tid, from_secure_info)));
+ }
+ 
+ void Module::Interface::SecureInfoGetByte101(Kernel::HLERequestContext& ctx) {
+@@ -597,7 +612,7 @@ void Module::Interface::IsCoppacsSupported(Kernel::HLERequestContext& ctx) {
+         Common::Hacks::HackType::REGION_FROM_SECURE, caller_tid, false);
+ 
+     u8 canada_or_usa = 1;
+-    if (canada_or_usa == cfg->GetRegionValue(from_secure_info)) {
++    if (canada_or_usa == cfg->GetRegionValueFor(caller_tid, from_secure_info)) {
+         rb.Push(true);
+     } else {
+         rb.Push(false);
+diff --git a/src/core/hle/service/cfg/cfg.h b/src/core/hle/service/cfg/cfg.h
+index 39f2f2c..87c2d5a 100644
+--- a/src/core/hle/service/cfg/cfg.h
++++ b/src/core/hle/service/cfg/cfg.h
+@@ -497,6 +497,12 @@ private:
+ public:
+     u32 GetRegionValue(bool from_secure_info);
+ 
++    /**
++     * Region as seen by the process with title ID `caller_title_id`: a region-specific system
++     * title (e.g. an applet) sees its own region, everything else sees GetRegionValue().
++     */
++    u32 GetRegionValueFor(u64 caller_title_id, bool from_secure_info);
++
+     static bool IsValidRegionCountry(u32 region, u8 country_code);
+ 
+     // Utilities for frontend to set config data.
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index eccd5b7..f1278cf 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -7,6 +7,7 @@ add_executable(tests
+     core/hle/kernel/hle_ipc.cpp
+     core/memory/memory.cpp
+     core/memory/vm_manager.cpp
++    core/system_titles.cpp
+     core/zip_pass.cpp
+     precompiled_headers.h
+     audio_core/hle/hle.cpp
+diff --git a/src/tests/core/system_titles.cpp b/src/tests/core/system_titles.cpp
+new file mode 100644
+index 0000000..2df00f8
+--- /dev/null
++++ b/src/tests/core/system_titles.cpp
+@@ -0,0 +1,17 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <catch2/catch_test_macros.hpp>
++#include "core/system_titles.h"
++
++TEST_CASE("GetSystemTitleRegion maps applet titles to their region", "[core]") {
++    // Software Keyboard: JPN C002, USA C802, EUR D002 (AUS shares the EUR title).
++    CHECK(Core::GetSystemTitleRegion(0x000400300000C002) == 0u);
++    CHECK(Core::GetSystemTitleRegion(0x000400300000C802) == 1u);
++    CHECK(Core::GetSystemTitleRegion(0x000400300000D002) == 2u);
++
++    // Games and unknown titles have no system region.
++    CHECK_FALSE(Core::GetSystemTitleRegion(0x00040000000EA900).has_value());
++    CHECK_FALSE(Core::GetSystemTitleRegion(0x0004003000FFFF02).has_value());
++}
+-- 
+2.43.0
+

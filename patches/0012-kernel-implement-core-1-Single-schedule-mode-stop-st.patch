@@ -1,0 +1,314 @@
+From c70dc396ce4315335386351787aa0efeb5b89078 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 18:03:50 +0200
+Subject: [PATCH] kernel: implement core 1 "Single" schedule mode, stop
+ starving sysmodules
+
+1.0-era titles (no CPU time in the exheader) run core 1 in "Single"
+mode, which was unimplemented and fell back to the Multi limiter.
+
+Worse, the kernel's own override table marks some of those titles as
+exempted from preemption (CPU time 10000): Nintendo 3DS Sound, Star Fox
+64 3D, Super Monkey Ball 3D, Doctor Lautrec and Pro Yakyuu Spirits 2011.
+The limiter treated 10000 as a percentage: the application phase lasted
+200ms and the sysmodule phase got a negative length, so LLE sysmodule
+threads on core 1 practically never ran. With the online LLE modules
+on, Nintendo 3DS Sound waited forever for frd:u, which never registered.
+
+- Only CPU time values 1..89 turn preemption on (0 disables it,
+  10000 and above means exempted), matching the 3DS kernel.
+- Single mode now uses 25ms slices: the application gets cpuTime%,
+  sysmodules (90 - cpuTime)%, and the last 10% goes to other threads.
+  Timings follow Luma3DS's notes (sysmodules/pm/source/reslimit.c).
+- The "Unimplemented Single schedule mode" warning is replaced by an
+  info line with the chosen mode and CPU time.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/kernel/resource_limit.cpp    |  4 ++
+ src/core/hle/kernel/thread.cpp            | 69 +++++++++++++++++------
+ src/core/hle/kernel/thread.h              | 35 +++++++++---
+ src/tests/CMakeLists.txt                  |  1 +
+ src/tests/core/hle/kernel/cpu_limiter.cpp | 55 ++++++++++++++++++
+ 5 files changed, 139 insertions(+), 25 deletions(-)
+ create mode 100644 src/tests/core/hle/kernel/cpu_limiter.cpp
+
+diff --git a/src/core/hle/kernel/resource_limit.cpp b/src/core/hle/kernel/resource_limit.cpp
+index 210f4d6..46eeeb0 100644
+--- a/src/core/hle/kernel/resource_limit.cpp
++++ b/src/core/hle/kernel/resource_limit.cpp
+@@ -153,6 +153,10 @@ void ResourceLimit::ApplyAppMaxCPUSetting(std::shared_ptr<Kernel::Process>& proc
+     SetCurrentValue(ResourceLimitType::CpuTime, set_cpu_time);
+     kernel.SetCore1ScheduleMode(final_mode);
+     kernel.UpdateCore1AppCpuLimit();
++
++    LOG_INFO(Kernel, "Core 1 schedule mode: {}, application CPU time: {} (limit {})",
++             final_mode == Core1ScheduleMode::Single ? "Single" : "Multi",
++             static_cast<s32>(set_cpu_time), static_cast<s32>(limit_cpu_time));
+ }
+ 
+ template <class Archive>
+diff --git a/src/core/hle/kernel/thread.cpp b/src/core/hle/kernel/thread.cpp
+index 4b9fabc..82b2af2 100644
+--- a/src/core/hle/kernel/thread.cpp
++++ b/src/core/hle/kernel/thread.cpp
+@@ -601,15 +601,49 @@ CpuLimiter::~CpuLimiter() {}
+ 
+ CpuLimiterMulti::CpuLimiterMulti(Kernel::KernelSystem& _kernel) : kernel(_kernel) {}
+ 
+-void CpuLimiterMulti::Initialize(bool is_single) {
+-    // TODO(PabloMK7): The is_single variable is needed to prevent
+-    // registering an event twice with the same name. Once CpuLimiterSingle
+-    // is implemented we can remove it.
++void CpuLimiterMulti::Initialize(bool is_single_) {
++    // is_single also keeps the two limiters from registering an event with the same name.
++    is_single = is_single_;
+     tick_event = kernel.timing.RegisterEvent(
+         fmt::format("Kernel::{}::tick_event", is_single ? "CpuLimiterSingle" : "CpuLimiterMulti"),
+         [this](u64, s64 cycles_late) { this->OnTick(cycles_late); });
+ }
+ 
++bool CpuLimiterMulti::IsPreemptiveCpuTime(s32 cpu_time) {
++    return cpu_time >= 1 && cpu_time <= 89;
++}
++
++CpuLimiterMulti::SchedState CpuLimiterMulti::NextState(bool is_single, SchedState state) {
++    switch (state) {
++    case SchedState::APP:
++        return SchedState::SYS;
++    case SchedState::SYS:
++        return is_single ? SchedState::OTHER : SchedState::APP;
++    case SchedState::OTHER:
++    default:
++        return SchedState::APP;
++    }
++}
++
++s64 CpuLimiterMulti::PhaseLength(bool is_single, SchedState state, s32 app_cpu_time) {
++    const s64 cpu_time = std::clamp<s64>(app_cpu_time, 1, 89);
++    if (is_single) {
++        const s64 slice = static_cast<s64>(single_slice_interval);
++        switch (state) {
++        case SchedState::APP:
++            return slice * cpu_time / 100;
++        case SchedState::SYS:
++            return slice * (90 - cpu_time) / 100;
++        case SchedState::OTHER:
++        default:
++            return slice * 10 / 100;
++        }
++    }
++    const s64 base = static_cast<s64>(base_tick_interval);
++    const s64 app_time = base * cpu_time / 100;
++    return state == SchedState::APP ? app_time : base - app_time;
++}
++
+ void CpuLimiterMulti::Start() {
+     if (ready) {
+         return;
+@@ -638,8 +672,8 @@ void CpuLimiterMulti::UpdateAppCpuLimit() {
+     app_cpu_time = static_cast<u32>(kernel.ResourceLimit()
+                                         .GetForCategory(Kernel::ResourceLimitCategory::Application)
+                                         ->GetCurrentValue(Kernel::ResourceLimitType::CpuTime));
+-    if (app_cpu_time == Core1CpuTime::PREEMPTION_DISABLED) {
+-        // No preemption, disable event
++    if (!IsPreemptiveCpuTime(app_cpu_time)) {
++        // No preemption (disabled, or the application is exempted), disable event
+         active = false;
+         kernel.timing.UnscheduleEvent(tick_event, 0);
+         WakeupSleepingThreads();
+@@ -674,10 +708,15 @@ bool CpuLimiterMulti::DoTimeLimit(Thread* thread) {
+     // thread needs to be time limited. This properly uses the resource limit
+     // value to check if it is a sysmodule or not. We can do this instead and
+     // it should be good enough. TODO(PabloMK7): fix?
+-    if (thread->resource_limit_category == ResourceLimitCategory::Application &&
+-            curr_state == SchedState::SYS ||
+-        thread->resource_limit_category == ResourceLimitCategory::Other &&
+-            curr_state == SchedState::APP) {
++    SchedState allowed_state;
++    if (thread->resource_limit_category == ResourceLimitCategory::Application) {
++        allowed_state = SchedState::APP;
++    } else if (thread->resource_limit_category == ResourceLimitCategory::Other) {
++        allowed_state = SchedState::SYS;
++    } else {
++        return false;
++    }
++    if (curr_state != allowed_state) {
+         // Block thread as not in the current mode
+         thread->status = ThreadStatus::WaitSleep;
+         sleeping_thread_ids.push(thread->thread_id);
+@@ -692,12 +731,9 @@ void CpuLimiterMulti::OnTick(s64 cycles_late) {
+ }
+ 
+ void CpuLimiterMulti::ChangeState(s64 cycles_late) {
+-    curr_state = (curr_state == SchedState::SYS) ? SchedState::APP : SchedState::SYS;
++    curr_state = NextState(is_single, curr_state);
+ 
+-    s64 next_timer = base_tick_interval * (app_cpu_time / 100.f);
+-    if (curr_state == SchedState::SYS) {
+-        next_timer = base_tick_interval - next_timer;
+-    }
++    s64 next_timer = PhaseLength(is_single, curr_state, app_cpu_time);
+     if (next_timer > cycles_late) {
+         next_timer -= cycles_late;
+     }
+@@ -773,9 +809,6 @@ std::shared_ptr<Thread> ThreadManager::GetThreadByID(u32 thread_id) const {
+ void ThreadManager::SetScheduleMode(Core1ScheduleMode mode) {
+     GetCpuLimiter()->End();
+     current_schedule_mode = mode;
+-    if (mode == Core1ScheduleMode::Single) {
+-        LOG_WARNING(Kernel, "Unimplemented \"Single\" schedule mode.");
+-    }
+     GetCpuLimiter()->Start();
+ }
+ 
+diff --git a/src/core/hle/kernel/thread.h b/src/core/hle/kernel/thread.h
+index dd83874..2ea6884 100644
+--- a/src/core/hle/kernel/thread.h
++++ b/src/core/hle/kernel/thread.h
+@@ -96,8 +96,22 @@ public:
+     virtual bool DoTimeLimit(Thread* thread) = 0;
+ };
+ 
++/**
++ * Core 1 preemption, as done by the 3DS kernel.
++ * - Multi mode: alternates between sysmodule-only and application-only phases every
++ *   2ms * (cpuTime / 100).
++ * - Single mode (1.0-era titles): 25ms slices. The application gets cpuTime% of the slice,
++ *   sysmodules get (90 - cpuTime)%, and the remaining 10% goes to other (exempted) threads.
++ * See https://github.com/LumaTeam/Luma3DS/blob/e35972ea/sysmodules/pm/source/reslimit.c#L144
++ */
+ class CpuLimiterMulti : public CpuLimiter {
+ public:
++    enum class SchedState : u32 {
++        APP,
++        SYS,
++        OTHER, ///< Single mode only: neither application nor sysmodule threads may run.
++    };
++
+     CpuLimiterMulti(Kernel::KernelSystem& kernel);
+     ~CpuLimiterMulti() override = default;
+ 
+@@ -110,23 +124,30 @@ public:
+ 
+     bool DoTimeLimit(Thread* thread) override;
+ 
+-private:
+-    enum class SchedState : u32 {
+-        APP,
+-        SYS,
+-    };
++    /// Whether an application CPU time value turns preemption on. Only 1..89 does: 0 disables
++    /// preemption and 10000 (and above) means the application is exempted from it.
++    static bool IsPreemptiveCpuTime(s32 cpu_time);
+ 
++    /// The phase that follows `state`.
++    static SchedState NextState(bool is_single, SchedState state);
++
++    /// How long `state` lasts, in cycles, for a preemptive application CPU time.
++    static s64 PhaseLength(bool is_single, SchedState state, s32 app_cpu_time);
++
++private:
+     void OnTick(s64 cycles_late);
+ 
+     void ChangeState(s64 cycles_late);
+ 
+     void WakeupSleepingThreads();
+ 
+-    static constexpr u64 base_tick_interval = nsToCycles(2'000'000); // 2ms
++    static constexpr u64 base_tick_interval = nsToCycles(2'000'000);    // 2ms
++    static constexpr u64 single_slice_interval = nsToCycles(25'000'000); // 25ms
+ 
+     Kernel::KernelSystem& kernel;
+     Core::TimingEventType* tick_event{};
+ 
++    bool is_single = false;
+     bool ready = false;
+     bool active = false;
+     Core1CpuTime app_cpu_time = Core1CpuTime::PREEMPTION_DISABLED;
+@@ -138,7 +159,7 @@ private:
+     void serialize(Archive& ar, const unsigned int);
+ };
+ 
+-// TODO(PabloMK7): Replace with proper implementation
++// Both modes share one implementation; the mode is chosen in Initialize().
+ using CpuLimiterSingle = CpuLimiterMulti;
+ 
+ class ThreadManager {
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index f1278cf..5e495e0 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -4,6 +4,7 @@ add_executable(tests
+     common/param_package.cpp
+     core/core_timing.cpp
+     core/file_sys/path_parser.cpp
++    core/hle/kernel/cpu_limiter.cpp
+     core/hle/kernel/hle_ipc.cpp
+     core/memory/memory.cpp
+     core/memory/vm_manager.cpp
+diff --git a/src/tests/core/hle/kernel/cpu_limiter.cpp b/src/tests/core/hle/kernel/cpu_limiter.cpp
+new file mode 100644
+index 0000000..a3ab3f5
+--- /dev/null
++++ b/src/tests/core/hle/kernel/cpu_limiter.cpp
+@@ -0,0 +1,55 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <catch2/catch_test_macros.hpp>
++#include "core/core_timing.h"
++#include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/thread.h"
++
++using Kernel::CpuLimiterMulti;
++using State = CpuLimiterMulti::SchedState;
++
++TEST_CASE("CpuLimiter only preempts for 1..89", "[kernel]") {
++    REQUIRE_FALSE(CpuLimiterMulti::IsPreemptiveCpuTime(Kernel::Core1CpuTime::PREEMPTION_DISABLED));
++    REQUIRE(CpuLimiterMulti::IsPreemptiveCpuTime(1));
++    REQUIRE(CpuLimiterMulti::IsPreemptiveCpuTime(25));
++    REQUIRE(CpuLimiterMulti::IsPreemptiveCpuTime(89));
++    REQUIRE_FALSE(CpuLimiterMulti::IsPreemptiveCpuTime(90));
++    // 1.0 titles such as Nintendo 3DS Sound are exempted, which must not starve sysmodules.
++    REQUIRE_FALSE(
++        CpuLimiterMulti::IsPreemptiveCpuTime(Kernel::Core1CpuTime::PREEMPTION_EXCEMPTED));
++}
++
++TEST_CASE("CpuLimiter Multi mode alternates within 2ms", "[kernel]") {
++    const s64 base = static_cast<s64>(nsToCycles(2'000'000));
++    REQUIRE(CpuLimiterMulti::NextState(false, State::APP) == State::SYS);
++    REQUIRE(CpuLimiterMulti::NextState(false, State::SYS) == State::APP);
++    const s64 app = CpuLimiterMulti::PhaseLength(false, State::APP, 25);
++    const s64 sys = CpuLimiterMulti::PhaseLength(false, State::SYS, 25);
++    REQUIRE(app == base * 25 / 100);
++    REQUIRE(app + sys == base);
++}
++
++TEST_CASE("CpuLimiter Single mode uses 25ms slices", "[kernel]") {
++    const s64 slice = static_cast<s64>(nsToCycles(25'000'000));
++    REQUIRE(CpuLimiterMulti::NextState(true, State::APP) == State::SYS);
++    REQUIRE(CpuLimiterMulti::NextState(true, State::SYS) == State::OTHER);
++    REQUIRE(CpuLimiterMulti::NextState(true, State::OTHER) == State::APP);
++    // Default for 1.0 titles: 25% application, 65% sysmodules, 10% other.
++    const s64 app = CpuLimiterMulti::PhaseLength(true, State::APP, 25);
++    const s64 sys = CpuLimiterMulti::PhaseLength(true, State::SYS, 25);
++    const s64 other = CpuLimiterMulti::PhaseLength(true, State::OTHER, 25);
++    REQUIRE(app == slice * 25 / 100);
++    REQUIRE(sys == slice * 65 / 100);
++    REQUIRE(other == slice * 10 / 100);
++    REQUIRE(app + sys + other <= slice);
++    REQUIRE(app + sys + other > slice - 3);
++    // Every phase has a positive length, even at the edges of the valid range.
++    for (s32 cpu : {1, 30, 89}) {
++        for (bool single : {false, true}) {
++            REQUIRE(CpuLimiterMulti::PhaseLength(single, State::APP, cpu) > 0);
++            REQUIRE(CpuLimiterMulti::PhaseLength(single, State::SYS, cpu) > 0);
++        }
++    }
++}
+-- 
+2.43.0
+

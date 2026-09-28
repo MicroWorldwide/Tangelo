@@ -1,0 +1,94 @@
+From 44b631dd32eb8fcf78da13c78585208eb9e1ed8b Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 01:09:39 +0200
+Subject: [PATCH 1/2] file_sys: create system shared extdata on first open
+
+The photo viewer library applet (PnoteApp2) opens NAND shared extdata
+F0000001 (camera/photo store). A real console creates it during system
+setup, so the applet treats NotFormatted as fatal. This crashed Disney
+Magical World 2 when opening its photo album.
+
+Format F0000001 and F0000002 (sound store) automatically when they are
+opened and missing, as PTM already does for F000000B.
+
+Also write the extdata icon to the corrected (shared) path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/file_sys/archive_extsavedata.cpp | 45 ++++++++++++++++++++++-
+ 1 file changed, 43 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/file_sys/archive_extsavedata.cpp b/src/core/file_sys/archive_extsavedata.cpp
+index bb10875..27096a1 100644
+--- a/src/core/file_sys/archive_extsavedata.cpp
++++ b/src/core/file_sys/archive_extsavedata.cpp
+@@ -180,6 +180,27 @@ struct ExtSaveDataArchivePath {
+ 
+ static_assert(sizeof(ExtSaveDataArchivePath) == 12, "Incorrect path size");
+ 
++/**
++ * NAND shared extdata that a real console creates during initial system setup, so system
++ * applets expect it to always exist and treat NotFormatted as a fatal error.
++ *  - 0xF0000001: Camera / photo store (NAND JPEG/MPO files, phtcache.bin). Opened by the
++ *    photo viewer library applet (PnoteApp2), e.g. from Disney Magical World 2's photo album.
++ *  - 0xF0000002: Sound store (NAND M4A files), used by the sound library applet (SnoteApp2).
++ * 0xF000000B (play coins, Mii data) is created on demand by the PTM service instead.
++ */
++static bool IsSystemProvisionedSharedExtData(const ExtSaveDataArchivePath& path) {
++    if (path.media_type != static_cast<u32>(Service::FS::MediaType::NAND)) {
++        return false;
++    }
++    switch (path.save_low) {
++    case 0xF0000001:
++    case 0xF0000002:
++        return true;
++    default:
++        return false;
++    }
++}
++
+ std::string GetExtSaveDataPath(std::string_view mount_point, const Path& path) {
+     std::vector<u8> vec_data = path.AsBinary();
+ 
+@@ -278,6 +299,26 @@ ResultVal<std::unique_ptr<ArchiveBackend>> ArchiveFactory_ExtSaveData::Open(cons
+     } else {
+         const auto directory = type == ExtSaveDataType::Boss ? "boss/" : "user/";
+         const auto fullpath = GetExtSaveDataPath(mount_point, GetCorrectedPath(path)) + directory;
++
++        if (!FileUtil::Exists(fullpath) && type == ExtSaveDataType::Shared &&
++            path.GetType() == LowPathType::Binary &&
++            path.AsBinary().size() == sizeof(ExtSaveDataArchivePath)) {
++            ExtSaveDataArchivePath path_data;
++            std::memcpy(&path_data, path.AsBinary().data(), sizeof(path_data));
++
++            if (IsSystemProvisionedSharedExtData(path_data)) {
++                LOG_INFO(Service_FS, "Creating missing system shared extdata {:08X}",
++                         path_data.save_low);
++                const Result format_result =
++                    FormatAsExtData(path, FileSys::ArchiveFormatInfo(), 0, program_id, 0,
++                                    std::nullopt);
++                if (format_result.IsError()) {
++                    LOG_ERROR(Service_FS, "Failed to create shared extdata {:08X}",
++                              path_data.save_low);
++                }
++            }
++        }
++
+         if (!FileUtil::Exists(fullpath)) {
+             // TODO(Subv): Verify the archive behavior of SharedExtSaveData compared to ExtSaveData.
+             // ExtSaveData seems to return FS_NotFound (120) when the archive doesn't exist.
+@@ -343,8 +384,8 @@ Result ArchiveFactory_ExtSaveData::FormatAsExtData(const Path& path,
+         file.WriteBytes(&format_info, sizeof(format_info));
+ 
+         if (icon.has_value()) {
+-            FileUtil::IOFile icon_file(FileSys::GetExtSaveDataPath(GetMountPoint(), path) + "icon",
+-                                       "wb");
++            FileUtil::IOFile icon_file(
++                FileSys::GetExtSaveDataPath(GetMountPoint(), corrected_path) + "icon", "wb");
+             icon_file.WriteBytes(icon->data(), icon->size());
+         }
+         return ResultSuccess;
+-- 
+2.43.0
+

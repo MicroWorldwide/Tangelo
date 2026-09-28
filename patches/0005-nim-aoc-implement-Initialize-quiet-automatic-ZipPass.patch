@@ -1,0 +1,138 @@
+From dc52ede306a894a1b5b342dcfd63910d8233c39f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 15:33:25 +0200
+Subject: [PATCH] nim:aoc: implement Initialize; quiet automatic ZipPass checks
+
+nim:aoc Initialize (0x0021) had no handler, so every game that checks
+for add-on content at boot (e.g. Disney Magical World 2) logged it as an
+unimplemented function. Add a handler that returns success, the same
+result the fallback already gave, so behaviour is unchanged.
+
+The ZipPass queue pass runs at startup and after every game. When its
+requirements aren't met (no system files, LLE modules off) that is a
+normal situation, so log it at debug level there; manual imports still
+report it as an error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/nim/nim_aoc.cpp | 16 +++++++++++++++-
+ src/core/hle/service/nim/nim_aoc.h   |  9 +++++++++
+ src/core/zip_pass.cpp                | 20 +++++++++++++++-----
+ 3 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/hle/service/nim/nim_aoc.cpp b/src/core/hle/service/nim/nim_aoc.cpp
+index 27137a2..e922e19 100644
+--- a/src/core/hle/service/nim/nim_aoc.cpp
++++ b/src/core/hle/service/nim/nim_aoc.cpp
+@@ -3,6 +3,8 @@
+ // Refer to the license.txt file included.
+ 
+ #include "common/archives.h"
++#include "common/logging/log.h"
++#include "core/hle/ipc_helpers.h"
+ #include "core/hle/service/nim/nim_aoc.h"
+ 
+ SERIALIZE_EXPORT_IMPL(Service::NIM::NIM_AOC)
+@@ -17,7 +19,7 @@ NIM_AOC::NIM_AOC() : ServiceFramework("nim:aoc", 2) {
+         {0x0009, nullptr, "ListContentSetsEx"},
+         {0x0018, nullptr, "GetBalance"},
+         {0x001D, nullptr, "GetCustomerSupportCode"},
+-        {0x0021, nullptr, "Initialize"},
++        {0x0021, &NIM_AOC::Initialize, "Initialize"},
+         {0x0024, nullptr, "CalculateContentsRequiredSize"},
+         {0x0025, nullptr, "RefreshServerTime"},
+         // clang-format on
+@@ -27,4 +29,16 @@ NIM_AOC::NIM_AOC() : ServiceFramework("nim:aoc", 2) {
+ 
+ NIM_AOC::~NIM_AOC() = default;
+ 
++void NIM_AOC::Initialize(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    // Games call this at boot to check for downloadable add-on content. The eShop is gone, so
++    // there is nothing to set up: report success (what the unimplemented-function fallback
++    // already returned), and later add-on content calls simply find no content.
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_NIM, "(STUBBED) called");
++}
++
+ } // namespace Service::NIM
+diff --git a/src/core/hle/service/nim/nim_aoc.h b/src/core/hle/service/nim/nim_aoc.h
+index 003b3fd..a3f03b7 100644
+--- a/src/core/hle/service/nim/nim_aoc.h
++++ b/src/core/hle/service/nim/nim_aoc.h
+@@ -14,6 +14,15 @@ public:
+     ~NIM_AOC();
+ 
+ private:
++    /**
++     * NIM_AOC::Initialize service function (0x0021)
++     *  Inputs:
++     *      0 : Header code [0x00210000]
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     */
++    void Initialize(Kernel::HLERequestContext& ctx);
++
+     SERVICE_SERIALIZATION_SIMPLE
+ };
+ 
+diff --git a/src/core/zip_pass.cpp b/src/core/zip_pass.cpp
+index 0af4e9d..875f1a0 100644
+--- a/src/core/zip_pass.cpp
++++ b/src/core/zip_pass.cpp
+@@ -123,7 +123,17 @@ bool AddFileToZip(zip_t* za, const std::string& zip_path, const std::string& src
+     return true;
+ }
+ 
+-int ZipPassChecks() {
++/// `automatic` is true for the queue pass that runs at startup and after every game; there an
++/// unmet requirement is a normal situation, so it's logged at debug level instead of as an error.
++int ZipPassChecks(bool automatic = false) {
++    const auto report = [automatic](const char* message) {
++        if (automatic) {
++            LOG_DEBUG(Frontend, "{}", message);
++        } else {
++            LOG_ERROR(Frontend, "{}", message);
++        }
++    };
++
+     int n_homes = 0;
+     for (u32 region = 0; region < Core::NUM_SYSTEM_TITLE_REGIONS; region++) {
+         if (region == 3) {
+@@ -136,17 +146,17 @@ int ZipPassChecks() {
+     }
+ 
+     if (n_homes < 1) {
+-        LOG_ERROR(Frontend, "ZipPass import impossible without system files");
++        report("ZipPass import impossible without system files");
+         return -2;
+     }
+ 
+     if (!Settings::values.enable_required_online_lle_modules.GetValue()) {
+-        LOG_ERROR(Frontend, "ZipPass import impossible without LLE modules");
++        report("ZipPass import impossible without LLE modules");
+         return -3;
+     }
+ 
+     if (isEmulationRunning()) {
+-        LOG_ERROR(Frontend, "ZipPass import refused while emulation is running");
++        report("ZipPass import refused while emulation is running");
+         return -4;
+     }
+ 
+@@ -372,7 +382,7 @@ int importQueuedZipPass() {
+     std::lock_guard lock(zip_pass_mutex);
+     LOG_DEBUG(Frontend, "Processing ZipPass queue");
+ 
+-    if (const int check = ZipPassChecks(); check != 0) {
++    if (const int check = ZipPassChecks(true); check != 0) {
+         return check;
+     }
+ 
+-- 
+2.43.0
+

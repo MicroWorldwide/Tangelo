@@ -1,0 +1,104 @@
+From 13fe8c1c8dc8b0baf9a5dd34a62485faa37992f4 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 15:25:42 +0200
+Subject: [PATCH] apt: fall back to an installed region's applet title
+
+Library and system applets are launched from the title ID for the
+current region (CFG). When a game runs region-free, e.g. a USA game with
+a EUR set of system files, that title isn't installed, so the native
+applet failed to load and the HLE fallback was used instead (Disney
+Magical World's name entry showed the Qt input dialog, not the 3DS
+software keyboard).
+
+Try the current region's title first, then the same applet from any
+other region that is installed, as a region-free patched console does.
+The HLE fallback is still used when no region's copy exists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/apt/applet_manager.cpp | 47 +++++++++++++++++----
+ 1 file changed, 38 insertions(+), 9 deletions(-)
+
+diff --git a/src/core/hle/service/apt/applet_manager.cpp b/src/core/hle/service/apt/applet_manager.cpp
+index ae975b4..7e9befd 100644
+--- a/src/core/hle/service/apt/applet_manager.cpp
++++ b/src/core/hle/service/apt/applet_manager.cpp
+@@ -128,6 +128,41 @@ u64 GetTitleIdForApplet(AppletId id, u32 region_value) {
+     }
+ }
+ 
++/**
++ * Launches the native (LLE) title of an applet. The title for `region_value` is tried first. If
++ * that one isn't installed, e.g. a USA game run region-free with a EUR set of system files, the
++ * same applet from another installed region is used instead, which is what a region-free patched
++ * console does. Returns nullptr when no region's copy can be loaded (caller falls back to HLE).
++ */
++static std::shared_ptr<Kernel::Process> LaunchAppletTitle(Core::System& system, AppletId id,
++                                                         u32 region_value) {
++    const u64 preferred = GetTitleIdForApplet(id, region_value);
++    if (auto process = NS::LaunchTitle(system, FS::MediaType::NAND, preferred)) {
++        return process;
++    }
++
++    for (u32 region = 0; region < AppletTitleData::NumRegions; ++region) {
++        if (region == region_value) {
++            continue;
++        }
++        const u64 title_id = GetTitleIdForApplet(id, region);
++        if (title_id == 0 || title_id == preferred) {
++            continue;
++        }
++        const std::string path = AM::GetTitleContentPath(FS::MediaType::NAND, title_id);
++        if (path.empty() || !FileUtil::Exists(path)) {
++            continue;
++        }
++        if (auto process = NS::LaunchTitle(system, FS::MediaType::NAND, title_id)) {
++            LOG_INFO(Service_APT,
++                     "Applet {:03X}: {:016X} (region {}) not installed, using {:016X} (region {})",
++                     id, preferred, region_value, title_id, region);
++            return process;
++        }
++    }
++    return nullptr;
++}
++
+ static constexpr std::size_t NumTitleIDConverts = 3;
+ static constexpr std::array<std::array<u64, 7>, NumTitleIDConverts> TitleIDConvertTable = {{
+     // MSET
+@@ -626,9 +661,7 @@ Result AppletManager::PrepareToStartLibraryApplet(AppletId applet_id) {
+     if (Settings::values.lle_applets) {
+         bool is_setup = system.GetAppLoader().DoingInitialSetup();
+         auto cfg = Service::CFG::GetModule(system);
+-        auto process =
+-            NS::LaunchTitle(system, FS::MediaType::NAND,
+-                            GetTitleIdForApplet(applet_id, cfg->GetRegionValue(is_setup)));
++        auto process = LaunchAppletTitle(system, applet_id, cfg->GetRegionValue(is_setup));
+         if (process) {
+             return ResultSuccess;
+         }
+@@ -659,9 +692,7 @@ Result AppletManager::PreloadLibraryApplet(AppletId applet_id) {
+     if (Settings::values.lle_applets) {
+         bool is_setup = system.GetAppLoader().DoingInitialSetup();
+         auto cfg = Service::CFG::GetModule(system);
+-        auto process =
+-            NS::LaunchTitle(system, FS::MediaType::NAND,
+-                            GetTitleIdForApplet(applet_id, cfg->GetRegionValue(is_setup)));
++        auto process = LaunchAppletTitle(system, applet_id, cfg->GetRegionValue(is_setup));
+         if (process) {
+             return ResultSuccess;
+         }
+@@ -881,9 +912,7 @@ Result AppletManager::StartSystemApplet(AppletId applet_id, std::shared_ptr<Kern
+     if (!GetAppletSlot(slot_id)->registered) {
+         bool is_setup = system.GetAppLoader().DoingInitialSetup();
+         auto cfg = Service::CFG::GetModule(system);
+-        auto process =
+-            NS::LaunchTitle(system, FS::MediaType::NAND,
+-                            GetTitleIdForApplet(applet_id, cfg->GetRegionValue(is_setup)));
++        auto process = LaunchAppletTitle(system, applet_id, cfg->GetRegionValue(is_setup));
+         if (!process) {
+             // TODO: Find the right error code.
+             return {ErrorDescription::NotFound, ErrorModule::Applet, ErrorSummary::NotSupported,
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+From ee75c03f731f32065323874d17561997b72b32fb Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 16:25:36 +0200
+Subject: [PATCH] qt: send compatibility reports to the Tangelo list
+
+Emulation > Report Compatibility opened Azahar's contributing guide, so
+reports about Tangelo ended up in Azahar's list. Point it at
+MicroWorldwide/tangelo-compatibility-list, which the Windows build now
+uses as the game list's compatibility source.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/citra_qt/citra_qt.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index 51a7534..ddd5d97 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -2350,7 +2350,7 @@ void GMainWindow::ConnectMenuEvents() {
+     connect_menu(ui->action_Restart, [this] { BootGame(QString(game_path)); });
+     connect_menu(ui->action_Report_Compatibility, []() {
+         QDesktopServices::openUrl(QUrl(QStringLiteral(
+-            "https://github.com/azahar-emu/compatibility-list/blob/master/CONTRIBUTING.md")));
++            "https://github.com/MicroWorldwide/tangelo-compatibility-list/blob/master/CONTRIBUTING.md")));
+     });
+     connect_menu(ui->action_Configure, &GMainWindow::OnConfigure, QAction::PreferencesRole);
+     connect_menu(ui->action_Configure_Current_Game, &GMainWindow::OnConfigurePerGame);
+-- 
+2.43.0
+

@@ -1,0 +1,380 @@
+From 6238a40fb06499273bbbe7422288c67432153c5f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 22:41:13 +0200
+Subject: [PATCH] cecd: give OutBox messages an ID and creation time like the
+ real module
+
+Applications write StreetPass messages with an all-zero message ID and
+no timestamps; the real cecd module fills them in. HLE CECD stored the
+application's header as is, so every message was named _AAAAAAAAAAA.
+NetPass (and the receiving cecd) drop a message whose ID is already in
+the inbox, so after an exchange only the first Tangelo player's message
+would ever arrive.
+
+Compared against a message the real module wrote for Nintendo 3DS Sound
+(online LLE modules on): it generated a random 8-byte message ID and
+stamped the creation time; sender ID, the second message ID and the
+send/receive times stay 0.
+
+- WriteMessage / WriteMessageWithHMAC to the OutBox now do the same:
+  a random ID when the message has none, the emulated clock as creation
+  time when it has none, the file named after the ID, and the ID
+  returned to the application. Inbox writes are unchanged.
+- The timestamp struct had month, day, hour, ... but the real layout
+  has a weekday after the day and a 16-bit millisecond at the end
+  (2026-09-28 Monday 22:35:00.370 = 2026, 9, 28, 1, 22, 35, 0, 370).
+  ZipPass wrote imported messages' send/receive times with the old
+  layout, shifting every field by one byte; it now uses the right one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cecd/cecd.cpp          | 99 +++++++++++++++++++--
+ src/core/hle/service/cecd/cecd.h            | 30 ++++++-
+ src/core/zip_pass.cpp                       |  6 +-
+ src/tests/CMakeLists.txt                    |  1 +
+ src/tests/core/hle/service/cecd_message.cpp | 80 +++++++++++++++++
+ 5 files changed, 204 insertions(+), 12 deletions(-)
+ create mode 100644 src/tests/core/hle/service/cecd_message.cpp
+
+diff --git a/src/core/hle/service/cecd/cecd.cpp b/src/core/hle/service/cecd/cecd.cpp
+index 3442dbf..9851db3 100644
+--- a/src/core/hle/service/cecd/cecd.cpp
++++ b/src/core/hle/service/cecd/cecd.cpp
+@@ -4,8 +4,10 @@
+ 
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/unique_ptr.hpp>
++#include <algorithm>
+ #include <cryptopp/base64.h>
+ #include <cryptopp/hmac.h>
++#include <cryptopp/osrng.h>
+ #include <cryptopp/sha.h>
+ #include <fmt/format.h>
+ #include "common/archives.h"
+@@ -20,6 +22,7 @@
+ #include "core/file_sys/file_backend.h"
+ #include "core/hle/ipc_helpers.h"
+ #include "core/hle/kernel/process.h"
++#include "core/hle/kernel/shared_page.h"
+ #include "core/hle/result.h"
+ #include "core/hle/service/cecd/cecd.h"
+ #include "core/hle/service/cecd/cecd_ndm.h"
+@@ -400,6 +403,19 @@ void Module::Interface::WriteMessage(Kernel::HLERequestContext& ctx) {
+     std::vector<u8> id_buffer(message_id_size);
+     message_id_buffer.Read(id_buffer.data(), 0, message_id_size);
+ 
++    std::vector<u8> buffer(buffer_size);
++    read_buffer.Read(buffer.data(), 0, buffer_size);
++
++    // Like the real cecd, give a new OutBox message a message ID and creation time. The app
++    // passes an all-zero ID and gets the generated one back.
++    if (is_outbox) {
++        const std::vector<u8> new_id = cecd->PrepareOutboxMessage(buffer);
++        if (!new_id.empty() && id_buffer.size() >= new_id.size()) {
++            std::copy(new_id.begin(), new_id.end(), id_buffer.begin());
++            message_id_buffer.Write(id_buffer.data(), 0, id_buffer.size());
++        }
++    }
++
+     FileSys::Path message_path =
+         cecd->GetCecDataPathTypeAsString(is_outbox ? CecDataPathType::OutboxMsg
+                                                    : CecDataPathType::InboxMsg,
+@@ -412,9 +428,6 @@ void Module::Interface::WriteMessage(Kernel::HLERequestContext& ctx) {
+     if (message_result.Succeeded()) {
+         auto message = std::move(message_result).Unwrap();
+ 
+-        std::vector<u8> buffer(buffer_size);
+-        read_buffer.Read(buffer.data(), 0, buffer_size);
+-
+         CecMessageHeader msg_header;
+         std::memcpy(&msg_header, buffer.data(), sizeof(CecMessageHeader));
+ 
+@@ -471,6 +484,19 @@ void Module::Interface::WriteMessageWithHMAC(Kernel::HLERequestContext& ctx) {
+     std::vector<u8> id_buffer(message_id_size);
+     message_id_buffer.Read(id_buffer.data(), 0, message_id_size);
+ 
++    std::vector<u8> buffer(buffer_size);
++    read_buffer.Read(buffer.data(), 0, buffer_size);
++
++    // Like the real cecd, give a new OutBox message a message ID and creation time. The app
++    // passes an all-zero ID and gets the generated one back.
++    if (is_outbox) {
++        const std::vector<u8> new_id = cecd->PrepareOutboxMessage(buffer);
++        if (!new_id.empty() && id_buffer.size() >= new_id.size()) {
++            std::copy(new_id.begin(), new_id.end(), id_buffer.begin());
++            message_id_buffer.Write(id_buffer.data(), 0, id_buffer.size());
++        }
++    }
++
+     FileSys::Path message_path =
+         cecd->GetCecDataPathTypeAsString(is_outbox ? CecDataPathType::OutboxMsg
+                                                    : CecDataPathType::InboxMsg,
+@@ -483,9 +509,6 @@ void Module::Interface::WriteMessageWithHMAC(Kernel::HLERequestContext& ctx) {
+     if (message_result.Succeeded()) {
+         auto message = std::move(message_result).Unwrap();
+ 
+-        std::vector<u8> buffer(buffer_size);
+-        read_buffer.Read(buffer.data(), 0, buffer_size);
+-
+         CecMessageHeader msg_header;
+         std::memcpy(&msg_header, buffer.data(), sizeof(CecMessageHeader));
+ 
+@@ -1393,6 +1416,70 @@ Module::SessionData::~SessionData() {
+ Module::Interface::Interface(std::shared_ptr<Module> cecd, const char* name, u32 max_session)
+     : ServiceFramework(name, max_session), cecd(std::move(cecd)) {}
+ 
++Module::CecMessageHeader::Time Module::MakeMessageTime(u64 ms_since_2000) {
++    // Days since 2000-01-01 to a civil date (Howard Hinnant's days_from_civil, inverted).
++    const u64 days_since_2000 = ms_since_2000 / 86'400'000;
++    const u64 ms_of_day = ms_since_2000 % 86'400'000;
++    const s64 z = static_cast<s64>(days_since_2000) + 10957 + 719468; // days since 0000-03-01
++    const s64 era = z / 146097;
++    const s64 doe = z - era * 146097;
++    const s64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
++    const s64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    const s64 mp = (5 * doy + 2) / 153;
++    const s64 day = doy - (153 * mp + 2) / 5 + 1;
++    const s64 month = mp < 10 ? mp + 3 : mp - 9;
++    const s64 year = yoe + era * 400 + (month <= 2 ? 1 : 0);
++
++    CecMessageHeader::Time time{};
++    time.year = static_cast<u32>(year);
++    time.month = static_cast<u8>(month);
++    time.day = static_cast<u8>(day);
++    time.weekday = static_cast<u8>((6 + days_since_2000) % 7); // 2000-01-01 was a Saturday
++    time.hour = static_cast<u8>(ms_of_day / 3'600'000);
++    time.minute = static_cast<u8>(ms_of_day / 60'000 % 60);
++    time.second = static_cast<u8>(ms_of_day / 1'000 % 60);
++    time.millisecond = static_cast<u16>(ms_of_day % 1'000);
++    return time;
++}
++
++Module::CecMessageId Module::FillOutboxMessageHeader(std::span<u8> message,
++                                                     const CecMessageId& new_id,
++                                                     const CecMessageHeader::Time& now) {
++    CecMessageHeader header;
++    std::memcpy(&header, message.data(), sizeof(CecMessageHeader));
++
++    if (std::all_of(header.message_id.begin(), header.message_id.end(),
++                    [](u8 b) { return b == 0; })) {
++        header.message_id = new_id;
++    }
++    if (header.create_time.year == 0) {
++        header.create_time = now;
++    }
++
++    std::memcpy(message.data(), &header, sizeof(CecMessageHeader));
++    return header.message_id;
++}
++
++std::vector<u8> Module::PrepareOutboxMessage(std::vector<u8>& message) {
++    constexpr u16 message_magic = 0x6060;
++    CecMessageHeader header;
++    if (message.size() < sizeof(CecMessageHeader)) {
++        return {};
++    }
++    std::memcpy(&header, message.data(), sizeof(CecMessageHeader));
++    if (header.magic != message_magic) {
++        return {};
++    }
++
++    CecMessageId new_id;
++    CryptoPP::AutoSeededRandomPool rng;
++    rng.GenerateBlock(new_id.data(), new_id.size());
++    const auto now =
++        MakeMessageTime(system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000());
++    const CecMessageId id = FillOutboxMessageHeader(message, new_id, now);
++    return std::vector<u8>(id.begin(), id.end());
++}
++
+ Module::Module(Core::System& system) : system(system) {
+     using namespace Kernel;
+     cecinfo_event = system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "CECD::cecinfo_event");
+diff --git a/src/core/hle/service/cecd/cecd.h b/src/core/hle/service/cecd/cecd.h
+index 65a0f58..9fe7e75 100644
+--- a/src/core/hle/service/cecd/cecd.h
++++ b/src/core/hle/service/cecd/cecd.h
+@@ -4,8 +4,10 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <memory>
+ #include <span>
++#include <vector>
+ #include "common/bit_field.h"
+ #include "common/common_funcs.h"
+ #include "core/hle/kernel/event.h"
+@@ -185,22 +187,44 @@ public:
+         u8 is_new;
+         u64_le sender_id;
+         u64_le sender_id2;
++        // Layout confirmed from a message written by the real cecd module: 2026-09-28 (a Monday)
++        // 22:35:00.370 is stored as year 2026, 9, 28, 1, 22, 35, 0, 370.
+         struct Time {
+             u32_le year;
+             u8 month;
+             u8 day;
++            u8 weekday; // 0 = Sunday
+             u8 hour;
+             u8 minute;
+             u8 second;
+-            u8 millisecond;
+-            u8 microsecond;
+-            u8 padding;
++            u16_le millisecond;
+         } send_time, recv_time, create_time;
+         u8 send_count;
+         u8 forward_count;
+         u16_le user_data;
+     };
+     static_assert(sizeof(CecMessageHeader) == 0x70, "CecMessageHeader struct has incorrect size.");
++    static_assert(sizeof(CecMessageHeader::Time) == 12, "CecMessageHeader::Time has incorrect size.");
++
++    using CecMessageId = std::array<u8, 8>;
++
++    /// Converts the 3DS clock (milliseconds since 2000-01-01) to a message timestamp.
++    static CecMessageHeader::Time MakeMessageTime(u64 ms_since_2000);
++
++    /**
++     * What the real cecd module does when an application writes a message into its OutBox:
++     * a message without an ID gets `new_id`, and one without a creation time gets `now`.
++     * Returns the message's ID. `message` must hold at least a CecMessageHeader.
++     */
++    static CecMessageId FillOutboxMessageHeader(std::span<u8> message, const CecMessageId& new_id,
++                                                const CecMessageHeader::Time& now);
++
++    /**
++     * Applies FillOutboxMessageHeader to a message an application writes into its OutBox, with a
++     * random ID and the emulated clock, updating `message` in place. Returns the message ID, or
++     * nothing if `message` is not a CEC message.
++     */
++    std::vector<u8> PrepareOutboxMessage(std::vector<u8>& message);
+ 
+     struct CecOBIndexHeader {
+         u16_le magic; // 0x6767 'gg'
+diff --git a/src/core/zip_pass.cpp b/src/core/zip_pass.cpp
+index 875f1a0..f3d2b6c 100644
+--- a/src/core/zip_pass.cpp
++++ b/src/core/zip_pass.cpp
+@@ -330,15 +330,15 @@ int importZipPass(std::string path) {
+             std::chrono::system_clock::to_time_t(std::chrono::system_clock::time_point(init_time));
+         const std::tm tm = *std::localtime(&now);
+ 
++        header.send_time = {};
+         header.send_time.year = tm.tm_year + 1900;
+         header.send_time.month = static_cast<u8>(tm.tm_mon + 1);
+         header.send_time.day = static_cast<u8>(tm.tm_mday);
++        header.send_time.weekday = static_cast<u8>(tm.tm_wday);
+         header.send_time.hour = static_cast<u8>(tm.tm_hour);
+         header.send_time.minute = static_cast<u8>(tm.tm_min);
+         header.send_time.second = static_cast<u8>(tm.tm_sec);
+-        header.send_time.millisecond = 1;
+-        header.send_time.microsecond = 1;
+-        header.send_time.padding = 1;
++        header.send_time.millisecond = 0;
+         header.recv_time = header.send_time;
+ 
+         CryptoPP::AutoSeededRandomPool rng;
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index d662b25..5f634ab 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_executable(tests
+     core/file_sys/path_parser.cpp
+     core/hle/kernel/cpu_limiter.cpp
+     core/hle/kernel/hle_ipc.cpp
++    core/hle/service/cecd_message.cpp
+     core/memory/memory.cpp
+     core/memory/vm_manager.cpp
+     core/system_titles.cpp
+diff --git a/src/tests/core/hle/service/cecd_message.cpp b/src/tests/core/hle/service/cecd_message.cpp
+new file mode 100644
+index 0000000..e7708b2
+--- /dev/null
++++ b/src/tests/core/hle/service/cecd_message.cpp
+@@ -0,0 +1,80 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cstring>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/service/cecd/cecd.h"
++
++using Service::CECD::Module;
++
++TEST_CASE("CECD message timestamps use the real cecd layout", "[core][cecd]") {
++    // Nintendo 3DS Sound's OutBox message written by the real cecd module at
++    // 2026-09-28 22:35:00.370 (a Monday) stores: 2026, 9, 28, 1, 22, 35, 0, 370.
++    const auto t = Module::MakeMessageTime(843'950'100'370);
++    CHECK(t.year == 2026u);
++    CHECK(t.month == 9);
++    CHECK(t.day == 28);
++    CHECK(t.weekday == 1);
++    CHECK(t.hour == 22);
++    CHECK(t.minute == 35);
++    CHECK(t.second == 0);
++    CHECK(t.millisecond == 370);
++
++    const auto start = Module::MakeMessageTime(0); // 2000-01-01, a Saturday
++    CHECK((start.year == 2000u && start.month == 1 && start.day == 1 && start.weekday == 6));
++
++    const auto leap = Module::MakeMessageTime(762'480'000'000); // 2024-02-29, a Thursday
++    CHECK((leap.year == 2024u && leap.month == 2 && leap.day == 29 && leap.weekday == 4));
++
++    // The byte layout of the timestamp as the real module wrote it.
++    const u8 real_bytes[12] = {0xEA, 0x07, 0x00, 0x00, 9, 28, 1, 22, 35, 0, 0x72, 0x01};
++    CHECK(std::memcmp(&t, real_bytes, sizeof(real_bytes)) == 0);
++}
++
++TEST_CASE("CECD gives new OutBox messages an ID and creation time", "[core][cecd]") {
++    // Header as Nintendo 3DS Sound writes it: sizes and flags set, no ID, no timestamps.
++    Module::CecMessageHeader app_header{};
++    app_header.magic = 0x6060;
++    app_header.message_size = 0x1800;
++    app_header.header_size = 0xD38;
++    app_header.body_size = 0xAA8;
++    app_header.title_id = 0x20500;
++    app_header.flag = 3;
++    app_header.send_method = 3;
++    app_header.send_count = 0xFF;
++    app_header.forward_count = 1;
++
++    std::vector<u8> message(0x1800, 0xAB);
++    std::memcpy(message.data(), &app_header, sizeof(app_header));
++
++    const Module::CecMessageId new_id{0x2e, 0x7e, 0xe1, 0x1d, 0x9a, 0x6f, 0x55, 0xf7};
++    const auto now = Module::MakeMessageTime(843'950'100'370);
++    const auto id = Module::FillOutboxMessageHeader(message, new_id, now);
++    CHECK(id == new_id);
++
++    Module::CecMessageHeader result;
++    std::memcpy(&result, message.data(), sizeof(result));
++    CHECK(result.message_id == new_id);
++    CHECK(std::memcmp(&result.create_time, &now, sizeof(now)) == 0);
++    // Everything else is left as the application wrote it, like the real module does.
++    CHECK(result.message_size == 0x1800u);
++    CHECK(result.title_id == 0x20500u);
++    CHECK(result.flag == 3);
++    CHECK(result.send_count == 0xFF);
++    CHECK(result.forward_count == 1);
++    CHECK(result.sender_id == 0u);
++    CHECK(result.send_time.year == 0u);
++    CHECK(result.recv_time.year == 0u);
++    CHECK(message[sizeof(result)] == 0xAB); // body untouched
++
++    // A message that already has an ID and creation time (an update, or a NetPass import)
++    // keeps them.
++    const Module::CecMessageId other_id{1, 2, 3, 4, 5, 6, 7, 8};
++    const auto later = Module::MakeMessageTime(900'000'000'000);
++    CHECK(Module::FillOutboxMessageHeader(message, other_id, later) == new_id);
++    std::memcpy(&result, message.data(), sizeof(result));
++    CHECK(result.message_id == new_id);
++    CHECK(std::memcmp(&result.create_time, &now, sizeof(now)) == 0);
++}
+-- 
+2.43.0
+

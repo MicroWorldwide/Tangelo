@@ -1,0 +1,84 @@
+From 06a0a5218d19f8f8310ff20782b5e33fe3471b73 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 20:36:58 +0200
+Subject: [PATCH] core: region-neutral system titles keep the console's region
+
+GetSystemTitleRegion (patch 0010) returned the first region whose
+title ID matched. System modules such as ACT use the same title ID in
+every region, so they were mapped to region 0 (Japan): CFG told the ACT
+module the console was Japanese while SecureInfo said otherwise, and
+ACT aborted the emulator with a fatal error (module 83, 0xF8A14D5F)
+about 1.5s after boot whenever the online LLE modules were enabled.
+
+Titles that use one ID for every region now return no region, so they
+see the console's region like on hardware. Region-specific titles
+(software keyboard, Nintendo 3DS Sound, ...) are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/system_titles.cpp       | 18 ++++++++++++++----
+ src/tests/core/system_titles.cpp | 10 ++++++++++
+ 2 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/system_titles.cpp b/src/core/system_titles.cpp
+index 0fa82b6..37f4c57 100644
+--- a/src/core/system_titles.cpp
++++ b/src/core/system_titles.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
++#include <iterator>
+ #include <vector>
+ #include "core/hle/service/am/am.h"
+ #include "core/hle/service/fs/archive.h"
+@@ -1199,11 +1201,19 @@ std::optional<u32> GetSystemTitleRegion(u64 title_id) {
+ 
+     const auto title_id_low = static_cast<u32>(title_id & 0xFFFFFFFF);
+     for (const auto& title : category->titles) {
+-        for (u32 region = 0; region < NUM_SYSTEM_TITLE_REGIONS; region++) {
+-            if (title.title_id_lows[region] == title_id_low) {
+-                return region;
+-            }
++        const auto& lows = title.title_id_lows;
++        const auto match = std::find(lows.begin(), lows.end(), title_id_low);
++        if (match == lows.end()) {
++            continue;
++        }
++        // Titles with one ID for every region (system modules such as ACT, some applets) are not
++        // region-specific: they must see the console's region, not the first region listed.
++        const bool same_in_all_regions =
++            std::all_of(lows.begin(), lows.end(), [&](u32 low) { return low == title_id_low; });
++        if (same_in_all_regions) {
++            return std::nullopt;
+         }
++        return static_cast<u32>(std::distance(lows.begin(), match));
+     }
+ 
+     return std::nullopt;
+diff --git a/src/tests/core/system_titles.cpp b/src/tests/core/system_titles.cpp
+index 2df00f8..07630cf 100644
+--- a/src/tests/core/system_titles.cpp
++++ b/src/tests/core/system_titles.cpp
+@@ -11,6 +11,16 @@ TEST_CASE("GetSystemTitleRegion maps applet titles to their region", "[core]") {
+     CHECK(Core::GetSystemTitleRegion(0x000400300000C802) == 1u);
+     CHECK(Core::GetSystemTitleRegion(0x000400300000D002) == 2u);
+ 
++    // Nintendo 3DS Sound: JPN 205, USA 215, EUR 225.
++    CHECK(Core::GetSystemTitleRegion(0x0004001000022500) == 2u);
++
++    // System modules use one title for every region, so they must see the console's region.
++    // Mapping ACT to the first region (Japan) made it abort with a fatal error.
++    CHECK_FALSE(Core::GetSystemTitleRegion(0x0004013000003802).has_value()); // ACT
++    CHECK_FALSE(Core::GetSystemTitleRegion(0x0004013000003202).has_value()); // Friends
++    CHECK_FALSE(Core::GetSystemTitleRegion(0x0004013000002602).has_value()); // CECD
++    CHECK_FALSE(Core::GetSystemTitleRegion(0x0004013000003402).has_value()); // BOSS
++
+     // Games and unknown titles have no system region.
+     CHECK_FALSE(Core::GetSystemTitleRegion(0x00040000000EA900).has_value());
+     CHECK_FALSE(Core::GetSystemTitleRegion(0x0004003000FFFF02).has_value());
+-- 
+2.43.0
+

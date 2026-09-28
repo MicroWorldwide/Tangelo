@@ -1,0 +1,155 @@
+From 90df577c827a92d1950a63d0b3651333e9f6fe1c Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 28 Sep 2026 15:53:47 +0200
+Subject: [PATCH] cfg: use the game's region when the forced region doesn't fit
+
+With Region forced (e.g. Europe) and a game that doesn't support that
+region (e.g. the USA Disney Magical World), the region-free patch lets
+the game boot, but it then gets a region and language it never expects
+and can stall on a black screen.
+
+Loaders now always record the regions a game supports (previously only
+in Auto-select mode). CFG keeps a forced region whenever the game
+supports it, including every region-free game. When it doesn't, the
+region and system language are chosen from the game, exactly as
+Auto-select does, and a warning naming the forced and supported regions
+is logged once per session.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cfg/cfg.cpp | 40 ++++++++++++++++++++++++++++++--
+ src/core/hle/service/cfg/cfg.h   |  9 +++++++
+ src/core/loader/artic.cpp        |  6 ++---
+ src/core/loader/ncch.cpp         |  6 ++---
+ 4 files changed, 51 insertions(+), 10 deletions(-)
+
+diff --git a/src/core/hle/service/cfg/cfg.cpp b/src/core/hle/service/cfg/cfg.cpp
+index 6eb7302..b89ceab 100644
+--- a/src/core/hle/service/cfg/cfg.cpp
++++ b/src/core/hle/service/cfg/cfg.cpp
+@@ -411,7 +411,7 @@ u32 Module::GetRegionValue(bool from_secure_info) {
+         }
+     }
+ 
+-    if (Settings::values.region_value.GetValue() == Settings::REGION_VALUE_AUTO_SELECT) {
++    if (UseGameRegion()) {
+         UpdatePreferredRegionCode();
+         return preferred_region_code;
+     }
+@@ -419,6 +419,42 @@ u32 Module::GetRegionValue(bool from_secure_info) {
+     return Settings::values.region_value.GetValue();
+ }
+ 
++bool Module::UseGameRegion() {
++    const s32 forced_region = Settings::values.region_value.GetValue();
++    if (forced_region == Settings::REGION_VALUE_AUTO_SELECT) {
++        return true;
++    }
++    if (!system.IsPoweredOn()) {
++        return false;
++    }
++
++    const auto game_regions = system.GetAppLoader().GetPreferredRegions();
++    if (game_regions.empty() || std::find(game_regions.begin(), game_regions.end(),
++                                          static_cast<u32>(forced_region)) != game_regions.end()) {
++        return false;
++    }
++
++    if (!region_mismatch_reported) {
++        region_mismatch_reported = true;
++        static constexpr std::array<const char*, 7> region_names{"Japan", "USA",   "Europe",
++                                                                 "Australia", "China", "Korea",
++                                                                 "Taiwan"};
++        const auto name = [](u32 region) {
++            return region < region_names.size() ? region_names[region] : "unknown";
++        };
++        std::vector<const char*> supported;
++        for (const u32 region : game_regions) {
++            supported.push_back(name(region));
++        }
++        LOG_WARNING(Service_CFG,
++                    "Region is set to {}, but this game only supports: {}. Using the game's own "
++                    "region and a matching language for this session. Set Region to Auto-select "
++                    "to always do this.",
++                    name(static_cast<u32>(forced_region)), fmt::join(supported, ", "));
++    }
++    return true;
++}
++
+ bool Module::IsValidRegionCountry(u32 region, u8 country_code) {
+     switch (region) {
+     case 0: // JPN
+@@ -1205,7 +1241,7 @@ void Module::SetSystemLanguage(SystemLanguage language) {
+ }
+ 
+ SystemLanguage Module::GetSystemLanguage() {
+-    if (Settings::values.region_value.GetValue() == Settings::REGION_VALUE_AUTO_SELECT) {
++    if (UseGameRegion()) {
+         UpdatePreferredRegionCode();
+     }
+     return GetRawSystemLanguage();
+diff --git a/src/core/hle/service/cfg/cfg.h b/src/core/hle/service/cfg/cfg.h
+index 4c5275a..39f2f2c 100644
+--- a/src/core/hle/service/cfg/cfg.h
++++ b/src/core/hle/service/cfg/cfg.h
+@@ -649,6 +649,14 @@ private:
+     void UpdatePreferredRegionCode();
+     SystemLanguage GetRawSystemLanguage();
+ 
++    /**
++     * Whether the region (and language) should come from the running game instead of the
++     * Region setting: always with Auto-select, and also when the forced region isn't one the
++     * game supports. Region-free patching lets such a game boot, but it may then misbehave
++     * (e.g. a USA game with Region forced to Europe stays on a black screen).
++     */
++    bool UseGameRegion();
++
+     Core::System& system;
+ 
+     static constexpr u32 CONFIG_SAVEFILE_SIZE = 0x8000;
+@@ -656,6 +664,7 @@ private:
+     std::unique_ptr<FileSys::ArchiveBackend> cfg_system_save_data_archive;
+     u32 preferred_region_code = 0;
+     bool preferred_region_chosen = false;
++    bool region_mismatch_reported = false;
+     MCUData mcu_data{};
+     std::string mac_address{};
+ 
+diff --git a/src/core/loader/artic.cpp b/src/core/loader/artic.cpp
+index c699e44..8c9a3c5 100644
+--- a/src/core/loader/artic.cpp
++++ b/src/core/loader/artic.cpp
+@@ -266,10 +266,8 @@ ResultStatus Apploader_Artic::LoadExecImpl(std::shared_ptr<Kernel::Process>& pro
+ }
+ 
+ void Apploader_Artic::ParseRegionLockoutInfo(u64 program_id) {
+-    if (Settings::values.region_value.GetValue() != Settings::REGION_VALUE_AUTO_SELECT) {
+-        return;
+-    }
+-
++    // Always record the game's regions: Auto-select picks from them, and CFG also uses them to
++    // detect a forced region the game doesn't support.
+     preferred_regions.clear();
+ 
+     std::vector<u8> smdh_buffer;
+diff --git a/src/core/loader/ncch.cpp b/src/core/loader/ncch.cpp
+index 118218d..86f9709 100644
+--- a/src/core/loader/ncch.cpp
++++ b/src/core/loader/ncch.cpp
+@@ -260,10 +260,8 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
+ }
+ 
+ void AppLoader_NCCH::ParseRegionLockoutInfo(u64 program_id) {
+-    if (Settings::values.region_value.GetValue() != Settings::REGION_VALUE_AUTO_SELECT) {
+-        return;
+-    }
+-
++    // Always record the game's regions: Auto-select picks from them, and CFG also uses them to
++    // detect a forced region the game doesn't support.
+     preferred_regions.clear();
+ 
+     std::vector<u8> smdh_buffer;
+-- 
+2.43.0
+
