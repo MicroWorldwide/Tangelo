@@ -1,0 +1,362 @@
+From 6ee801d6f1289cc37bad050b3ad26348aa1e51e2 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 18:12:50 +0200
+Subject: [PATCH] fs, am: EnumerateExtSaveData and GetTwlArchiveResourceInfo
+ (DevMenu)
+
+DevMenu calls these at start and got "unimplemented":
+- fs:USER EnumerateExtSaveData (0x0855) and Obsoleted_3_0_EnumerateExtSaveData
+  (0x0833): list the extdata folders on the emulated SD card (or the shared
+  extdata on the NAND), as 4- or 8-byte IDs.
+- am GetTwlArchiveResourceInfo (0x0020): DSi NAND sizes (fixed: 128 MiB total,
+  32 MiB for titles, all free).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/file_sys/archive_extsavedata.cpp    | 24 +++++++++
+ src/core/file_sys/archive_extsavedata.h      |  8 +++
+ src/core/hle/service/am/am.cpp               | 14 +++++
+ src/core/hle/service/am/am.h                 |  9 ++++
+ src/core/hle/service/am/am_net.cpp           |  2 +-
+ src/core/hle/service/am/am_sys.cpp           |  2 +-
+ src/core/hle/service/am/am_u.cpp             |  2 +-
+ src/core/hle/service/fs/fs_user.cpp          | 55 +++++++++++++++++++-
+ src/core/hle/service/fs/fs_user.h            | 30 +++++++++++
+ src/tests/CMakeLists.txt                     |  1 +
+ src/tests/core/file_sys/extsavedata_list.cpp | 30 +++++++++++
+ 11 files changed, 172 insertions(+), 5 deletions(-)
+ create mode 100644 src/tests/core/file_sys/extsavedata_list.cpp
+
+diff --git a/src/core/file_sys/archive_extsavedata.cpp b/src/core/file_sys/archive_extsavedata.cpp
+index 8f76c81..e53e34f 100644
+--- a/src/core/file_sys/archive_extsavedata.cpp
++++ b/src/core/file_sys/archive_extsavedata.cpp
+@@ -3,7 +3,9 @@
+ // Refer to the license.txt file included.
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <memory>
++#include <string>
+ #include <vector>
+ #include <fmt/format.h>
+ #include "common/archives.h"
+@@ -217,6 +219,28 @@ std::string GetExtDataContainerPath(std::string_view mount_point, bool shared) {
+     return fmt::format("{}Nintendo 3DS/{}/{}/extdata/", mount_point, SYSTEM_ID, SDCARD_ID);
+ }
+ 
++std::vector<u64> ListExtSaveDataIds(std::string_view mount_point, bool shared) {
++    constexpr u32 SharedExtDataHigh = 0x00048000;
++    const u32 high = shared ? SharedExtDataHigh : 0;
++    const std::string directory =
++        fmt::format("{}{:08x}/", GetExtDataContainerPath(mount_point, shared), high);
++
++    std::vector<u64> ids;
++    FileUtil::ForeachDirectoryEntry(
++        nullptr, directory, [&](u64*, const std::string& parent, const std::string& name) {
++            if (name.size() != 8 || !FileUtil::IsDirectory(parent + "/" + name) ||
++                !std::all_of(name.begin(), name.end(),
++                             [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); })) {
++                return true;
++            }
++            const u32 low = static_cast<u32>(std::stoul(name, nullptr, 16));
++            ids.push_back((static_cast<u64>(high) << 32) | low);
++            return true;
++        });
++    std::sort(ids.begin(), ids.end());
++    return ids;
++}
++
+ std::string GetExtDataPathFromId(std::string_view mount_point, u64 extdata_id) {
+     const u32 high = static_cast<u32>(extdata_id >> 32);
+     const u32 low = static_cast<u32>(extdata_id & 0xFFFFFFFF);
+diff --git a/src/core/file_sys/archive_extsavedata.h b/src/core/file_sys/archive_extsavedata.h
+index 8a69b94..fe80646 100644
+--- a/src/core/file_sys/archive_extsavedata.h
++++ b/src/core/file_sys/archive_extsavedata.h
+@@ -123,6 +123,14 @@ std::string GetExtDataPathFromId(std::string_view mount_point, u64 extdata_id);
+  */
+ std::string GetExtDataContainerPath(std::string_view mount_point, bool shared);
+ 
++/**
++ * Lists the ExtSaveData archives that exist in the host file system (FS EnumerateExtSaveData).
++ * @param mount_point The base folder where the container resides, ie. SDMC or NAND.
++ * @param shared Whether to list SharedExtSaveData (high ID 0x00048000) instead of ExtSaveData.
++ * @returns The extdata IDs (high << 32 | low), sorted
++ */
++std::vector<u64> ListExtSaveDataIds(std::string_view mount_point, bool shared);
++
+ /**
+  * Constructs a FileSys::Path object that refers to the ExtData archive identified by
+  * the specified media type, high save id and low save id.
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index 0f44ceb..0dd6062 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -3325,6 +3325,20 @@ void Module::Interface::GetNumImportTitleContextsFiltered(Kernel::HLERequestCont
+     LOG_WARNING(Service_AM, "(STUBBED) called, media_type={}, filter={}", media_type, filter);
+ }
+ 
++void Module::Interface::GetTwlArchiveResourceInfo(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    constexpr u64 TotalCapacity = 128ULL * 1024 * 1024;
++    constexpr u64 TitlesCapacity = 32ULL * 1024 * 1024;
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(9, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u64>(TotalCapacity);
++    rb.Push<u64>(TotalCapacity);
++    rb.Push<u64>(TitlesCapacity);
++    rb.Push<u64>(TitlesCapacity);
++    LOG_DEBUG(Service_AM, "called");
++}
++
+ void Module::Interface::DeleteAllImportContextsFiltered(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u8 media_type = static_cast<u8>(rp.Pop<u32>() & 0xFF);
+diff --git a/src/core/hle/service/am/am.h b/src/core/hle/service/am/am.h
+index b4af6ed..645311a 100644
+--- a/src/core/hle/service/am/am.h
++++ b/src/core/hle/service/am/am.h
+@@ -789,6 +789,15 @@ public:
+          */
+         void DeleteAllImportContextsFiltered(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AM::GetTwlArchiveResourceInfo service function: sizes of the DSi (TWL) NAND partition,
++         * shown by DevMenu and System Settings. Fixed values, all free.
++         *  Outputs:
++         *      1 : Result, 0 on success, otherwise error code
++         *      2-9 : u64 total capacity, total free space, titles capacity, titles free space
++         */
++        void GetTwlArchiveResourceInfo(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AM::GetImportTitleContextListFiltered service function
+          *  Inputs:
+diff --git a/src/core/hle/service/am/am_net.cpp b/src/core/hle/service/am/am_net.cpp
+index 3587986..ec0278d 100644
+--- a/src/core/hle/service/am/am_net.cpp
++++ b/src/core/hle/service/am/am_net.cpp
+@@ -41,7 +41,7 @@ AM_NET::AM_NET(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x001D, nullptr, "DeleteAllTwlUserPrograms"},
+         {0x001E, nullptr, "ReadTwlBackupInfo"},
+         {0x001F, nullptr, "DeleteAllExpiredUserPrograms"},
+-        {0x0020, nullptr, "GetTwlArchiveResourceInfo"},
++        {0x0020, &AM_NET::GetTwlArchiveResourceInfo, "GetTwlArchiveResourceInfo"},
+         {0x0021, &AM_NET::GetPersonalizedTicketInfoList, "GetPersonalizedTicketInfoList"},
+         {0x0022, &AM_NET::DeleteAllImportContextsFiltered, "DeleteAllImportContextsFiltered"},
+         {0x0023, &AM_NET::GetNumImportTitleContextsFiltered, "GetNumImportTitleContextsFiltered"},
+diff --git a/src/core/hle/service/am/am_sys.cpp b/src/core/hle/service/am/am_sys.cpp
+index f008e03..6cf2eec 100644
+--- a/src/core/hle/service/am/am_sys.cpp
++++ b/src/core/hle/service/am/am_sys.cpp
+@@ -41,7 +41,7 @@ AM_SYS::AM_SYS(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x001D, nullptr, "DeleteAllTwlUserPrograms"},
+         {0x001E, nullptr, "ReadTwlBackupInfo"},
+         {0x001F, nullptr, "DeleteAllExpiredUserPrograms"},
+-        {0x0020, nullptr, "GetTwlArchiveResourceInfo"},
++        {0x0020, &AM_SYS::GetTwlArchiveResourceInfo, "GetTwlArchiveResourceInfo"},
+         {0x0021, &AM_SYS::GetPersonalizedTicketInfoList, "GetPersonalizedTicketInfoList"},
+         {0x0022, &AM_SYS::DeleteAllImportContextsFiltered, "DeleteAllImportContextsFiltered"},
+         {0x0023, &AM_SYS::GetNumImportTitleContextsFiltered, "GetNumImportTitleContextsFiltered"},
+diff --git a/src/core/hle/service/am/am_u.cpp b/src/core/hle/service/am/am_u.cpp
+index 4191f53..e50e211 100644
+--- a/src/core/hle/service/am/am_u.cpp
++++ b/src/core/hle/service/am/am_u.cpp
+@@ -41,7 +41,7 @@ AM_U::AM_U(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "am:u"
+         {0x001D, nullptr, "DeleteAllTwlUserPrograms"},
+         {0x001E, nullptr, "ReadTwlBackupInfo"},
+         {0x001F, nullptr, "DeleteAllExpiredUserPrograms"},
+-        {0x0020, nullptr, "GetTwlArchiveResourceInfo"},
++        {0x0020, &AM_U::GetTwlArchiveResourceInfo, "GetTwlArchiveResourceInfo"},
+         {0x0021, &AM_U::GetPersonalizedTicketInfoList, "GetPersonalizedTicketInfoList"},
+         {0x0022, &AM_U::DeleteAllImportContextsFiltered, "DeleteAllImportContextsFiltered"},
+         {0x0023, &AM_U::GetNumImportTitleContextsFiltered, "GetNumImportTitleContextsFiltered"},
+diff --git a/src/core/hle/service/fs/fs_user.cpp b/src/core/hle/service/fs/fs_user.cpp
+index b653afe..6594f6c 100644
+--- a/src/core/hle/service/fs/fs_user.cpp
++++ b/src/core/hle/service/fs/fs_user.cpp
+@@ -16,6 +16,7 @@
+ #include "common/settings.h"
+ #include "common/string_util.h"
+ #include "core/core.h"
++#include "core/file_sys/archive_extsavedata.h"
+ #include "core/file_sys/errors.h"
+ #include "core/file_sys/ncch_container.h"
+ #include "core/file_sys/seed_db.h"
+@@ -1395,6 +1396,56 @@ void FS_USER::ListSeeds(Kernel::HLERequestContext& ctx) {
+     LOG_DEBUG(Service_FS, "max_count={}, count={}", max_count, count);
+ }
+ 
++void FS_USER::EnumerateExtSaveDataImpl(IPC::RequestParser& rp, u32 max_count, MediaType media_type,
++                                       u32 entry_size, bool shared) {
++    auto& buffer = rp.PopMappedBuffer();
++
++    // Shared extdata lives on the NAND, the others on the SD card.
++    shared = shared || media_type == MediaType::NAND;
++    const std::string mount_point =
++        FileUtil::GetUserPath(shared ? FileUtil::UserPath::NANDDir : FileUtil::UserPath::SDMCDir);
++    const std::vector<u64> ids = FileSys::ListExtSaveDataIds(mount_point, shared);
++
++    if (entry_size != 4 && entry_size != 8) {
++        entry_size = 8;
++    }
++    const std::size_t count =
++        std::min<std::size_t>({ids.size(), max_count, buffer.GetSize() / entry_size});
++    for (std::size_t i = 0; i < count; ++i) {
++        if (entry_size == 4) {
++            const u32 low = static_cast<u32>(ids[i]);
++            buffer.Write(&low, i * 4, 4);
++        } else {
++            buffer.Write(&ids[i], i * 8, 8);
++        }
++    }
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(static_cast<u32>(count));
++    rb.PushMappedBuffer(buffer);
++    LOG_DEBUG(Service_FS, "media_type={}, shared={}, entry_size={}, count={}", media_type, shared,
++              entry_size, count);
++}
++
++void FS_USER::EnumerateExtSaveData(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 output_size = rp.Pop<u32>();
++    const auto media_type = static_cast<MediaType>(rp.Pop<u32>() & 0xFF);
++    const u32 entry_size = rp.Pop<u32>();
++    const bool shared = (rp.Pop<u32>() & 0xFF) != 0;
++    const u32 max_count =
++        (entry_size == 4 || entry_size == 8) ? output_size / entry_size : output_size / 8;
++    EnumerateExtSaveDataImpl(rp, max_count, media_type, entry_size, shared);
++}
++
++void FS_USER::ObsoletedEnumerateExtSaveData(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 max_count = rp.Pop<u32>();
++    const auto media_type = static_cast<MediaType>(rp.Pop<u32>() & 0xFF);
++    EnumerateExtSaveDataImpl(rp, max_count, media_type, 8, false);
++}
++
+ void FS_USER::GetNumTitleTags(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+@@ -1924,7 +1975,7 @@ FS_USER::FS_USER(Core::System& system)
+         {0x0830, &FS_USER::ObsoletedCreateExtSaveData, "Obsoleted_3_0_CreateExtSaveData"},
+         {0x0831, nullptr, "CreateSharedExtSaveData"},
+         {0x0832, nullptr, "ReadExtSaveDataIcon"},
+-        {0x0833, nullptr, "EnumerateExtSaveData"},
++        {0x0833, &FS_USER::ObsoletedEnumerateExtSaveData, "Obsoleted_3_0_EnumerateExtSaveData"},
+         {0x0834, nullptr, "EnumerateSharedExtSaveData"},
+         {0x0835, &FS_USER::ObsoletedDeleteExtSaveData, "Obsoleted_3_0_DeleteExtSaveData"},
+         {0x0836, nullptr, "DeleteSharedExtSaveData"},
+@@ -1958,7 +2009,7 @@ FS_USER::FS_USER(Core::System& system)
+         {0x0852, &FS_USER::DeleteExtSaveData, "DeleteExtSaveData"},
+         {0x0853, &FS_USER::ReadExtSaveDataIcon, "ReadExtSaveDataIcon"},
+         {0x0854, nullptr, "GetExtDataBlockSize"},
+-        {0x0855, nullptr, "EnumerateExtSaveData"},
++        {0x0855, &FS_USER::EnumerateExtSaveData, "EnumerateExtSaveData"},
+         {0x0856, &FS_USER::CreateSystemSaveData, "CreateSystemSaveData"},
+         {0x0857, &FS_USER::DeleteSystemSaveData, "DeleteSystemSaveData"},
+         {0x0858, nullptr, "StartDeviceMoveAsSource"},
+diff --git a/src/core/hle/service/fs/fs_user.h b/src/core/hle/service/fs/fs_user.h
+index 3e9a798..0fd1892 100644
+--- a/src/core/hle/service/fs/fs_user.h
++++ b/src/core/hle/service/fs/fs_user.h
+@@ -13,6 +13,10 @@
+ #include "core/hle/service/fs/archive.h"
+ #include "core/hle/service/service.h"
+ 
++namespace IPC {
++class RequestParser;
++}
++
+ namespace Core {
+ class System;
+ }
+@@ -683,6 +687,32 @@ private:
+      */
+     void ListSeeds(Kernel::HLERequestContext& ctx);
+ 
++    /**
++     * FS_User::EnumerateExtSaveData service function (DevMenu, System Settings data management).
++     *  Inputs:
++     *      1 : Output buffer size in bytes
++     *      2 : u8 Media type (0 = NAND: shared extdata, 1 = SD)
++     *      3 : ID entry size (4 = low ID only, 8 = full ID)
++     *      4 : u8 Shared
++     *      5-6 : Mapped output buffer
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     *      2 : Number of IDs written
++     */
++    void EnumerateExtSaveData(Kernel::HLERequestContext& ctx);
++
++    /**
++     * FS_User::Obsoleted_3_0_EnumerateExtSaveData service function: like EnumerateExtSaveData
++     * with 8-byte IDs.
++     *  Inputs:
++     *      1 : Maximum number of IDs
++     *      2 : u8 Media type
++     *      3-4 : Mapped output buffer
++     */
++    void ObsoletedEnumerateExtSaveData(Kernel::HLERequestContext& ctx);
++    void EnumerateExtSaveDataImpl(IPC::RequestParser& rp, u32 max_count, MediaType media_type,
++                                  u32 entry_size, bool shared);
++
+     /**
+      * FS_User::GetNumTitleTags / ListTitleTags service functions. Title tags aren't stored,
+      * so there are none.
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 5ebb59f..755ba19 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -3,6 +3,7 @@ add_executable(tests
+     common/file_util.cpp
+     common/param_package.cpp
+     core/core_timing.cpp
++    core/file_sys/extsavedata_list.cpp
+     core/file_sys/path_parser.cpp
+     core/hle/kernel/cpu_limiter.cpp
+     core/hle/kernel/hle_ipc.cpp
+diff --git a/src/tests/core/file_sys/extsavedata_list.cpp b/src/tests/core/file_sys/extsavedata_list.cpp
+new file mode 100644
+index 0000000..68ef971
+--- /dev/null
++++ b/src/tests/core/file_sys/extsavedata_list.cpp
+@@ -0,0 +1,30 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <filesystem>
++#include <string>
++#include <catch2/catch_test_macros.hpp>
++#include "common/file_util.h"
++#include "core/file_sys/archive_extsavedata.h"
++
++TEST_CASE("ExtSaveData IDs are listed from the host folders", "[file_sys]") {
++    const std::string root =
++        (std::filesystem::temp_directory_path() / "tangelo-extdata-list").string() + "/";
++    FileUtil::DeleteDirRecursively(root);
++
++    const std::string sd = FileSys::GetExtDataContainerPath(root, false) + "00000000/";
++    const std::string nand = FileSys::GetExtDataContainerPath(root, true) + "00048000/";
++    for (const char* id : {"00000228", "00000EA9", "0000198f"}) {
++        REQUIRE(FileUtil::CreateFullPath(sd + id + "/user/"));
++    }
++    REQUIRE(FileUtil::CreateFullPath(sd + "notanid/"));
++    REQUIRE(FileUtil::CreateFullPath(nand + "f000000b/user/"));
++    FileUtil::WriteStringToFile(false, sd + "12345678", "a file, not a folder");
++
++    CHECK(FileSys::ListExtSaveDataIds(root, false) == std::vector<u64>{0x228, 0xEA9, 0x198F});
++    CHECK(FileSys::ListExtSaveDataIds(root, true) == std::vector<u64>{0x00048000F000000BULL});
++
++    FileUtil::DeleteDirRecursively(root);
++    CHECK(FileSys::ListExtSaveDataIds(root, false).empty());
++}
+-- 
+2.43.0
+
