@@ -1,0 +1,930 @@
+From be22e5a5f3ea689a5509941a1629794aa3dce846 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 15:40:44 +0200
+Subject: [PATCH] services: HOME Menu calls, BOSS background tasks
+
+Calls the HOME Menu and its applets made that ended in "unimplemented":
+- ns:s LaunchTitle: the HOME Menu starts the system modules at boot; they are HLE
+  services (or already loaded), so this reports success. Other titles are refused.
+- gsp::Lcd SetLedForceOff: success.
+- ptm:play / ptm:sysm GetPlayHistory, GetPlayHistoryStart, GetPlayHistoryLength:
+  an empty play history (Activity Log); ptm:sysm ClearSoftwareClosedFlag.
+- http:C CreateRootCertChain, DestroyRootCertChain, RootCertChainAddDefaultCert,
+  SelectRootCertChain: handles only (server certificates aren't checked).
+- fs:USER ListSeeds (from the seed database), GetNumTitleTags and ListTitleTags
+  (none).
+- news:s SyncArrivedNotifications, am DeleteAllImportContextsFiltered,
+  ac GetConnectingInfraPriority: success / 0.
+
+BOSS, seen with Mii Plaza (online LLE off):
+- StartBgImmediate runs the task like StartTask (Mii Plaza starts MIIDATA, PANEL,
+  PANELLM and LEGEND this way).
+- GetTaskInfo makes the task's properties the current ones, so the game reads them
+  with ReceiveProperty.
+- A task that is already downloading isn't started twice, also when the game
+  registers it again meanwhile; tasks without a URL aren't run.
+- Property sizes are compared in bytes: the certificate ID list (0x0F, three u32s)
+  was reported as the wrong size and read into a 12-entry list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/file_sys/seed_db.cpp                | 15 ++++++
+ src/core/file_sys/seed_db.h                  |  3 ++
+ src/core/hle/service/ac/ac.cpp               | 10 ++++
+ src/core/hle/service/ac/ac.h                 |  9 ++++
+ src/core/hle/service/ac/ac_i.cpp             |  1 +
+ src/core/hle/service/ac/ac_u.cpp             |  1 +
+ src/core/hle/service/am/am.cpp               | 11 +++++
+ src/core/hle/service/am/am.h                 | 12 +++++
+ src/core/hle/service/am/am_net.cpp           |  2 +-
+ src/core/hle/service/am/am_sys.cpp           |  2 +-
+ src/core/hle/service/am/am_u.cpp             |  2 +-
+ src/core/hle/service/apt/apt.cpp             | 21 ++++++++
+ src/core/hle/service/apt/apt.h               | 13 +++++
+ src/core/hle/service/apt/ns_s.cpp            |  2 +-
+ src/core/hle/service/boss/boss.cpp           | 24 +++++++++-
+ src/core/hle/service/boss/online_service.cpp | 37 ++++++++++-----
+ src/core/hle/service/boss/online_service.h   |  2 +
+ src/core/hle/service/fs/fs_user.cpp          | 40 ++++++++++++++++
+ src/core/hle/service/fs/fs_user.h            | 18 +++++++
+ src/core/hle/service/gsp/gsp_lcd.cpp         | 13 ++++-
+ src/core/hle/service/gsp/gsp_lcd.h           |  8 ++++
+ src/core/hle/service/http/http_c.cpp         | 50 ++++++++++++++++++--
+ src/core/hle/service/http/http_c.h           | 18 +++++++
+ src/core/hle/service/news/news.cpp           |  7 +++
+ src/core/hle/service/news/news.h             |  9 ++++
+ src/core/hle/service/news/news_s.cpp         |  2 +-
+ src/core/hle/service/ptm/ptm.cpp             | 36 ++++++++++++++
+ src/core/hle/service/ptm/ptm.h               | 31 ++++++++++++
+ src/core/hle/service/ptm/ptm_play.cpp        |  6 +--
+ src/core/hle/service/ptm/ptm_sysm.cpp        |  8 ++--
+ 30 files changed, 381 insertions(+), 32 deletions(-)
+
+diff --git a/src/core/file_sys/seed_db.cpp b/src/core/file_sys/seed_db.cpp
+index 3ac295f..d37d439 100644
+--- a/src/core/file_sys/seed_db.cpp
++++ b/src/core/file_sys/seed_db.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include <fmt/format.h>
+ #include "common/file_util.h"
+ #include "common/logging/log.h"
+@@ -197,6 +198,20 @@ bool DeleteSeed(u64 title_id) {
+     return found;
+ }
+ 
++std::vector<u64> GetSeedTitleIds() {
++    SeedDB db;
++    if (!db.Load()) {
++        return {};
++    }
++    std::vector<u64> title_ids;
++    title_ids.reserve(db.seeds.size());
++    for (const auto& [title_id, seed] : db.seeds) {
++        title_ids.push_back(title_id);
++    }
++    std::sort(title_ids.begin(), title_ids.end());
++    return title_ids;
++}
++
+ u32 GetSeedCount() {
+     SeedDB db;
+     if (!db.Load()) {
+diff --git a/src/core/file_sys/seed_db.h b/src/core/file_sys/seed_db.h
+index 12366e4..e7792af 100644
+--- a/src/core/file_sys/seed_db.h
++++ b/src/core/file_sys/seed_db.h
+@@ -7,6 +7,7 @@
+ #include <array>
+ #include <optional>
+ #include <unordered_map>
++#include <vector>
+ #include "common/common_types.h"
+ #include "common/swap.h"
+ 
+@@ -38,5 +39,7 @@ bool AddSeed(const Seed& seed);
+ std::optional<Seed::Data> GetSeed(u64 title_id);
+ bool DeleteSeed(u64 title_id);
+ u32 GetSeedCount();
++/// Title IDs of all seeds in the seed database (sorted).
++std::vector<u64> GetSeedTitleIds();
+ 
+ } // namespace FileSys
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 0fe474b..d98c961 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -140,6 +140,16 @@ void Module::Interface::GetWifiStatus(Kernel::HLERequestContext& ctx) {
+     rb.Push<u32>(static_cast<u32>(WifiStatus::STATUS_CONNECTED_SLOT1));
+ }
+ 
++void Module::Interface::GetConnectingInfraPriority(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0);
++
++    LOG_DEBUG(Service_AC, "called");
++}
++
+ void Module::Interface::GetInfraPriority(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     [[maybe_unused]] const std::vector<u8>& ac_config = rp.PopStaticBuffer();
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index a7655bd..0e97c91 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -114,6 +114,15 @@ public:
+          */
+         void GetInfraPriority(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::GetConnectingInfraPriority service function: the priority of the connected
++         * network (0, the same as GetInfraPriority).
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2 : Infra priority
++         */
++        void GetConnectingInfraPriority(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::SetRequestEulaVersion service function
+          *  Inputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index f7d226c..5efcc55 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -20,6 +20,7 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x000C, &AC_I::GetStatus, "GetStatus"},
+         {0x000D, &AC_I::GetWifiStatus, "GetWifiStatus"},
+         {0x000E, &AC_I::GetCurrentAPInfo, "GetCurrentAPInfo"},
++        {0x000F, &AC_I::GetConnectingInfraPriority, "GetConnectingInfraPriority"},
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+         {0x0011, &AC_I::GetNZoneApNumService, "GetNZoneApNumService"},
+         {0x0014, &AC_I::GetConnectingLocation, "GetConnectingLocation"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 93b1725..9526b48 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -20,6 +20,7 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x000C, &AC_U::GetStatus, "GetStatus"},
+         {0x000D, &AC_U::GetWifiStatus, "GetWifiStatus"},
+         {0x000E, &AC_U::GetCurrentAPInfo, "GetCurrentAPInfo"},
++        {0x000F, &AC_U::GetConnectingInfraPriority, "GetConnectingInfraPriority"},
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+         {0x0011, &AC_U::GetNZoneApNumService, "GetNZoneApNumService"},
+         {0x0014, &AC_U::GetConnectingLocation, "GetConnectingLocation"},
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index 5eb1407..0f44ceb 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -3325,6 +3325,17 @@ void Module::Interface::GetNumImportTitleContextsFiltered(Kernel::HLERequestCont
+     LOG_WARNING(Service_AM, "(STUBBED) called, media_type={}, filter={}", media_type, filter);
+ }
+ 
++void Module::Interface::DeleteAllImportContextsFiltered(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u8 media_type = static_cast<u8>(rp.Pop<u32>() & 0xFF);
++    const u32 filter = rp.Pop<u32>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_AM, "media_type={}, filter={:#x}", media_type, filter);
++}
++
+ void Module::Interface::GetImportTitleContextListFiltered(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+diff --git a/src/core/hle/service/am/am.h b/src/core/hle/service/am/am.h
+index 515bed7..b4af6ed 100644
+--- a/src/core/hle/service/am/am.h
++++ b/src/core/hle/service/am/am.h
+@@ -777,6 +777,18 @@ public:
+          */
+         void GetNumImportTitleContextsFiltered(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AM::DeleteAllImportContextsFiltered service function. The HOME Menu calls this at
++         * boot to clean up interrupted installs; Tangelo keeps no import contexts across boots,
++         * so there is nothing to delete.
++         *  Inputs:
++         *      1 : Media type
++         *      2 : Filter
++         *  Outputs:
++         *      1 : Result, 0 on success, otherwise error code
++         */
++        void DeleteAllImportContextsFiltered(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AM::GetImportTitleContextListFiltered service function
+          *  Inputs:
+diff --git a/src/core/hle/service/am/am_net.cpp b/src/core/hle/service/am/am_net.cpp
+index 33f2dd6..3587986 100644
+--- a/src/core/hle/service/am/am_net.cpp
++++ b/src/core/hle/service/am/am_net.cpp
+@@ -43,7 +43,7 @@ AM_NET::AM_NET(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x001F, nullptr, "DeleteAllExpiredUserPrograms"},
+         {0x0020, nullptr, "GetTwlArchiveResourceInfo"},
+         {0x0021, &AM_NET::GetPersonalizedTicketInfoList, "GetPersonalizedTicketInfoList"},
+-        {0x0022, nullptr, "DeleteAllImportContextsFiltered"},
++        {0x0022, &AM_NET::DeleteAllImportContextsFiltered, "DeleteAllImportContextsFiltered"},
+         {0x0023, &AM_NET::GetNumImportTitleContextsFiltered, "GetNumImportTitleContextsFiltered"},
+         {0x0024, &AM_NET::GetImportTitleContextListFiltered, "GetImportTitleContextListFiltered"},
+         {0x0025, &AM_NET::CheckContentRights, "CheckContentRights"},
+diff --git a/src/core/hle/service/am/am_sys.cpp b/src/core/hle/service/am/am_sys.cpp
+index b8ac89b..f008e03 100644
+--- a/src/core/hle/service/am/am_sys.cpp
++++ b/src/core/hle/service/am/am_sys.cpp
+@@ -43,7 +43,7 @@ AM_SYS::AM_SYS(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x001F, nullptr, "DeleteAllExpiredUserPrograms"},
+         {0x0020, nullptr, "GetTwlArchiveResourceInfo"},
+         {0x0021, &AM_SYS::GetPersonalizedTicketInfoList, "GetPersonalizedTicketInfoList"},
+-        {0x0022, nullptr, "DeleteAllImportContextsFiltered"},
++        {0x0022, &AM_SYS::DeleteAllImportContextsFiltered, "DeleteAllImportContextsFiltered"},
+         {0x0023, &AM_SYS::GetNumImportTitleContextsFiltered, "GetNumImportTitleContextsFiltered"},
+         {0x0024, &AM_SYS::GetImportTitleContextListFiltered, "GetImportTitleContextListFiltered"},
+         {0x0025, &AM_SYS::CheckContentRights, "CheckContentRights"},
+diff --git a/src/core/hle/service/am/am_u.cpp b/src/core/hle/service/am/am_u.cpp
+index dd98a3c..4191f53 100644
+--- a/src/core/hle/service/am/am_u.cpp
++++ b/src/core/hle/service/am/am_u.cpp
+@@ -43,7 +43,7 @@ AM_U::AM_U(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "am:u"
+         {0x001F, nullptr, "DeleteAllExpiredUserPrograms"},
+         {0x0020, nullptr, "GetTwlArchiveResourceInfo"},
+         {0x0021, &AM_U::GetPersonalizedTicketInfoList, "GetPersonalizedTicketInfoList"},
+-        {0x0022, nullptr, "DeleteAllImportContextsFiltered"},
++        {0x0022, &AM_U::DeleteAllImportContextsFiltered, "DeleteAllImportContextsFiltered"},
+         {0x0023, &AM_U::GetNumImportTitleContextsFiltered, "GetNumImportTitleContextsFiltered"},
+         {0x0024, &AM_U::GetImportTitleContextListFiltered, "GetImportTitleContextListFiltered"},
+         {0x0025, &AM_U::CheckContentRights, "CheckContentRights"},
+diff --git a/src/core/hle/service/apt/apt.cpp b/src/core/hle/service/apt/apt.cpp
+index f33bc65..fbef160 100644
+--- a/src/core/hle/service/apt/apt.cpp
++++ b/src/core/hle/service/apt/apt.cpp
+@@ -78,6 +78,27 @@ void Module::NSInterface::SetWirelessRebootInfo(Kernel::HLERequestContext& ctx)
+     LOG_WARNING(Service_APT, "called size={}", size);
+ }
+ 
++void Module::NSInterface::LaunchTitle(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u64 title_id = rp.Pop<u64>();
++    const u32 flags = rp.Pop<u32>();
++
++    constexpr u64 SystemModuleHigh = 0x00040130;
++    auto rb = rp.MakeBuilder(2, 0);
++    if ((title_id >> 32) == SystemModuleHigh) {
++        rb.Push(ResultSuccess);
++        rb.Push<u32>(0);
++        LOG_DEBUG(Service_APT, "system module {:016X} is already running, flags={:#x}", title_id,
++                  flags);
++        return;
++    }
++    rb.Push(Result(ErrorDescription::NotImplemented, ErrorModule::NS, ErrorSummary::NotSupported,
++                   ErrorLevel::Permanent));
++    rb.Push<u32>(0);
++    LOG_WARNING(Service_APT, "launching title {:016X} (flags={:#x}) is not supported", title_id,
++                flags);
++}
++
+ void Module::NSInterface::CardUpdateInitialize(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     rp.Pop<u32>(); // Shared mem size
+diff --git a/src/core/hle/service/apt/apt.h b/src/core/hle/service/apt/apt.h
+index 8598260..1dc0374 100644
+--- a/src/core/hle/service/apt/apt.h
++++ b/src/core/hle/service/apt/apt.h
+@@ -77,6 +77,19 @@ public:
+ 
+         void CardUpdateInitialize(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * NS::LaunchTitle service function. The HOME Menu asks NS to start the system modules
++         * (0004013000xxxx02) at boot. Those are HLE services (or already loaded as LLE modules)
++         * in Tangelo, so this reports success. Other titles aren't supported.
++         * Inputs:
++         *     1-2 : Title ID
++         *     3 : Launch flags
++         * Outputs:
++         *     1 : Result of function, 0 on success, otherwise error code
++         *     2 : Process ID
++         */
++        void LaunchTitle(Kernel::HLERequestContext& ctx);
++
+         /**
+          * NS::ShutdownAsync service function.
+          * Inputs:
+diff --git a/src/core/hle/service/apt/ns_s.cpp b/src/core/hle/service/apt/ns_s.cpp
+index cc802b7..e3ea35c 100644
+--- a/src/core/hle/service/apt/ns_s.cpp
++++ b/src/core/hle/service/apt/ns_s.cpp
+@@ -12,7 +12,7 @@ NS_S::NS_S(std::shared_ptr<Service::APT::Module> apt)
+     static const FunctionInfo functions[] = {
+         // clang-format off
+         {0x0001, nullptr, "LaunchFIRM"},
+-        {0x0002, nullptr, "LaunchTitle"},
++        {0x0002, &NS_S::LaunchTitle, "LaunchTitle"},
+         {0x0003, nullptr, "TerminateApplication"},
+         {0x0004, nullptr, "TerminateProcess"},
+         {0x0005, nullptr, "LaunchApplicationFIRM"},
+diff --git a/src/core/hle/service/boss/boss.cpp b/src/core/hle/service/boss/boss.cpp
+index eef487f..bfeeadb 100644
+--- a/src/core/hle/service/boss/boss.cpp
++++ b/src/core/hle/service/boss/boss.cpp
+@@ -674,11 +674,20 @@ void Module::Interface::GetTaskInfo(Kernel::HLERequestContext& ctx) {
+     const u8 unk_param2 = rp.Pop<u8>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    // Makes the task's properties the current ones; games read them with ReceiveProperty.
++    const std::string task_id = OnlineService::ReadTaskId(size, buffer);
++    const bool found = online_service->LoadTaskProperties(task_id);
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) size={:#010x}, unk_param2={:#04x}", size, unk_param2);
++    LOG_DEBUG(Service_BOSS, "task_id={}{}, unk_param2={:#04x}", task_id,
++              found ? "" : " (not registered)", unk_param2);
+ }
+ 
+ void Module::Interface::DeleteNsData(Kernel::HLERequestContext& ctx) {
+@@ -903,11 +912,22 @@ void Module::Interface::StartBgImmediate(Kernel::HLERequestContext& ctx) {
+     const u32 size = rp.Pop<u32>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    // Runs a registered task now, as a background task (e.g. Mii Plaza's MIIDATA, PANEL,
++    // PANELLM and LEGEND at start).
++    const std::string task_id = OnlineService::ReadTaskId(size, buffer);
++    if (!online_service->StartTask(task_id, boss->spotpass_state)) {
++        LOG_WARNING(Service_BOSS, "Task '{}' isn't registered", task_id);
++    }
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) size={:#010x}", size);
++    LOG_DEBUG(Service_BOSS, "task_id={}", task_id);
+ }
+ 
+ void Module::Interface::GetTaskProperty0(Kernel::HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index 8200858..1b93e89 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -677,11 +677,13 @@ Result OnlineService::SendProperty(const u16 id, const u32 size, Kernel::MappedB
+     };
+ 
+     auto read_vector = [&]<typename T>(std::vector<T>& old_prop) {
+-        if (size != old_prop.size()) {
++        // `size` is in bytes; the property may hold u32s (e.g. 0x0F, the certificate ID list).
++        const std::size_t old_size = old_prop.size() * sizeof(T);
++        if (size != old_size) {
+             LOG_ERROR(Service_BOSS, "Unexpected size of property {:#06x}, was expecting {}, got {}",
+-                      property_id, old_prop.size(), size);
++                      property_id, old_size, size);
+         }
+-        std::vector<T> cur_prop(size);
++        std::vector<T> cur_prop((size + sizeof(T) - 1) / sizeof(T));
+         buffer.Read(cur_prop.data(), 0, size);
+         prop = cur_prop;
+     };
+@@ -715,11 +717,13 @@ Result OnlineService::ReceiveProperty(const u16 id, const u32 size, Kernel::Mapp
+     };
+ 
+     auto write_vector = [&]<typename T>(std::vector<T>& cur_prop) {
+-        if (size != cur_prop.size()) {
++        const std::size_t cur_size = cur_prop.size() * sizeof(T);
++        if (size != cur_size) {
+             LOG_ERROR(Service_BOSS, "Unexpected size of property {:#06x}, was expecting {}, got {}",
+-                      property_id, cur_prop.size(), size);
++                      property_id, cur_size, size);
+         }
+-        buffer.Write(cur_prop.data(), 0, size);
++        // Never read past the property.
++        buffer.Write(cur_prop.data(), 0, std::min<std::size_t>(size, cur_size));
+     };
+ 
+     auto& prop = current_props.properties[property_id];
+@@ -745,13 +749,21 @@ bool OnlineService::StartTask(const std::string& task_id,
+             return false;
+         }
+         auto& properties = task->second.properties;
+-        if (std::get<u8>(properties[TaskStateProperty]) == static_cast<u8>(TaskState::Running)) {
++        if (running_tasks.contains(task_id)) {
++            // The download updates the task when it finishes, also if the game registered the
++            // task again in the meantime.
+             LOG_DEBUG(Service_BOSS, "SpotPass task '{}' is already running", task_id);
++            properties[TaskStateProperty] = static_cast<u8>(TaskState::Running);
+             return true;
+         }
+         url = PropertyString(properties[PropertyID::Url]);
++        if (url.empty()) {
++            LOG_WARNING(Service_BOSS, "SpotPass task '{}' has no URL; not run", task_id);
++            return true;
++        }
+         last_modified = PropertyString(properties[TaskLastModifiedProperty]);
+         properties[TaskStateProperty] = static_cast<u8>(TaskState::Running);
++        running_tasks.insert(task_id);
+     }
+ 
+     {
+@@ -768,6 +780,10 @@ bool OnlineService::StartTask(const std::string& task_id,
+     std::thread([self = shared_from_this(), task_id, url = std::move(url),
+                  last_modified = std::move(last_modified), state]() mutable {
+         self->RunTask(task_id, std::move(url), std::move(last_modified), state);
++        {
++            std::scoped_lock lock(self->mutex);
++            self->running_tasks.erase(task_id);
++        }
+         std::scoped_lock state_lock(state->mutex);
+         --state->active_workers;
+         state->workers_done.notify_all();
+@@ -777,12 +793,6 @@ bool OnlineService::StartTask(const std::string& task_id,
+ 
+ void OnlineService::RunTask(const std::string& task_id, std::string url, std::string last_modified,
+                             std::shared_ptr<SpotPassState> state) {
+-    if (url.empty()) {
+-        LOG_WARNING(Service_BOSS, "SpotPass task '{}' has no URL", task_id);
+-        FinishTask(task_id, TaskState::Failed, 0, {});
+-        return;
+-    }
+-
+     const TaskDownload download = DownloadTaskFile(url, last_modified, state->cancel);
+     if (state->cancel) {
+         return;
+@@ -835,6 +845,7 @@ void OnlineService::RunTask(const std::string& task_id, std::string url, std::st
+ void OnlineService::FinishTask(const std::string& task_id, TaskState state, u32 http_status,
+                                const std::string& last_modified) {
+     std::scoped_lock lock(mutex);
++    running_tasks.erase(task_id);
+     const auto task = task_id_list.find(task_id);
+     if (task == task_id_list.end()) {
+         return;
+diff --git a/src/core/hle/service/boss/online_service.h b/src/core/hle/service/boss/online_service.h
+index 648bfbe..dd107cb 100644
+--- a/src/core/hle/service/boss/online_service.h
++++ b/src/core/hle/service/boss/online_service.h
+@@ -298,6 +298,8 @@ private:
+ 
+     /// Guards task_id_list and the extdata against the download workers.
+     std::recursive_mutex mutex;
++    /// Tasks with a download in progress.
++    std::set<std::string> running_tasks;
+ 
+     // For serialization
+     explicit OnlineService() = default;
+diff --git a/src/core/hle/service/fs/fs_user.cpp b/src/core/hle/service/fs/fs_user.cpp
+index 14879b3..b653afe 100644
+--- a/src/core/hle/service/fs/fs_user.cpp
++++ b/src/core/hle/service/fs/fs_user.cpp
+@@ -1378,6 +1378,43 @@ void FS_USER::GetNumSeeds(Kernel::HLERequestContext& ctx) {
+     rb.Push<u32>(FileSys::GetSeedCount());
+ }
+ 
++void FS_USER::ListSeeds(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 max_count = rp.Pop<u32>();
++    auto& buffer = rp.PopMappedBuffer();
++
++    std::vector<u64> title_ids = FileSys::GetSeedTitleIds();
++    const std::size_t count =
++        std::min<std::size_t>({title_ids.size(), max_count, buffer.GetSize() / sizeof(u64)});
++    buffer.Write(title_ids.data(), 0, count * sizeof(u64));
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(static_cast<u32>(count));
++    rb.PushMappedBuffer(buffer);
++    LOG_DEBUG(Service_FS, "max_count={}, count={}", max_count, count);
++}
++
++void FS_USER::GetNumTitleTags(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0);
++    LOG_DEBUG(Service_FS, "called");
++}
++
++void FS_USER::ListTitleTags(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 max_count = rp.Pop<u32>();
++    auto& buffer = rp.PopMappedBuffer();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0);
++    rb.PushMappedBuffer(buffer);
++    LOG_DEBUG(Service_FS, "max_count={}", max_count);
++}
++
+ void FS_USER::AddSeed(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     u64 title_id{rp.Pop<u64>()};
+@@ -1951,8 +1988,11 @@ FS_USER::FS_USER(Core::System& system)
+         {0x087B, &FS_USER::GetSeed, "GetSeed"},
+         {0x087C, &FS_USER::DeleteSeed, "GetSeed"},
+         {0x087D, &FS_USER::GetNumSeeds, "GetNumSeeds"},
++        {0x087E, &FS_USER::ListSeeds, "ListSeeds"},
+         {0x0880, &FS_USER::SetUnknown0x80Data, "SetUnknown0x80Data"},
+         {0x0881, &FS_USER::GetUnknown0x80Data, "GetUnknown0x80Data"},
++        {0x0883, &FS_USER::GetNumTitleTags, "GetNumTitleTags"},
++        {0x0884, &FS_USER::ListTitleTags, "ListTitleTags"},
+         {0x0886, nullptr, "CheckUpdatedDat"},
+         // clang-format on
+     };
+diff --git a/src/core/hle/service/fs/fs_user.h b/src/core/hle/service/fs/fs_user.h
+index e405448..3e9a798 100644
+--- a/src/core/hle/service/fs/fs_user.h
++++ b/src/core/hle/service/fs/fs_user.h
+@@ -672,6 +672,24 @@ private:
+ 
+     void GetNumSeeds(Kernel::HLERequestContext& ctx);
+ 
++    /**
++     * FS_User::ListSeeds service function.
++     *  Inputs:
++     *      1 : Maximum number of title IDs
++     *      2-3 : Mapped output buffer (u64 title IDs)
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     *      2 : Number of title IDs written
++     */
++    void ListSeeds(Kernel::HLERequestContext& ctx);
++
++    /**
++     * FS_User::GetNumTitleTags / ListTitleTags service functions. Title tags aren't stored,
++     * so there are none.
++     */
++    void GetNumTitleTags(Kernel::HLERequestContext& ctx);
++    void ListTitleTags(Kernel::HLERequestContext& ctx);
++
+     void SetUnknown0x80Data(Kernel::HLERequestContext& ctx);
+ 
+     void GetUnknown0x80Data(Kernel::HLERequestContext& ctx);
+diff --git a/src/core/hle/service/gsp/gsp_lcd.cpp b/src/core/hle/service/gsp/gsp_lcd.cpp
+index 4c15599..91cbacc 100644
+--- a/src/core/hle/service/gsp/gsp_lcd.cpp
++++ b/src/core/hle/service/gsp/gsp_lcd.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the license.txt file included.
+ 
+ #include "common/archives.h"
++#include "common/logging/log.h"
+ #include "core/hle/ipc_helpers.h"
+ #include "core/hle/service/gsp/gsp_lcd.h"
+ 
+@@ -19,7 +20,7 @@ GSP_LCD::GSP_LCD() : ServiceFramework("gsp::Lcd") {
+         {0x0010, nullptr, "PowerOffAllBacklights"},
+         {0x0011, nullptr, "PowerOnBacklight"},
+         {0x0012, nullptr, "PowerOffBacklight"},
+-        {0x0013, nullptr, "SetLedForceOff"},
++        {0x0013, &GSP_LCD::SetLedForceOff, "SetLedForceOff"},
+         {0x0014, nullptr, "GetVendor"},
+         {0x0015, nullptr, "GetBrightness"},
+         // clang-format on
+@@ -27,4 +28,14 @@ GSP_LCD::GSP_LCD() : ServiceFramework("gsp::Lcd") {
+     RegisterHandlers(functions);
+ };
+ 
++void GSP_LCD::SetLedForceOff(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u8 force_off = rp.Pop<u8>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_GSP, "force_off={}", force_off);
++}
++
+ } // namespace Service::GSP
+diff --git a/src/core/hle/service/gsp/gsp_lcd.h b/src/core/hle/service/gsp/gsp_lcd.h
+index 31d17f5..f6415ec 100644
+--- a/src/core/hle/service/gsp/gsp_lcd.h
++++ b/src/core/hle/service/gsp/gsp_lcd.h
+@@ -14,6 +14,14 @@ public:
+     ~GSP_LCD() = default;
+ 
+ private:
++    /**
++     * GSP_LCD::SetLedForceOff service function. The HOME Menu turns the 3D LED off; there is
++     * no LED to switch, so this only reports success.
++     * Inputs:
++     *     1 : u8, 1 = force the LED off
++     */
++    void SetLedForceOff(Kernel::HLERequestContext& ctx);
++
+     SERVICE_SERIALIZATION_SIMPLE
+ };
+ 
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 85f6375..794477a 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -1690,6 +1690,48 @@ void HTTP_C::AddDefaultCert(Kernel::HLERequestContext& ctx) {
+     rb.Push(ResultSuccess);
+ }
+ 
++void HTTP_C::CreateRootCertChain(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 handle = ++root_cert_chains_counter;
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(handle);
++    LOG_DEBUG(Service_HTTP, "handle={}", handle);
++}
++
++void HTTP_C::DestroyRootCertChain(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 handle = rp.Pop<u32>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++    LOG_DEBUG(Service_HTTP, "handle={}", handle);
++}
++
++void HTTP_C::RootCertChainAddDefaultCert(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 chain_handle = rp.Pop<u32>();
++    const u32 certificate_id = rp.Pop<u32>();
++    const u32 cert_handle = ++root_certs_counter;
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(cert_handle);
++    LOG_DEBUG(Service_HTTP, "chain={}, certificate_id={}, cert_handle={}", chain_handle,
++              certificate_id, cert_handle);
++}
++
++void HTTP_C::SelectRootCertChain(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 context_handle = rp.Pop<u32>();
++    const u32 chain_handle = rp.Pop<u32>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++    LOG_DEBUG(Service_HTTP, "context={}, chain={}", context_handle, chain_handle);
++}
++
+ void HTTP_C::SetDefaultClientCert(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const Context::Handle context_handle = rp.Pop<u32>();
+@@ -2361,17 +2403,17 @@ HTTP_C::HTTP_C() : ServiceFramework("http:C", 32) {
+         {0x0023, &HTTP_C::GetResponseStatusCodeTimeout, "GetResponseStatusCodeTimeout"},
+         {0x0024, &HTTP_C::AddTrustedRootCA, "AddTrustedRootCA"},
+         {0x0025, &HTTP_C::AddDefaultCert, "AddDefaultCert"},
+-        {0x0026, nullptr, "SelectRootCertChain"},
++        {0x0026, &HTTP_C::SelectRootCertChain, "SelectRootCertChain"},
+         {0x0027, nullptr, "SetClientCert"},
+         {0x0028, &HTTP_C::SetDefaultClientCert, "SetDefaultClientCert"},
+         {0x0029, &HTTP_C::SetClientCertContext, "SetClientCertContext"},
+         {0x002A, &HTTP_C::GetSSLError, "GetSSLError"},
+         {0x002B, &HTTP_C::SetSSLOpt, "SetSSLOpt"},
+         {0x002C, nullptr, "SetSSLClearOpt"},
+-        {0x002D, nullptr, "CreateRootCertChain"},
+-        {0x002E, nullptr, "DestroyRootCertChain"},
++        {0x002D, &HTTP_C::CreateRootCertChain, "CreateRootCertChain"},
++        {0x002E, &HTTP_C::DestroyRootCertChain, "DestroyRootCertChain"},
+         {0x002F, nullptr, "RootCertChainAddCert"},
+-        {0x0030, nullptr, "RootCertChainAddDefaultCert"},
++        {0x0030, &HTTP_C::RootCertChainAddDefaultCert, "RootCertChainAddDefaultCert"},
+         {0x0031, nullptr, "RootCertChainRemoveCert"},
+         {0x0032, &HTTP_C::OpenClientCertContext, "OpenClientCertContext"},
+         {0x0033, &HTTP_C::OpenDefaultClientCertContext, "OpenDefaultClientCertContext"},
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index 1f75d2f..0e288b0 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -792,6 +792,21 @@ private:
+      */
+     void SetDefaultClientCert(Kernel::HLERequestContext& ctx);
+ 
++    /**
++     * HTTP_C::CreateRootCertChain, DestroyRootCertChain, RootCertChainAddDefaultCert and
++     * SelectRootCertChain service functions. NIM and the HOME Menu set up root certificate chains;
++     * Tangelo doesn't check server certificates, so the chains only hand out handles.
++     *  CreateRootCertChain outputs: 1 result, 2 chain handle
++     *  DestroyRootCertChain inputs: 1 chain handle; outputs: 1 result
++     *  RootCertChainAddDefaultCert inputs: 1 chain handle, 2 cert ID;
++     *      outputs: 1 result, 2 cert handle
++     *  SelectRootCertChain inputs: 1 context handle, 2 chain handle; outputs: 1 result
++     */
++    void CreateRootCertChain(Kernel::HLERequestContext& ctx);
++    void DestroyRootCertChain(Kernel::HLERequestContext& ctx);
++    void RootCertChainAddDefaultCert(Kernel::HLERequestContext& ctx);
++    void SelectRootCertChain(Kernel::HLERequestContext& ctx);
++
+     /**
+      * HTTP_C::SetClientCertContext service function
+      *  Inputs:
+@@ -906,6 +921,9 @@ private:
+ 
+     /// The next handle number to use when a new ClientCert context is created.
+     ClientCertContext::Handle client_certs_counter = 0;
++    /// Handles for root certificate chains and their certificates (not saved in save states).
++    u32 root_cert_chains_counter = 0;
++    u32 root_certs_counter = 0;
+ 
+     /// Global list of HTTP contexts currently opened.
+     std::unordered_map<Context::Handle, Context> contexts;
+diff --git a/src/core/hle/service/news/news.cpp b/src/core/hle/service/news/news.cpp
+index 9cd1794..cf1b9b1 100644
+--- a/src/core/hle/service/news/news.cpp
++++ b/src/core/hle/service/news/news.cpp
+@@ -407,6 +407,13 @@ void Module::Interface::GetTotalArrivedNotifications(Kernel::HLERequestContext&
+     rb.Push<u32>(0); // Total number of pending BOSS notifications to be synced
+ }
+ 
++void Module::Interface::SyncArrivedNotifications(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++    LOG_DEBUG(Service_NEWS, "called (nothing to sync)");
++}
++
+ std::size_t Module::GetTotalNotifications() {
+     return std::count_if(
+         notification_ids.begin(), notification_ids.end(),
+diff --git a/src/core/hle/service/news/news.h b/src/core/hle/service/news/news.h
+index f0331ff..856e307 100644
+--- a/src/core/hle/service/news/news.h
++++ b/src/core/hle/service/news/news.h
+@@ -324,6 +324,15 @@ public:
+          */
+         void GetTotalArrivedNotifications(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * NEWS::SyncArrivedNotifications service function. Moves notifications that arrived
++         * through SpotPass into the news database; there are none pending (see
++         * GetTotalArrivedNotifications).
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void SyncArrivedNotifications(Kernel::HLERequestContext& ctx);
++
+     protected:
+         std::shared_ptr<Module> news;
+     };
+diff --git a/src/core/hle/service/news/news_s.cpp b/src/core/hle/service/news/news_s.cpp
+index e32f190..c299505 100644
+--- a/src/core/hle/service/news/news_s.cpp
++++ b/src/core/hle/service/news/news_s.cpp
+@@ -24,7 +24,7 @@ NEWS_S::NEWS_S(std::shared_ptr<Module> news) : Module::Interface(std::move(news)
+         {0x000C, &NEWS_S::GetNotificationMessage, "GetNotificationMessage"},
+         {0x000D, &NEWS_S::GetNotificationImage, "GetNotificationImage"},
+         {0x000E, nullptr, "SetInfoLEDPattern"},
+-        {0x000F, nullptr, "SyncArrivedNotifications"},
++        {0x000F, &NEWS_S::SyncArrivedNotifications, "SyncArrivedNotifications"},
+         {0x0010, nullptr, "SyncOneArrivedNotification"},
+         {0x0011, &NEWS_S::SetAutomaticSyncFlag, "SetAutomaticSyncFlag"},
+         {0x0012, &NEWS_S::SetNotificationHeaderOther, "SetNotificationHeaderOther"},
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index 2a1bf22..1d8bece 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -178,6 +178,42 @@ void Module::Interface::GetSoftwareClosedFlag(Kernel::HLERequestContext& ctx) {
+     LOG_WARNING(Service_PTM, "(STUBBED) called");
+ }
+ 
++void Module::Interface::ClearSoftwareClosedFlag(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++    LOG_DEBUG(Service_PTM, "called");
++}
++
++void Module::Interface::GetPlayHistory(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 start = rp.Pop<u32>();
++    const u32 count = rp.Pop<u32>();
++    auto& buffer = rp.PopMappedBuffer();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0);
++    rb.PushMappedBuffer(buffer);
++    LOG_DEBUG(Service_PTM, "start={}, count={} (no play history)", start, count);
++}
++
++void Module::Interface::GetPlayHistoryStart(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0);
++    LOG_DEBUG(Service_PTM, "called");
++}
++
++void Module::Interface::GetPlayHistoryLength(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0);
++    LOG_DEBUG(Service_PTM, "called");
++}
++
+ void CheckNew3DS(IPC::RequestBuilder& rb) {
+     const bool is_new_3ds = Settings::values.is_new_3ds.GetValue();
+ 
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index ce05807..81ba906 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -161,6 +161,37 @@ public:
+          */
+         void GetSoftwareClosedFlag(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * PTM::ClearSoftwareClosedFlag service function. The flag is always clear (see
++         * GetSoftwareClosedFlag).
++         *  Outputs:
++         *      1: Result code, 0 on success, otherwise error code
++         */
++        void ClearSoftwareClosedFlag(Kernel::HLERequestContext& ctx);
++
++        /**
++         * PTM::GetPlayHistory service function (Activity Log, HOME Menu). Tangelo doesn't record
++         * play history yet, so no entries are returned.
++         *  Inputs:
++         *      1: Index of the first entry
++         *      2: Number of entries
++         *      3-4: Mapped output buffer (8 bytes per entry)
++         *  Outputs:
++         *      1: Result code, 0 on success, otherwise error code
++         *      2: Number of entries written
++         */
++        void GetPlayHistory(Kernel::HLERequestContext& ctx);
++
++        /**
++         * PTM::GetPlayHistoryStart / GetPlayHistoryLength service functions: the index of the
++         * first play history entry and the number of entries (both 0, the history is empty).
++         *  Outputs:
++         *      1: Result code, 0 on success, otherwise error code
++         *      2: u32 value
++         */
++        void GetPlayHistoryStart(Kernel::HLERequestContext& ctx);
++        void GetPlayHistoryLength(Kernel::HLERequestContext& ctx);
++
+         /**
+          * PTM::CheckNew3DS service function
+          *  Outputs:
+diff --git a/src/core/hle/service/ptm/ptm_play.cpp b/src/core/hle/service/ptm/ptm_play.cpp
+index 64f8942..6f731e7 100644
+--- a/src/core/hle/service/ptm/ptm_play.cpp
++++ b/src/core/hle/service/ptm/ptm_play.cpp
+@@ -30,9 +30,9 @@ PTM_Play::PTM_Play(std::shared_ptr<Module> ptm)
+         {0x000E, nullptr, "GetPedometerRecordingMode"},
+         {0x000F, nullptr, "GetStepHistoryAll"},
+         // ptm:play
+-        {0x0807, nullptr, "GetPlayHistory"},
+-        {0x0808, nullptr, "GetPlayHistoryStart"},
+-        {0x0809, nullptr, "GetPlayHistoryLength"},
++        {0x0807, &PTM_Play::GetPlayHistory, "GetPlayHistory"},
++        {0x0808, &PTM_Play::GetPlayHistoryStart, "GetPlayHistoryStart"},
++        {0x0809, &PTM_Play::GetPlayHistoryLength, "GetPlayHistoryLength"},
+         {0x080B, nullptr, "CalcPlayHistoryStart"},
+         // clang-format on
+     };
+diff --git a/src/core/hle/service/ptm/ptm_sysm.cpp b/src/core/hle/service/ptm/ptm_sysm.cpp
+index 97afeab..3b1521d 100644
+--- a/src/core/hle/service/ptm/ptm_sysm.cpp
++++ b/src/core/hle/service/ptm/ptm_sysm.cpp
+@@ -47,16 +47,16 @@ PTM_S_Common::PTM_S_Common(std::shared_ptr<Module> ptm, const char* name)
+         {0x0804, nullptr, "SetBatteryEmptyLEDPattern"},
+         {0x0805, nullptr, "ClearStepHistory"},
+         {0x0806, nullptr, "SetStepHistory"},
+-        {0x0807, nullptr, "GetPlayHistory"},
+-        {0x0808, nullptr, "GetPlayHistoryStart"},
+-        {0x0809, nullptr, "GetPlayHistoryLength"},
++        {0x0807, &PTM_S_Common::GetPlayHistory, "GetPlayHistory"},
++        {0x0808, &PTM_S_Common::GetPlayHistoryStart, "GetPlayHistoryStart"},
++        {0x0809, &PTM_S_Common::GetPlayHistoryLength, "GetPlayHistoryLength"},
+         {0x080A, nullptr, "ClearPlayHistory"},
+         {0x080B, nullptr, "CalcPlayHistoryStart"},
+         {0x080C, nullptr, "SetUserTime"},
+         {0x080D, nullptr, "InvalidateSystemTime"},
+         {0x080E, nullptr, "NotifyPlayEvent"},
+         {0x080F, &PTM_S_Common::GetSoftwareClosedFlag, "GetSoftwareClosedFlag"},
+-        {0x0810, nullptr, "ClearSoftwareClosedFlag"},
++        {0x0810, &PTM_S_Common::ClearSoftwareClosedFlag, "ClearSoftwareClosedFlag"},
+         {0x0811, &PTM_S_Common::GetShellState, "GetShellState"},
+         {0x0812, nullptr, "IsShutdownByBatteryEmpty"},
+         {0x0813, nullptr, "FormatSavedata"},
+-- 
+2.43.0
+
