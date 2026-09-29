@@ -1,0 +1,162 @@
+From 856786e638ae9649634889d153203edeba901db9 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 02:31:24 +0200
+Subject: [PATCH] http: also redirect NetPass's SpotPass mirror to the custom
+ server
+
+NetPass points SpotPass downloads at its own mirror
+(https://api.netpass.cafe/npdl/p01/nsa/...), which answers with a 302 to
+Nintendo's URL when it doesn't have the file. The BOSS module follows the
+redirect but, for the followed request, only checks size and status and
+never reads the data (task result 0x5F, error 004-6007 in Disney Magical
+World), even though the custom server sent a valid file.
+
+With a custom SpotPass server set, /npdl/ requests to api.netpass.cafe
+are now sent to it as well, with the /npdl prefix dropped, so the first
+request gets the file directly. The rest of NetPass's API is untouched.
+X-Tangelo-Original-Host tells the server which host was meant.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ .../configuration/configure_network.ui        |  2 +-
+ src/core/hle/service/http/http_c.cpp          |  2 +-
+ .../hle/service/http/spotpass_redirect.cpp    | 22 ++++++++++++++++++-
+ src/core/hle/service/http/spotpass_redirect.h |  9 ++++++--
+ .../core/hle/service/spotpass_redirect.cpp    | 16 ++++++++++++++
+ 5 files changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/src/citra_qt/configuration/configure_network.ui b/src/citra_qt/configuration/configure_network.ui
+index 3d8850d..cc2e460 100644
+--- a/src/citra_qt/configuration/configure_network.ui
++++ b/src/citra_qt/configuration/configure_network.ui
+@@ -96,7 +96,7 @@
+       <item>
+        <widget class="QLabel" name="spotpass_hint_label">
+         <property name="text">
+-         <string>With a custom server, SpotPass requests meant for Nintendo (content downloads, the policy list and uploads) go to this address instead. The original path is kept, e.g. /p01/nsa/…</string>
++         <string>With a custom server, SpotPass requests meant for Nintendo (content downloads, the policy list and uploads) go to this address instead, as do SpotPass downloads NetPass moved to its mirror. The original path is kept, e.g. /p01/nsa/…</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 59d90f1..85f6375 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -255,7 +255,7 @@ void Context::MakeRequest() {
+             LOG_INFO(Service_HTTP, "SpotPass request redirected: {} -> {}", url, *redirected);
+             spotpass_host = GetUrlHost(url);
+             request_url = std::move(*redirected);
+-        } else if (IsSpotPassHost(GetUrlHost(url))) {
++        } else if (IsSpotPassUrl(url)) {
+             LOG_WARNING(Service_HTTP,
+                         "Custom SpotPass server is enabled but its address is empty or invalid; "
+                         "sending {} to Nintendo",
+diff --git a/src/core/hle/service/http/spotpass_redirect.cpp b/src/core/hle/service/http/spotpass_redirect.cpp
+index 31e3438..2d156c1 100644
+--- a/src/core/hle/service/http/spotpass_redirect.cpp
++++ b/src/core/hle/service/http/spotpass_redirect.cpp
+@@ -17,6 +17,11 @@ constexpr std::array<std::string_view, 3> SpotPassHosts{
+     "npul.c.app.nintendowifi.net", // SpotPass uploads (/p01/recv/...)
+ };
+ 
++// NetPass rewrites SpotPass task URLs to its own mirror, which answers with a redirect to
++// Nintendo when it doesn't have a file. Only its /npdl/ paths are SpotPass.
++constexpr std::string_view NetPassHost = "api.netpass.cafe";
++constexpr std::string_view NetPassSpotPassPrefix = "/npdl";
++
+ std::string ToLower(std::string_view text) {
+     std::string result(text);
+     std::transform(result.begin(), result.end(), result.begin(),
+@@ -67,9 +72,20 @@ bool IsSpotPassHost(std::string_view host) {
+     return std::find(SpotPassHosts.begin(), SpotPassHosts.end(), name) != SpotPassHosts.end();
+ }
+ 
++bool IsSpotPassUrl(std::string_view url) {
++    const std::string host = GetUrlHost(url);
++    if (host == NetPassHost) {
++        const std::string_view rest = SplitAuthority(url).second;
++        return rest.starts_with(NetPassSpotPassPrefix) &&
++               (rest.size() == NetPassSpotPassPrefix.size() ||
++                rest[NetPassSpotPassPrefix.size()] == '/');
++    }
++    return IsSpotPassHost(host);
++}
++
+ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server) {
+     server = Trim(server);
+-    if (server.empty() || !IsSpotPassHost(GetUrlHost(url))) {
++    if (server.empty() || !IsSpotPassUrl(url)) {
+         return std::nullopt;
+     }
+ 
+@@ -90,6 +106,10 @@ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string
+     if (rest.empty() || rest.front() != '/') {
+         rest.insert(rest.begin(), '/');
+     }
++    if (GetUrlHost(url) == NetPassHost) {
++        // NetPass's SpotPass mirror: https://api.netpass.cafe/npdl/p01/... -> <server>/p01/...
++        rest.erase(0, NetPassSpotPassPrefix.size());
++    }
+     return base + rest;
+ }
+ 
+diff --git a/src/core/hle/service/http/spotpass_redirect.h b/src/core/hle/service/http/spotpass_redirect.h
+index f974a03..031f33a 100644
+--- a/src/core/hle/service/http/spotpass_redirect.h
++++ b/src/core/hle/service/http/spotpass_redirect.h
+@@ -14,13 +14,18 @@ namespace Service::HTTP {
+ /// content downloads, the policy list and SpotPass uploads.
+ bool IsSpotPassHost(std::string_view host);
+ 
++/// Returns true if `url` is a SpotPass request: one of Nintendo's SpotPass hosts, or a /npdl/ path
++/// on NetPass's SpotPass mirror (api.netpass.cafe), which NetPass puts in place of Nintendo's URLs.
++bool IsSpotPassUrl(std::string_view url);
++
+ /**
+  * Rewrites a SpotPass URL so it points at a custom server.
+  * `server` is "[scheme://]host[:port][/base/path]"; without a scheme, https is assumed.
+  * The original path and query are appended to the server's base path, so
+  * "https://npdl.cdn.nintendowifi.net/p01/nsa/abc/task/file" with server "http://my.host:8080/sp"
+- * becomes "http://my.host:8080/sp/p01/nsa/abc/task/file".
+- * Returns nullopt if `url` isn't a SpotPass URL or `server` is empty.
++ * becomes "http://my.host:8080/sp/p01/nsa/abc/task/file". For NetPass's mirror the "/npdl" prefix
++ * is dropped, so "https://api.netpass.cafe/npdl/p01/nsa/abc/task/file" maps to the same address.
++ * Returns nullopt if `url` isn't a SpotPass URL (see IsSpotPassUrl) or `server` is empty.
+  */
+ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server);
+ 
+diff --git a/src/tests/core/hle/service/spotpass_redirect.cpp b/src/tests/core/hle/service/spotpass_redirect.cpp
+index 594da79..2995936 100644
+--- a/src/tests/core/hle/service/spotpass_redirect.cpp
++++ b/src/tests/core/hle/service/spotpass_redirect.cpp
+@@ -7,6 +7,7 @@
+ 
+ using Service::HTTP::GetUrlHost;
+ using Service::HTTP::IsSpotPassHost;
++using Service::HTTP::IsSpotPassUrl;
+ using Service::HTTP::RedirectSpotPassUrl;
+ 
+ TEST_CASE("SpotPass hosts are recognised", "[service][http][spotpass]") {
+@@ -48,3 +49,18 @@ TEST_CASE("Other URLs and empty servers are left alone", "[service][http][spotpa
+     CHECK_FALSE(RedirectSpotPassUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c", "   "));
+     CHECK_FALSE(RedirectSpotPassUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c", "http://"));
+ }
++
++TEST_CASE("NetPass SpotPass mirror URLs are redirected too", "[service][http][spotpass]") {
++    const std::string mirror =
++        "https://api.netpass.cafe/npdl/p01/nsa/V04RWTNqtHWfOaEB/FGONLYT/NINTENDOZONE?tm=4";
++    CHECK(IsSpotPassUrl(mirror));
++    CHECK(RedirectSpotPassUrl(mirror, "http://localhost:8080") ==
++          "http://localhost:8080/p01/nsa/V04RWTNqtHWfOaEB/FGONLYT/NINTENDOZONE?tm=4");
++
++    // The rest of NetPass's API is not SpotPass and stays untouched.
++    CHECK_FALSE(IsSpotPassUrl("https://api.netpass.cafe/outbox/slot"));
++    CHECK_FALSE(IsSpotPassUrl("https://api.netpass.cafe/npdlx/p01"));
++    CHECK_FALSE(RedirectSpotPassUrl("https://api.netpass.cafe/inbox/12/slot", "http://s"));
++    CHECK(IsSpotPassUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c"));
++    CHECK_FALSE(IsSpotPassUrl("https://nasc.nintendowifi.net/ac"));
++}
+-- 
+2.43.0
+
