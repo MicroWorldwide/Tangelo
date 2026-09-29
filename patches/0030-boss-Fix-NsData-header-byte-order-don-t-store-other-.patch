@@ -1,0 +1,112 @@
+From 9c17cca7ad373e12e4b31bc1191761b5d61b42ab Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 17:33:47 +0200
+Subject: [PATCH] boss: Fix NsData header byte order, don't store other titles'
+ payloads
+
+GetNsDataHeaderInfo returned single fields (program ID, datatype, payload size,
+NsData ID, version) straight from the big-endian stored header, so games got them
+byte-swapped. Mii Plaza read the payload size 0x17E0 as 0xE0170000, its ReadNsData
+failed, and it treated its extra data as corrupted: it deleted and recreated its
+extdata (0x228), losing the save data in it.
+
+Downloaded SpotPass containers can carry payloads for other titles, e.g. HOME Menu
+notifications for the NEWS module (0004013000003502) in Mii Plaza's PANEL and LEGEND
+files. They were stored as the game's own data; now only payloads for the game (or
+the same game from another region) are stored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/boss/online_service.cpp | 27 +++++++++++++++-----
+ src/tests/core/hle/service/boss_download.cpp |  7 +++++
+ 2 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index 1b93e89..d16d166 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -561,9 +561,16 @@ Result OnlineService::GetNsDataHeaderInfo(const u32 ns_data_id, const NsDataHead
+         return ResultUnknown;
+     }
+ 
++    // The stored header is big-endian; the game gets native values.
++    const u64 header_program_id = entry->header.program_id;
++    const u32 header_datatype = entry->header.datatype;
++    const u32 header_payload_size = entry->header.payload_size;
++    const u32 header_ns_data_id = entry->header.ns_data_id;
++    const u32 header_version = entry->header.version;
++
+     switch (type) {
+     case NsDataHeaderInfoType::ProgramId:
+-        buffer.Write(&entry->header.program_id, 0, size);
++        buffer.Write(&header_program_id, 0, size);
+         return ResultSuccess;
+     case NsDataHeaderInfoType::Unknown: {
+         // TODO: Figure out what this is. Stubbed to zero for now.
+@@ -572,16 +579,16 @@ Result OnlineService::GetNsDataHeaderInfo(const u32 ns_data_id, const NsDataHead
+         return ResultSuccess;
+     }
+     case NsDataHeaderInfoType::Datatype:
+-        buffer.Write(&entry->header.datatype, 0, size);
++        buffer.Write(&header_datatype, 0, size);
+         return ResultSuccess;
+     case NsDataHeaderInfoType::PayloadSize:
+-        buffer.Write(&entry->header.payload_size, 0, size);
++        buffer.Write(&header_payload_size, 0, size);
+         return ResultSuccess;
+     case NsDataHeaderInfoType::NsDataId:
+-        buffer.Write(&entry->header.ns_data_id, 0, size);
++        buffer.Write(&header_ns_data_id, 0, size);
+         return ResultSuccess;
+     case NsDataHeaderInfoType::Version:
+-        buffer.Write(&entry->header.version, 0, size);
++        buffer.Write(&header_version, 0, size);
+         return ResultSuccess;
+     case NsDataHeaderInfoType::Everything: {
+         const NsDataHeaderInfo info = {
+@@ -920,7 +927,15 @@ std::optional<std::vector<u32>> OnlineService::StoreNsData(
+     std::vector<u32> written;
+     for (BossPayload payload : payloads) {
+         if (payload.program_id != program_id) {
+-            // E.g. data from another region's server; stored for this game so it can read it.
++            if ((payload.program_id >> 32) != (program_id >> 32)) {
++                // E.g. a HOME Menu notification for the NEWS module (0004013000003502). The
++                // real BOSS module hands those to that title, not to the game.
++                LOG_INFO(Service_BOSS,
++                         "SpotPass file {:#010x} is for program {:#018x}, not this game; skipped",
++                         payload.ns_data_id, payload.program_id);
++                continue;
++            }
++            // The same game from another region; stored for this game so it can read it.
+             LOG_WARNING(Service_BOSS,
+                         "SpotPass file {:#010x} is for program {:#018x}; storing it for {:#018x}",
+                         payload.ns_data_id, payload.program_id, program_id);
+diff --git a/src/tests/core/hle/service/boss_download.cpp b/src/tests/core/hle/service/boss_download.cpp
+index 918403d..6818cd6 100644
+--- a/src/tests/core/hle/service/boss_download.cpp
++++ b/src/tests/core/hle/service/boss_download.cpp
+@@ -111,6 +111,12 @@ TEST_CASE("Downloaded SpotPass files are stored in the game's extdata", "[servic
+          .ns_data_id = 2,
+          .version = 3,
+          .data = std::vector<u8>(0x20, 0x22)},
++        // A HOME Menu notification (NEWS module): not stored for the game.
++        {.program_id = 0x0004013000003502,
++         .datatype = 0x10003,
++         .ns_data_id = 3,
++         .version = 1,
++         .data = std::vector<u8>(0x10, 0x44)},
+     };
+ 
+     auto written = service->StoreNsData(payloads);
+@@ -123,6 +129,7 @@ TEST_CASE("Downloaded SpotPass files are stored in the game's extdata", "[servic
+     REQUIRE(second);
+     CHECK(second->header.program_id == ProgramId);
+     CHECK(second->header.version == 3);
++    CHECK_FALSE(service->GetNsDataEntryFromId(3));
+ 
+     // Same version again: nothing is rewritten.
+     written = service->StoreNsData(payloads);
+-- 
+2.43.0
+
