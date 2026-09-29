@@ -1,0 +1,224 @@
+From 63dc569691549cbcaa22ecc86ee9046b4ed30de0 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 19:40:07 +0200
+Subject: [PATCH] ptm: Log titles started from the HOME Menu in the play
+ history
+
+0033 logged a title only when emulation started or stopped. Titles the HOME Menu
+starts run as new processes in the same session, so they were missing from the
+Activity Log (Mii Plaza and the Activity Log itself when started from the HOME Menu).
+
+The kernel now tells a listener when a process starts running or exits; PTM logs
+applications and applets (title ID high 0x00040000, 0x00040010, 0x00040030) as
+launched and closed with the emulated time. Titles still running when emulation stops
+are logged as closed then.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/kernel/kernel.h     | 13 +++++++
+ src/core/hle/kernel/process.cpp  |  2 ++
+ src/core/hle/service/ptm/ptm.cpp | 61 ++++++++++++++++++++++----------
+ src/core/hle/service/ptm/ptm.h   | 20 +++++++----
+ 4 files changed, 70 insertions(+), 26 deletions(-)
+
+diff --git a/src/core/hle/kernel/kernel.h b/src/core/hle/kernel/kernel.h
+index 20ea679..5510eea 100644
+--- a/src/core/hle/kernel/kernel.h
++++ b/src/core/hle/kernel/kernel.h
+@@ -210,6 +210,18 @@ public:
+ 
+     std::shared_ptr<Process> CreateProcess(std::shared_ptr<CodeSet> code_set);
+ 
++    /// Called with a process's program ID when it starts running (true) or exits (false), e.g.
++    /// for PTM's play history. Not saved in save states.
++    using ProcessListener = std::function<void(u64 program_id, bool started)>;
++    void SetProcessListener(ProcessListener listener) {
++        process_listener = std::move(listener);
++    }
++    void NotifyProcessListener(u64 program_id, bool started) const {
++        if (process_listener) {
++            process_listener(program_id, started);
++        }
++    }
++
+     /**
+      * Terminates a process, killing its threads and removing it from the process list.
+      * @param process Process to terminate.
+@@ -420,6 +432,7 @@ public:
+     void UpdateCore1AppCpuLimit();
+ 
+ private:
++    ProcessListener process_listener;
+     void MemoryInit(MemoryMode memory_mode, u64 override_init_time);
+ 
+     void UpdateReportedMemory(MemoryMode memory_mode, New3dsMemoryMode n3ds_mode);
+diff --git a/src/core/hle/kernel/process.cpp b/src/core/hle/kernel/process.cpp
+index e272bd5..cb6f212 100644
+--- a/src/core/hle/kernel/process.cpp
++++ b/src/core/hle/kernel/process.cpp
+@@ -128,6 +128,7 @@ void KernelSystem::TerminateProcess(std::shared_ptr<Process> process) {
+     }
+ 
+     RestoreMemoryState(process->codeset->program_id);
++    NotifyProcessListener(process->codeset->program_id, false);
+ 
+     process->Exit();
+     std::erase(process_list, process);
+@@ -263,6 +264,7 @@ void Process::Run(s32 main_thread_priority, u32 stack_size) {
+ 
+     vm_manager.LogLayout(Common::Log::Level::Debug);
+     Kernel::SetupMainThread(kernel, codeset->entrypoint, main_thread_priority, SharedFrom(this));
++    kernel.NotifyProcessListener(codeset->program_id, true);
+ 
+     // Pause process at start if flag enabled and we are not a sysmodule
+     if (Core::System::GetInstance().GetDebugNextProcessFlag() &&
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index dd11506..ffec2c6 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -23,7 +23,6 @@
+ #include "core/hle/service/ptm/ptm_sets.h"
+ #include "core/hle/service/ptm/ptm_sysm.h"
+ #include "core/hle/service/ptm/ptm_u.h"
+-#include "core/loader/loader.h"
+ 
+ SERIALIZE_EXPORT_IMPL(Service::PTM::Module)
+ SERVICE_CONSTRUCT_IMPL(Service::PTM::Module)
+@@ -398,34 +397,52 @@ Module::Module(Core::System& system_) : system(system_) {
+     }
+ 
+     LoadPlayHistory();
+-    if (system.GetAppLoader().ReadProgramId(running_title_id) != Loader::ResultStatus::Success) {
+-        running_title_id = 0;
++}
++
++namespace {
++/// Titles the play history logs: applications (games, system applications like Mii Plaza) and
++/// applets (HOME Menu, Activity Log, ...), not system modules, updates or DLC.
++bool IsLoggedTitle(u64 program_id) {
++    const u32 high = static_cast<u32>(program_id >> 32);
++    return high == 0x00040000 || high == 0x00040010 || high == 0x00040030;
++}
++} // namespace
++
++void Module::OnProcessEvent(u64 program_id, bool started) {
++    if (!IsLoggedTitle(program_id)) {
++        return;
+     }
+-    if (running_title_id != 0) {
+-        launch_ms_since_2000 = system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
+-        launch_host_time = std::chrono::steady_clock::now();
+-        const u8 event = PlayHistory::IsApplet(running_title_id) ? PlayHistory::Applet : 0;
+-        play_history.Add(running_title_id, event, launch_ms_since_2000);
+-        SavePlayHistory();
+-        LOG_INFO(Service_PTM, "Play history: {:016X} launched", running_title_id);
++    const u64 now = system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
++    const u8 applet = PlayHistory::IsApplet(program_id) ? PlayHistory::Applet : 0;
++    if (started) {
++        running_titles[program_id] = {now, std::chrono::steady_clock::now()};
++        play_history.Add(program_id, applet, now);
++        LOG_INFO(Service_PTM, "Play history: {:016X} launched", program_id);
++    } else {
++        running_titles.erase(program_id);
++        play_history.Add(program_id, PlayHistory::Close | applet, now);
++        LOG_INFO(Service_PTM, "Play history: {:016X} closed", program_id);
+     }
++    SavePlayHistory();
+ }
+ 
+ Module::~Module() {
+-    if (running_title_id == 0) {
++    if (running_titles.empty()) {
+         return;
+     }
+     // The kernel may already be gone here; the close time is the launch time plus the time
+     // that has passed since.
+-    const auto played = std::chrono::duration_cast<std::chrono::milliseconds>(
+-        std::chrono::steady_clock::now() - launch_host_time);
+-    const u8 event =
+-        PlayHistory::Close | (PlayHistory::IsApplet(running_title_id) ? PlayHistory::Applet : 0);
+-    play_history.Add(running_title_id, event,
+-                     launch_ms_since_2000 + static_cast<u64>(played.count()));
++    const auto host_now = std::chrono::steady_clock::now();
++    for (const auto& [program_id, title] : running_titles) {
++        const auto played = std::chrono::duration_cast<std::chrono::milliseconds>(
++            host_now - title.launch_host_time);
++        const u8 applet = PlayHistory::IsApplet(program_id) ? PlayHistory::Applet : 0;
++        play_history.Add(program_id, PlayHistory::Close | applet,
++                         title.launch_ms_since_2000 + static_cast<u64>(played.count()));
++        LOG_INFO(Service_PTM, "Play history: {:016X} closed after {} min", program_id,
++                 played.count() / 60000);
++    }
+     SavePlayHistory();
+-    LOG_INFO(Service_PTM, "Play history: {:016X} closed after {} min", running_title_id,
+-             played.count() / 60000);
+ }
+ 
+ namespace {
+@@ -517,6 +534,12 @@ Module::Interface::Interface(std::shared_ptr<Module> ptm, const char* name, u32
+ void InstallInterfaces(Core::System& system) {
+     auto& service_manager = system.ServiceManager();
+     auto ptm = std::make_shared<Module>(system);
++    system.Kernel().SetProcessListener(
++        [weak_ptm = std::weak_ptr<Module>(ptm)](u64 program_id, bool started) {
++            if (const auto ptm = weak_ptm.lock()) {
++                ptm->OnProcessEvent(program_id, started);
++            }
++        });
+     std::make_shared<PTM_Gets>(ptm)->InstallAsService(service_manager);
+     std::make_shared<PTM_Play>(ptm)->InstallAsService(service_manager);
+     std::make_shared<PTM_Sets>(ptm)->InstallAsService(service_manager);
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index de464c2..46a8eaf 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -7,6 +7,7 @@
+ #include <vector>
+ 
+ #include <chrono>
++#include <map>
+ #include <memory>
+ #include "common/common_types.h"
+ #include "core/hle/ipc_helpers.h"
+@@ -61,9 +62,12 @@ public:
+ 
+     /// Hour-by-hour steps of the virtual walk, as GetStepHistory reports them.
+     static std::vector<u16> VirtualStepHistory(u64 start_ms, u32 hours, u64 now_ms);
+-    /// Logs the running title as closed in the play history.
++    /// Logs the titles still running as closed in the play history.
+     ~Module();
+ 
++    /// Play history: a title (application or applet) started (true) or exited (false).
++    void OnProcessEvent(u64 program_id, bool started);
++
+     static u16 GetPlayCoins();
+     static void SetPlayCoins(u16 play_coins);
+ 
+@@ -242,15 +246,17 @@ private:
+     bool battery_is_charging = true;
+     bool pedometer_is_counting = false;
+ 
+-    /// Play history (/PlayHistory.dat in the PTM system save data 0x00010022). A title is
+-    /// logged as launched when emulation starts (also after the HOME Menu starts a title, which
+-    /// restarts emulation with that title) and as closed when it stops.
++    /// Play history (/PlayHistory.dat in the PTM system save data 0x00010022). Applications and
++    /// applets are logged when their process starts and exits (the kernel tells PTM, see
++    /// InstallInterfaces); titles still running when emulation stops are logged as closed then.
+     void LoadPlayHistory();
+     void SavePlayHistory() const;
+     PlayHistory play_history;
+-    u64 running_title_id = 0;
+-    u64 launch_ms_since_2000 = 0;
+-    std::chrono::steady_clock::time_point launch_host_time;
++    struct RunningTitle {
++        u64 launch_ms_since_2000 = 0;
++        std::chrono::steady_clock::time_point launch_host_time;
++    };
++    std::map<u64, RunningTitle> running_titles;
+ 
+     template <class Archive>
+     void serialize(Archive& ar, const unsigned int);
+-- 
+2.43.0
+
