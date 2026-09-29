@@ -1,0 +1,238 @@
+From 6aa1a226525922c3f6b4a60c103c0e0d28f748d2 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 13:20:13 +0200
+Subject: [PATCH] ac/qt: "Connect as a Nintendo Zone hotspot" option
+
+The 3DS recognises a Nintendo Zone by the access point: an open network
+named "NintendoSpotPass1" is the EUR Nintendo Zone hotspot in the system's
+hotspot list (3dbrew "Nintendo Zone"; also how SatellaZone's readme makes
+the EUR Nintendo Zone app appear). Tangelo's virtual access point is
+called "Tangelo", so games that only handed out gifts at a Nintendo Zone
+(e.g. Animal Crossing: New Leaf at the post office) refuse.
+
+New checkbox in Configure > General > Network > SpotPass, "Connect as a
+Nintendo Zone hotspot" (setting nintendo_zone_mode, off by default).
+When on:
+- GetCurrentAPInfo reports SSID "NintendoSpotPass1";
+- GetNZoneApNumService fills in an ApNum and service name (placeholders;
+  the real values came from Nintendo's hotspot list);
+- GetConnectingLocation reports 1 (assumed to mean Nintendo Zone) unless
+  the hidden ac_connecting_location setting overrides it.
+When off, everything behaves as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ CMakeModules/GenerateSettingKeys.cmake        |  1 +
+ src/android/app/src/main/jni/config.cpp       |  1 +
+ src/citra_qt/configuration/config.cpp         |  2 +
+ .../configuration/configure_network.cpp       |  2 +
+ .../configuration/configure_network.ui        | 11 +++++
+ src/common/settings.h                         |  2 +
+ src/core/hle/service/ac/ac.cpp                | 41 +++++++++++++++----
+ 7 files changed, 51 insertions(+), 9 deletions(-)
+
+diff --git a/CMakeModules/GenerateSettingKeys.cmake b/CMakeModules/GenerateSettingKeys.cmake
+index f1b8534..3c02856 100644
+--- a/CMakeModules/GenerateSettingKeys.cmake
++++ b/CMakeModules/GenerateSettingKeys.cmake
+@@ -151,6 +151,7 @@ foreach(KEY IN ITEMS
+     "use_custom_spotpass_server"
+     "spotpass_server_url"
+     "ac_connecting_location"
++    "nintendo_zone_mode"
+     "check_for_update_on_start"
+     "update_check_channel"
+ )
+diff --git a/src/android/app/src/main/jni/config.cpp b/src/android/app/src/main/jni/config.cpp
+index 2511eff..a647ced 100644
+--- a/src/android/app/src/main/jni/config.cpp
++++ b/src/android/app/src/main/jni/config.cpp
+@@ -334,6 +334,7 @@ void Config::ReadValues() {
+     ReadSetting("WebService", Settings::values.use_custom_spotpass_server);
+     ReadSetting("WebService", Settings::values.spotpass_server_url);
+     ReadSetting("WebService", Settings::values.ac_connecting_location);
++    ReadSetting("WebService", Settings::values.nintendo_zone_mode);
+ }
+ 
+ void Config::Reload() {
+diff --git a/src/citra_qt/configuration/config.cpp b/src/citra_qt/configuration/config.cpp
+index 83ca78f..4b7eefe 100644
+--- a/src/citra_qt/configuration/config.cpp
++++ b/src/citra_qt/configuration/config.cpp
+@@ -923,6 +923,7 @@ void QtConfig::ReadWebServiceValues() {
+     ReadBasicSetting(Settings::values.use_custom_spotpass_server);
+     ReadBasicSetting(Settings::values.spotpass_server_url);
+     ReadBasicSetting(Settings::values.ac_connecting_location);
++    ReadBasicSetting(Settings::values.nintendo_zone_mode);
+ 
+     qt_config->endGroup();
+ }
+@@ -1459,6 +1460,7 @@ void QtConfig::SaveWebServiceValues() {
+     WriteBasicSetting(Settings::values.use_custom_spotpass_server);
+     WriteBasicSetting(Settings::values.spotpass_server_url);
+     WriteBasicSetting(Settings::values.ac_connecting_location);
++    WriteBasicSetting(Settings::values.nintendo_zone_mode);
+ 
+     qt_config->endGroup();
+ }
+diff --git a/src/citra_qt/configuration/configure_network.cpp b/src/citra_qt/configuration/configure_network.cpp
+index eafe865..6b850b9 100644
+--- a/src/citra_qt/configuration/configure_network.cpp
++++ b/src/citra_qt/configuration/configure_network.cpp
+@@ -39,6 +39,7 @@ void ConfigureWeb::SetConfiguration() {
+     ui->spotpass_url_lineedit->setText(
+         QString::fromStdString(Settings::values.spotpass_server_url.GetValue()));
+     UpdateSpotPassFields(custom_spotpass);
++    ui->nintendo_zone_checkbox->setChecked(Settings::values.nintendo_zone_mode.GetValue());
+ 
+ #ifdef USE_DISCORD_PRESENCE
+     ui->toggle_discordrpc->setChecked(UISettings::values.enable_discord_presence.GetValue());
+@@ -55,6 +56,7 @@ void ConfigureWeb::ApplyConfiguration() {
+     Settings::values.use_custom_spotpass_server = ui->spotpass_custom_radio->isChecked();
+     Settings::values.spotpass_server_url =
+         ui->spotpass_url_lineedit->text().trimmed().toStdString();
++    Settings::values.nintendo_zone_mode = ui->nintendo_zone_checkbox->isChecked();
+ }
+ 
+ void ConfigureWeb::UpdateSpotPassFields(bool custom) {
+diff --git a/src/citra_qt/configuration/configure_network.ui b/src/citra_qt/configuration/configure_network.ui
+index cc2e460..8d758a4 100644
+--- a/src/citra_qt/configuration/configure_network.ui
++++ b/src/citra_qt/configuration/configure_network.ui
+@@ -93,6 +93,16 @@
+         </property>
+        </widget>
+       </item>
++      <item>
++       <widget class="QCheckBox" name="nintendo_zone_checkbox">
++        <property name="text">
++         <string>Connect as a Nintendo Zone hotspot</string>
++        </property>
++        <property name="toolTip">
++         <string>Games see the virtual access point as a Nintendo Zone (network name NintendoSpotPass1), e.g. for gifts that were only handed out at Nintendo Zone hotspots.</string>
++        </property>
++       </widget>
++      </item>
+       <item>
+        <widget class="QLabel" name="spotpass_hint_label">
+         <property name="text">
+@@ -128,6 +138,7 @@
+   <tabstop>spotpass_nintendo_radio</tabstop>
+   <tabstop>spotpass_custom_radio</tabstop>
+   <tabstop>spotpass_url_lineedit</tabstop>
++  <tabstop>nintendo_zone_checkbox</tabstop>
+  </tabstops>
+  <resources/>
+  <connections/>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index ec80ac3..2fb2ef5 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -666,6 +666,8 @@ struct Values {
+     /// Experimental: value ac:u GetConnectingLocation reports (0 = normal access point).
+     /// Games use it to tell a Nintendo Zone from other access points; meaning of values unknown.
+     Setting<u32> ac_connecting_location{0, Keys::ac_connecting_location};
++    /// Report the virtual access point as a Nintendo Zone hotspot (SSID "NintendoSpotPass1").
++    Setting<bool> nintendo_zone_mode{false, Keys::nintendo_zone_mode};
+ 
+     // Miscellaneous
+     Setting<std::string> log_filter{"*:Info", Keys::log_filter};
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 3b630a4..b11e651 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -29,6 +29,15 @@ SERIALIZE_EXPORT_IMPL(Service::AC::Module)
+ SERVICE_CONSTRUCT_IMPL(Service::AC::Module)
+ 
+ namespace Service::AC {
++namespace {
++/// SSID the 3DS treats as a Nintendo Zone hotspot (an open network with this name).
++constexpr std::string_view NintendoZoneSSID = "NintendoSpotPass1";
++
++bool IsNintendoZoneMode() {
++    return Settings::values.nintendo_zone_mode.GetValue();
++}
++} // namespace
++
+ void Module::Interface::CreateDefaultConfig(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+@@ -206,11 +215,13 @@ void Module::Interface::GetCurrentAPInfo(Kernel::HLERequestContext& ctx) {
+ 
+     // Layout from 3dbrew: 0x0 SSID length, 0x4 SSID (32 bytes), 0x24 BSSID (6 bytes), rest
+     // unknown. Tangelo has no real access point, so while "connected" it reports a fixed virtual
+-    // one; when not connected the structure is left empty.
++    // one; when not connected the structure is left empty. In Nintendo Zone mode the access point
++    // is named like a Nintendo Zone hotspot: an open network called "NintendoSpotPass1" is what
++    // the 3DS treats as one.
+     constexpr std::size_t APInfoSize = 0x34;
+     std::vector<u8> info(std::min<std::size_t>(size, APInfoSize), 0);
+     if (ac->ac_connected && info.size() == APInfoSize) {
+-        constexpr std::string_view ssid = "Tangelo";
++        const std::string_view ssid = IsNintendoZoneMode() ? NintendoZoneSSID : "Tangelo";
+         const u32 ssid_length = static_cast<u32>(ssid.size());
+         std::memcpy(info.data(), &ssid_length, sizeof(ssid_length));
+         std::memcpy(info.data() + 0x4, ssid.data(), ssid.size());
+@@ -223,7 +234,8 @@ void Module::Interface::GetCurrentAPInfo(Kernel::HLERequestContext& ctx) {
+     rb.Push(ResultSuccess);
+     rb.PushStaticBuffer(std::move(info), 0);
+ 
+-    LOG_DEBUG(Service_AC, "called, size=0x{:X}, connected={}", size, ac->ac_connected);
++    LOG_DEBUG(Service_AC, "called, size=0x{:X}, connected={}, nintendo_zone={}", size,
++              ac->ac_connected, IsNintendoZoneMode());
+ }
+ 
+ void Module::Interface::GetNZoneApNumService(Kernel::HLERequestContext& ctx) {
+@@ -232,15 +244,22 @@ void Module::Interface::GetNZoneApNumService(Kernel::HLERequestContext& ctx) {
+     rp.PopPID();
+ 
+     // Layout from 3dbrew: 0x0 ApNum (10 bytes), 0xA padding, 0xC service name (UTF-8, 24 bytes).
+-    // Nintendo Zone hotspots don't exist for Tangelo, so the structure is always empty.
++    // Empty unless Nintendo Zone mode is on; the values used then are placeholders, since the
++    // real ones came from Nintendo's hotspot list.
+     constexpr std::size_t NZoneInfoSize = 0x24;
+     std::vector<u8> info(std::min<std::size_t>(size, NZoneInfoSize), 0);
++    if (ac->ac_connected && IsNintendoZoneMode() && info.size() == NZoneInfoSize) {
++        constexpr std::string_view ap_num = "0000000001";
++        constexpr std::string_view service_name = "Nintendo Zone";
++        std::memcpy(info.data(), ap_num.data(), ap_num.size());
++        std::memcpy(info.data() + 0xC, service_name.data(), service_name.size());
++    }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+     rb.PushStaticBuffer(std::move(info), 0);
+ 
+-    LOG_DEBUG(Service_AC, "called, size=0x{:X}", size);
++    LOG_DEBUG(Service_AC, "called, size=0x{:X}, nintendo_zone={}", size, IsNintendoZoneMode());
+ }
+ 
+ void Module::Interface::GetConnectingLocation(Kernel::HLERequestContext& ctx) {
+@@ -248,15 +267,19 @@ void Module::Interface::GetConnectingLocation(Kernel::HLERequestContext& ctx) {
+     rp.PopPID();
+ 
+     // Asked by games that hand out Nintendo Zone gifts (e.g. Animal Crossing: New Leaf at the
+-    // post office) right after connecting. The reply layout isn't documented; a u32 is assumed
+-    // and its value comes from a hidden setting so values can be tried without rebuilding.
+-    const u32 location = Settings::values.ac_connecting_location.GetValue();
++    // post office) right after connecting. The reply layout isn't documented; a u32 is assumed.
++    // A non-zero hidden setting overrides the value so others can be tried without rebuilding;
++    // otherwise Nintendo Zone mode reports 1 (assumed to mean "Nintendo Zone") and normal mode 0.
++    const u32 override_location = Settings::values.ac_connecting_location.GetValue();
++    const u32 location =
++        override_location != 0 ? override_location : (IsNintendoZoneMode() ? 1u : 0u);
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+     rb.Push<u32>(location);
+ 
+-    LOG_INFO(Service_AC, "called, connected={}, reporting location {}", ac->ac_connected, location);
++    LOG_INFO(Service_AC, "called, connected={}, nintendo_zone={}, reporting location {}",
++             ac->ac_connected, IsNintendoZoneMode(), location);
+ }
+ 
+ void Module::Interface::IsConnected(Kernel::HLERequestContext& ctx) {
+-- 
+2.43.0
+

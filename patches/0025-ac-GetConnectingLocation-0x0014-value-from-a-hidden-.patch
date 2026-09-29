@@ -1,0 +1,168 @@
+From 9c9c4ef24f320d67fb25261bd68d66a682427066 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 03:42:10 +0200
+Subject: [PATCH] ac: GetConnectingLocation (0x0014), value from a hidden
+ setting
+
+Animal Crossing: New Leaf calls ac:u 0x0014 (GetConnectingLocation,
+undocumented) at the post office right after connecting, then reads the
+current access point, to decide whether a Nintendo Zone gift can be
+handed out ("It seems the present isn't being delivered with the access
+point you're connected to right now."). The command wasn't in the
+handler table, so the generic fallback replied and the game read leftover
+request data (0x0C, the ProcessID placeholder) as the answer.
+
+It now replies with a result and a u32. The meaning of the values is
+unknown, so the value comes from a hidden setting,
+[WebService] ac_connecting_location (default 0), which can be changed in
+the config file to find the value that means "Nintendo Zone". Every call
+is logged at Info level. Registered on ac:u and ac:i.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ CMakeModules/GenerateSettingKeys.cmake  |  1 +
+ src/android/app/src/main/jni/config.cpp |  1 +
+ src/citra_qt/configuration/config.cpp   |  2 ++
+ src/common/settings.h                   |  3 +++
+ src/core/hle/service/ac/ac.cpp          | 16 ++++++++++++++++
+ src/core/hle/service/ac/ac.h            | 12 ++++++++++++
+ src/core/hle/service/ac/ac_i.cpp        |  1 +
+ src/core/hle/service/ac/ac_u.cpp        |  1 +
+ 8 files changed, 37 insertions(+)
+
+diff --git a/CMakeModules/GenerateSettingKeys.cmake b/CMakeModules/GenerateSettingKeys.cmake
+index 527f5a2..f1b8534 100644
+--- a/CMakeModules/GenerateSettingKeys.cmake
++++ b/CMakeModules/GenerateSettingKeys.cmake
+@@ -150,6 +150,7 @@ foreach(KEY IN ITEMS
+     "network_token"
+     "use_custom_spotpass_server"
+     "spotpass_server_url"
++    "ac_connecting_location"
+     "check_for_update_on_start"
+     "update_check_channel"
+ )
+diff --git a/src/android/app/src/main/jni/config.cpp b/src/android/app/src/main/jni/config.cpp
+index 127bc8b..2511eff 100644
+--- a/src/android/app/src/main/jni/config.cpp
++++ b/src/android/app/src/main/jni/config.cpp
+@@ -333,6 +333,7 @@ void Config::ReadValues() {
+     ReadSetting("WebService", Settings::values.network_token);
+     ReadSetting("WebService", Settings::values.use_custom_spotpass_server);
+     ReadSetting("WebService", Settings::values.spotpass_server_url);
++    ReadSetting("WebService", Settings::values.ac_connecting_location);
+ }
+ 
+ void Config::Reload() {
+diff --git a/src/citra_qt/configuration/config.cpp b/src/citra_qt/configuration/config.cpp
+index 3fa9a00..83ca78f 100644
+--- a/src/citra_qt/configuration/config.cpp
++++ b/src/citra_qt/configuration/config.cpp
+@@ -922,6 +922,7 @@ void QtConfig::ReadWebServiceValues() {
+     ReadBasicSetting(Settings::values.network_token);
+     ReadBasicSetting(Settings::values.use_custom_spotpass_server);
+     ReadBasicSetting(Settings::values.spotpass_server_url);
++    ReadBasicSetting(Settings::values.ac_connecting_location);
+ 
+     qt_config->endGroup();
+ }
+@@ -1457,6 +1458,7 @@ void QtConfig::SaveWebServiceValues() {
+     WriteBasicSetting(Settings::values.network_token);
+     WriteBasicSetting(Settings::values.use_custom_spotpass_server);
+     WriteBasicSetting(Settings::values.spotpass_server_url);
++    WriteBasicSetting(Settings::values.ac_connecting_location);
+ 
+     qt_config->endGroup();
+ }
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 2f066c3..ec80ac3 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -663,6 +663,9 @@ struct Values {
+     /// Send SpotPass (BOSS) traffic for Nintendo's servers to spotpass_server_url instead.
+     Setting<bool> use_custom_spotpass_server{false, Keys::use_custom_spotpass_server};
+     Setting<std::string> spotpass_server_url{"", Keys::spotpass_server_url};
++    /// Experimental: value ac:u GetConnectingLocation reports (0 = normal access point).
++    /// Games use it to tell a Nintendo Zone from other access points; meaning of values unknown.
++    Setting<u32> ac_connecting_location{0, Keys::ac_connecting_location};
+ 
+     // Miscellaneous
+     Setting<std::string> log_filter{"*:Info", Keys::log_filter};
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 40f40b3..3b630a4 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -243,6 +243,22 @@ void Module::Interface::GetNZoneApNumService(Kernel::HLERequestContext& ctx) {
+     LOG_DEBUG(Service_AC, "called, size=0x{:X}", size);
+ }
+ 
++void Module::Interface::GetConnectingLocation(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    rp.PopPID();
++
++    // Asked by games that hand out Nintendo Zone gifts (e.g. Animal Crossing: New Leaf at the
++    // post office) right after connecting. The reply layout isn't documented; a u32 is assumed
++    // and its value comes from a hidden setting so values can be tried without rebuilding.
++    const u32 location = Settings::values.ac_connecting_location.GetValue();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(location);
++
++    LOG_INFO(Service_AC, "called, connected={}, reporting location {}", ac->ac_connected, location);
++}
++
+ void Module::Interface::IsConnected(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     u32 unk = rp.Pop<u32>();
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index c4700cc..29711bd 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -192,6 +192,18 @@ public:
+          */
+         void GetNZoneApNumService(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::GetConnectingLocation service function (undocumented on 3dbrew).
++         *  Inputs:
++         *      1 : ProcessID header (0x20)
++         *      2 : ProcessID
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2 : Location of the current connection (experimental, see
++         *          Settings::values.ac_connecting_location)
++         */
++        void GetConnectingLocation(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::SetClientVersion service function
+          *  Inputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index e6ce6d3..2533269 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -22,6 +22,7 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x000E, &AC_I::GetCurrentAPInfo, "GetCurrentAPInfo"},
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+         {0x0011, &AC_I::GetNZoneApNumService, "GetNZoneApNumService"},
++        {0x0014, &AC_I::GetConnectingLocation, "GetConnectingLocation"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0027, &AC_I::GetInfraPriority, "GetInfraPriority"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index af44539..3211847 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -22,6 +22,7 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x000E, &AC_U::GetCurrentAPInfo, "GetCurrentAPInfo"},
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+         {0x0011, &AC_U::GetNZoneApNumService, "GetNZoneApNumService"},
++        {0x0014, &AC_U::GetConnectingLocation, "GetConnectingLocation"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0027, &AC_U::GetInfraPriority, "GetInfraPriority"},
+-- 
+2.43.0
+
