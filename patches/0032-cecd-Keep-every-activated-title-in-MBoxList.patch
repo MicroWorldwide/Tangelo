@@ -1,0 +1,286 @@
+From 123542d18d3b8775d734f7fdd7d76619a3d4c078 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 18:28:28 +0200
+Subject: [PATCH] cecd: Keep every activated title in MBoxList
+
+Titles activating StreetPass write /CEC/MBoxList____ with only their own box (Mario &
+Sonic writes an empty list). HLE CECD took that buffer as the whole list and added
+the title, so the last title to activate StreetPass removed all others: System
+Settings > StreetPass Management showed only Mario & Sonic, while Mii Plaza and
+Animal Crossing still had their boxes.
+
+The list is now rebuilt from the box folders in /CEC every time it is written:
+listed boxes that still have a folder keep their order, other folders follow, then
+the title writing the list (at most 24).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cecd/cecd.cpp          | 147 ++++++++++++--------
+ src/core/hle/service/cecd/cecd.h            |  13 ++
+ src/tests/core/hle/service/cecd_message.cpp |  25 ++++
+ 3 files changed, 124 insertions(+), 61 deletions(-)
+
+diff --git a/src/core/hle/service/cecd/cecd.cpp b/src/core/hle/service/cecd/cecd.cpp
+index 9851db3..72c1497 100644
+--- a/src/core/hle/service/cecd/cecd.cpp
++++ b/src/core/hle/service/cecd/cecd.cpp
+@@ -2,14 +2,16 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
++#include <cctype>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/unique_ptr.hpp>
+-#include <algorithm>
+ #include <cryptopp/base64.h>
+ #include <cryptopp/hmac.h>
+ #include <cryptopp/osrng.h>
+ #include <cryptopp/sha.h>
+ #include <fmt/format.h>
++#include <fmt/ranges.h>
+ #include "common/archives.h"
+ #include "common/common_paths.h"
+ #include "common/file_util.h"
+@@ -983,7 +985,6 @@ std::string Module::GetCecCommandAsString(const CecCommand command) const {
+ void Module::CheckAndUpdateFile(const CecDataPathType path_type, const u32 ncch_program_id,
+                                 std::vector<u8>& file_buffer) {
+     constexpr u32 max_num_boxes = 24;
+-    constexpr u32 name_size = 16;      // fixed size 16 characters long
+     constexpr u32 valid_name_size = 8; // 8 characters are valid, the rest are null
+     const u32 file_size = static_cast<u32>(file_buffer.size());
+ 
+@@ -1019,68 +1020,46 @@ void Module::CheckAndUpdateFile(const CecDataPathType path_type, const u32 ncch_
+             mbox_list_header.version = 0x01;
+         }
+ 
+-        if (mbox_list_header.num_boxes > 24) {
+-            LOG_DEBUG(Service_CECD, "CecMBoxListHeader number of boxes is too large: {}",
+-                      mbox_list_header.num_boxes);
+-        } else {
+-            std::vector<u8> name_buffer(name_size);
+-            std::memset(name_buffer.data(), 0, name_size);
+-
+-            if (ncch_program_id != 0) {
+-                std::string name = fmt::format("{:08x}", ncch_program_id);
+-                std::memcpy(name_buffer.data(), name.data(), name.size());
+-
+-                bool already_activated = false;
+-                for (auto i = 0; i < mbox_list_header.num_boxes; i++) {
+-                    // Box names start at offset 0xC, are 16 char long, first 8 id, last 8 null
+-                    if (std::memcmp(name_buffer.data(), &mbox_list_header.box_names[i],
+-                                    valid_name_size) == 0) {
+-                        LOG_DEBUG(Service_CECD, "Title already activated");
+-                        already_activated = true;
+-                    }
+-                };
+-
+-                if (!already_activated) {
+-                    if (mbox_list_header.num_boxes < max_num_boxes) { // max boxes
+-                        LOG_DEBUG(Service_CECD, "Adding title to mboxlist____: {}", name);
+-                        std::memcpy(&mbox_list_header.box_names[mbox_list_header.num_boxes],
+-                                    name_buffer.data(), name_size);
+-                        mbox_list_header.num_boxes++;
+-                    }
+-                }
+-            } else { // ncch_program_id == 0, remove/update activated boxes
+-                /// We need to read the /CEC directory to find out which titles, if any,
+-                /// are activated. The num_of_titles = (total_read_count) - 1, to adjust for
+-                /// the MBoxList____ file that is present in the directory as well.
+-                FileSys::Path root_path(
+-                    GetCecDataPathTypeAsString(CecDataPathType::RootDir, 0).data());
+-
+-                auto dir_result = cecd_system_save_data_archive->OpenDirectory(root_path);
+-
+-                auto root_dir = std::move(dir_result).Unwrap();
+-                std::vector<FileSys::Entry> entries(max_num_boxes + 1); // + 1 mboxlist
+-                const u32 entry_count = root_dir->Read(max_num_boxes + 1, entries.data());
+-                root_dir->Close();
+-
+-                LOG_DEBUG(Service_CECD, "Number of entries found in /CEC: {}", entry_count);
+-
+-                std::string mbox_list_name("MBoxList____");
+-                std::string file_name;
+-                std::u16string u16_filename;
+-
+-                // Loop through entries but don't add mboxlist____ to itself.
+-                for (u32 i = 0; i < entry_count; i++) {
+-                    u16_filename = std::u16string(entries[i].filename);
+-                    file_name = Common::UTF16ToUTF8(u16_filename);
+-
+-                    if (mbox_list_name.compare(file_name) != 0) {
+-                        LOG_DEBUG(Service_CECD, "Adding title to mboxlist____: {}", file_name);
+-                        std::memcpy(&mbox_list_header.box_names[mbox_list_header.num_boxes++],
+-                                    file_name.data(), valid_name_size);
+-                    }
++        // Titles write the list with only their own box in it (or nothing at all), so rebuild it
++        // from the box folders in /CEC; otherwise the last title to activate StreetPass would
++        // remove every other title from the list.
++        std::vector<std::string> listed;
++        const u32 listed_count = std::min<u32>(mbox_list_header.num_boxes, max_num_boxes);
++        for (u32 i = 0; i < listed_count; i++) {
++            const auto& box = mbox_list_header.box_names[i];
++            const auto end = std::find(box.begin(), box.begin() + valid_name_size, u8{0});
++            listed.emplace_back(box.begin(), end);
++        }
++
++        std::vector<std::string> box_dirs;
++        FileSys::Path root_path(GetCecDataPathTypeAsString(CecDataPathType::RootDir, 0).data());
++        auto dir_result = cecd_system_save_data_archive->OpenDirectory(root_path);
++        if (dir_result.Succeeded()) {
++            auto root_dir = std::move(dir_result).Unwrap();
++            std::vector<FileSys::Entry> entries(64);
++            const u32 entry_count =
++                root_dir->Read(static_cast<u32>(entries.size()), entries.data());
++            root_dir->Close();
++            for (u32 i = 0; i < entry_count; i++) {
++                if (entries[i].is_directory) {
++                    box_dirs.push_back(Common::UTF16ToUTF8(std::u16string(entries[i].filename)));
+                 }
+             }
+         }
++
++        const std::string add_box =
++            ncch_program_id != 0 ? fmt::format("{:08x}", ncch_program_id) : std::string{};
++        const auto boxes = MergeMBoxList(listed, box_dirs, add_box, max_num_boxes);
++
++        mbox_list_header.num_boxes = static_cast<u16>(boxes.size());
++        for (auto& box : mbox_list_header.box_names) {
++            box.fill(0);
++        }
++        for (std::size_t i = 0; i < boxes.size(); i++) {
++            std::memcpy(mbox_list_header.box_names[i].data(), boxes[i].data(), boxes[i].size());
++        }
++        LOG_DEBUG(Service_CECD, "MBoxList____: {} box(es): {}", boxes.size(),
++                  fmt::join(boxes, ", "));
+         std::memcpy(file_buffer.data(), &mbox_list_header, sizeof(CecMBoxListHeader));
+         break;
+     }
+@@ -1563,6 +1542,52 @@ Module::Module(Core::System& system) : system(system) {
+ 
+ Module::~Module() = default;
+ 
++std::vector<std::string> MergeMBoxList(const std::vector<std::string>& listed,
++                                       const std::vector<std::string>& box_dirs,
++                                       std::string_view add_box, std::size_t max_boxes) {
++    const auto normalize = [](std::string_view name) {
++        std::string result(name.substr(0, std::min<std::size_t>(name.size(), 8)));
++        std::transform(result.begin(), result.end(), result.begin(),
++                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++        return result;
++    };
++    const auto is_box_name = [](const std::string& name) {
++        return name.size() == 8 && std::all_of(name.begin(), name.end(), [](unsigned char c) {
++                   return std::isxdigit(c) != 0;
++               });
++    };
++
++    std::vector<std::string> dirs;
++    for (const auto& dir : box_dirs) {
++        const std::string name = normalize(dir);
++        if (dir.size() == 8 && is_box_name(name)) {
++            dirs.push_back(name);
++        }
++    }
++    std::sort(dirs.begin(), dirs.end());
++
++    std::vector<std::string> result;
++    const auto add = [&](const std::string& name) {
++        if (result.size() < max_boxes && is_box_name(name) &&
++            std::find(result.begin(), result.end(), name) == result.end()) {
++            result.push_back(name);
++        }
++    };
++    for (const auto& entry : listed) {
++        const std::string name = normalize(entry);
++        if (std::find(dirs.begin(), dirs.end(), name) != dirs.end()) {
++            add(name);
++        }
++    }
++    for (const auto& name : dirs) {
++        add(name);
++    }
++    if (!add_box.empty()) {
++        add(normalize(add_box));
++    }
++    return result;
++}
++
+ void InstallInterfaces(Core::System& system) {
+     auto& service_manager = system.ServiceManager();
+     auto cecd = std::make_shared<Module>(system);
+diff --git a/src/core/hle/service/cecd/cecd.h b/src/core/hle/service/cecd/cecd.h
+index 9fe7e75..6be3045 100644
+--- a/src/core/hle/service/cecd/cecd.h
++++ b/src/core/hle/service/cecd/cecd.h
+@@ -7,6 +7,8 @@
+ #include <array>
+ #include <memory>
+ #include <span>
++#include <string>
++#include <string_view>
+ #include <vector>
+ #include "common/bit_field.h"
+ #include "common/common_funcs.h"
+@@ -658,6 +660,17 @@ private:
+ /// Initialize CECD service(s)
+ void InstallInterfaces(Core::System& system);
+ 
++/**
++ * The boxes for /CEC/MBoxList____ (the StreetPass titles shown in System Settings).
++ * A title writing the list only knows about its own box, so the list is rebuilt from the box
++ * folders in /CEC: first the `listed` boxes that still have a folder (keeping their order), then
++ * the other folders, then `add_box` (the title activating StreetPass), at most `max_boxes`.
++ * Names are the 8-digit hex box IDs, compared case-insensitively.
++ */
++std::vector<std::string> MergeMBoxList(const std::vector<std::string>& listed,
++                                       const std::vector<std::string>& box_dirs,
++                                       std::string_view add_box, std::size_t max_boxes = 24);
++
+ } // namespace Service::CECD
+ 
+ SERVICE_CONSTRUCT(Service::CECD::Module)
+diff --git a/src/tests/core/hle/service/cecd_message.cpp b/src/tests/core/hle/service/cecd_message.cpp
+index e7708b2..f1ccd8b 100644
+--- a/src/tests/core/hle/service/cecd_message.cpp
++++ b/src/tests/core/hle/service/cecd_message.cpp
+@@ -5,6 +5,7 @@
+ #include <cstring>
+ #include <vector>
+ #include <catch2/catch_test_macros.hpp>
++#include <fmt/format.h>
+ #include "core/hle/service/cecd/cecd.h"
+ 
+ using Service::CECD::Module;
+@@ -78,3 +79,27 @@ TEST_CASE("CECD gives new OutBox messages an ID and creation time", "[core][cecd
+     CHECK(result.message_id == new_id);
+     CHECK(std::memcmp(&result.create_time, &now, sizeof(now)) == 0);
+ }
++
++TEST_CASE("MBoxList keeps every activated StreetPass box", "[service][cecd]") {
++    using Service::CECD::MergeMBoxList;
++    // Mario & Sonic writes the list with nothing in it; Mii Plaza and ACNL have box folders.
++    const std::vector<std::string> dirs{"0014a400", "00020800", "00198f00"};
++    CHECK(MergeMBoxList({}, dirs, "0014a400") ==
++          std::vector<std::string>{"00020800", "0014a400", "00198f00"});
++
++    // Existing order is kept, boxes without a folder are dropped, the new box goes last.
++    CHECK(
++        MergeMBoxList({"00198F00", "00020800", "deadbeef"}, {"00020800", "00198f00"}, "0014a400") ==
++        std::vector<std::string>{"00198f00", "00020800", "0014a400"});
++
++    // Rebuild without a title (ncch_program_id 0), no duplicates, non-box folders ignored.
++    CHECK(MergeMBoxList({"00020800", "00020800"}, {"00020800", "TMP", "MBoxList____"}, "") ==
++          std::vector<std::string>{"00020800"});
++
++    // At most 24 boxes.
++    std::vector<std::string> many;
++    for (int i = 0; i < 30; i++) {
++        many.push_back(fmt::format("{:08x}", 0x1000 + i));
++    }
++    CHECK(MergeMBoxList({}, many, "").size() == 24);
++}
+-- 
+2.43.0
+
