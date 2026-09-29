@@ -1,0 +1,1464 @@
+From 5a8d478eeab5c3a5df9c69e66c5a9bc22596c59e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 15:23:47 +0200
+Subject: [PATCH] boss: Built-in SpotPass downloads
+
+Without the BOSS module (online LLE off), SpotPass tasks never ran: StartTask and
+StartTaskImmediate were stubs, and on a 3DS most tasks run in the background or in
+sleep mode, which never happens in the emulator.
+
+- StartTask/StartTaskImmediate download the task's URL on a worker thread (through
+  the custom SpotPass server when enabled), decrypt the SpotPass container (key slot
+  0x38) and store each payload in the game's SpotPass extdata, replacing older
+  versions of the same NsData ID. Unchanged files are left alone.
+- GetTaskState reports running (2), success (0) or failed (7). GetTaskStatus loads
+  the task's properties, so the game can read the state, HTTP status, last success
+  time and Last-Modified with ReceiveProperty.
+- RegisterImmediateTask registers the task.
+- With a custom SpotPass server set, each registered task runs once per Tangelo
+  start, when the game opens its SpotPass session or registers the task.
+- Downloaded files are "new" until the game clears the flag; the NsData new flag
+  is kept per NsData ID. The new-arrival flag is set after a download.
+- Task IDs are cut off at the first NUL, so tasks loaded from BOSS_SV.db match the
+  ones the game registers.
+- Running downloads stop when emulation stops.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/CMakeLists.txt                       |   4 +
+ src/core/hle/service/boss/boss.cpp            | 111 +++++--
+ src/core/hle/service/boss/boss.h              |   5 +-
+ src/core/hle/service/boss/boss_container.cpp  |  94 ++++++
+ src/core/hle/service/boss/boss_container.h    |  43 +++
+ src/core/hle/service/boss/boss_download.cpp   |  93 ++++++
+ src/core/hle/service/boss/boss_download.h     |  34 ++
+ src/core/hle/service/boss/online_service.cpp  | 313 +++++++++++++++++-
+ src/core/hle/service/boss/online_service.h    |  77 ++++-
+ src/tests/CMakeLists.txt                      |   4 +-
+ src/tests/core/hle/service/boss_container.cpp | 123 +++++++
+ src/tests/core/hle/service/boss_download.cpp  | 146 ++++++++
+ 12 files changed, 1013 insertions(+), 34 deletions(-)
+ create mode 100644 src/core/hle/service/boss/boss_container.cpp
+ create mode 100644 src/core/hle/service/boss/boss_container.h
+ create mode 100644 src/core/hle/service/boss/boss_download.cpp
+ create mode 100644 src/core/hle/service/boss/boss_download.h
+ create mode 100644 src/tests/core/hle/service/boss_container.cpp
+ create mode 100644 src/tests/core/hle/service/boss_download.cpp
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 5188fba..385aeb9 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -248,6 +248,10 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
+     hle/service/boss/boss_p.h
+     hle/service/boss/boss_u.cpp
+     hle/service/boss/boss_u.h
++    hle/service/boss/boss_container.cpp
++    hle/service/boss/boss_container.h
++    hle/service/boss/boss_download.cpp
++    hle/service/boss/boss_download.h
+     hle/service/boss/boss_storage.cpp
+     hle/service/boss/boss_storage.h
+     hle/service/boss/online_service.cpp
+diff --git a/src/core/hle/service/boss/boss.cpp b/src/core/hle/service/boss/boss.cpp
+index b523579..eef487f 100644
+--- a/src/core/hle/service/boss/boss.cpp
++++ b/src/core/hle/service/boss/boss.cpp
+@@ -66,6 +66,9 @@ void Module::Interface::InitializeSession(Kernel::HLERequestContext& ctx) {
+     }
+ 
+     const auto result = session_data->online_service->InitializeSession(program_id);
++    if (result.IsSuccess()) {
++        session_data->online_service->RunTasksAtStart(boss->spotpass_state);
++    }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(result);
+@@ -157,9 +160,14 @@ void Module::Interface::GetNewArrivalFlag(Kernel::HLERequestContext& ctx) {
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push<u8>(boss->new_arrival_flag);
++    u8 new_arrival = boss->new_arrival_flag;
++    {
++        std::scoped_lock lock(boss->spotpass_state->mutex);
++        new_arrival |= boss->spotpass_state->new_arrival ? 1 : 0;
++    }
++    rb.Push<u8>(new_arrival);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) new_arrival_flag={}", boss->new_arrival_flag);
++    LOG_DEBUG(Service_BOSS, "new_arrival_flag={}", new_arrival);
+ }
+ 
+ void Module::Interface::RegisterNewArrivalEvent(Kernel::HLERequestContext& ctx) {
+@@ -203,7 +211,8 @@ void Module::Interface::RegisterTask(Kernel::HLERequestContext& ctx) {
+     if (online_service == nullptr) {
+         return;
+     }
+-    online_service->RegisterTask(size, buffer);
++    const std::string task_id = online_service->RegisterTask(size, buffer);
++    online_service->RunTasksAtStart(boss->spotpass_state, task_id);
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+@@ -507,11 +516,20 @@ void Module::Interface::StartTask(Kernel::HLERequestContext& ctx) {
+     const u32 size = rp.Pop<u32>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    const std::string task_id = OnlineService::ReadTaskId(size, buffer);
++    if (!online_service->StartTask(task_id, boss->spotpass_state)) {
++        LOG_WARNING(Service_BOSS, "Task '{}' isn't registered", task_id);
++    }
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) size={:#010x}", size);
++    LOG_DEBUG(Service_BOSS, "task_id={}", task_id);
+ }
+ 
+ void Module::Interface::StartTaskImmediate(Kernel::HLERequestContext& ctx) {
+@@ -519,11 +537,20 @@ void Module::Interface::StartTaskImmediate(Kernel::HLERequestContext& ctx) {
+     const u32 size = rp.Pop<u32>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    const std::string task_id = OnlineService::ReadTaskId(size, buffer);
++    if (!online_service->StartTask(task_id, boss->spotpass_state)) {
++        LOG_WARNING(Service_BOSS, "Task '{}' isn't registered", task_id);
++    }
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) size={:#010x}", size);
++    LOG_DEBUG(Service_BOSS, "task_id={}", task_id);
+ }
+ 
+ void Module::Interface::CancelTask(Kernel::HLERequestContext& ctx) {
+@@ -554,14 +581,23 @@ void Module::Interface::GetTaskState(Kernel::HLERequestContext& ctx) {
+     const u8 state = rp.Pop<u8>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    const std::string task_id = OnlineService::ReadTaskId(size, buffer);
++    // Tasks that never ran report 0 (success), as before.
++    const TaskState task_state = online_service->GetTaskState(task_id).value_or(TaskState::Success);
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(4, 2);
+     rb.Push(ResultSuccess);
+-    rb.Push<u8>(0);  /// TaskStatus
+-    rb.Push<u32>(0); /// Current state value for task PropertyID 0x4
+-    rb.Push<u8>(0);  /// unknown, usually 0
++    rb.Push<u8>(static_cast<u8>(task_state)); /// TaskStatus
++    rb.Push<u32>(0);                          /// Current state value for task PropertyID 0x4
++    rb.Push<u8>(0);                           /// unknown, usually 0
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) size={:#010x}, state={:#06x}", size, state);
++    LOG_DEBUG(Service_BOSS, "task_id={}, state={:#06x} -> {}", task_id, state,
++              static_cast<u8>(task_state));
+ }
+ 
+ void Module::Interface::GetTaskResult(Kernel::HLERequestContext& ctx) {
+@@ -601,13 +637,21 @@ void Module::Interface::GetTaskStatus(Kernel::HLERequestContext& ctx) {
+     const u8 unk_param3 = rp.Pop<u8>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    // The task's results (state, HTTP status, last success, ...) are read with ReceiveProperty.
++    const std::string task_id = OnlineService::ReadTaskId(size, buffer);
++    const bool found = online_service->LoadTaskProperties(task_id);
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
+     rb.Push(ResultSuccess);
+-    rb.Push<u8>(0); // stub 0 (8 bit value)
++    rb.Push<u8>(0); // step ID
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) size={:#010x}, unk_param2={:#04x}, unk_param3={:#04x}",
+-                size, unk_param2, unk_param3);
++    LOG_DEBUG(Service_BOSS, "task_id={}{}, unk_param2={:#04x}, unk_param3={:#04x}", task_id,
++              found ? "" : " (not registered)", unk_param2, unk_param3);
+ }
+ 
+ void Module::Interface::GetTaskError(Kernel::HLERequestContext& ctx) {
+@@ -727,26 +771,38 @@ void Module::Interface::GetNsDataAdditionalInfo(Kernel::HLERequestContext& ctx)
+ 
+ void Module::Interface::SetNsDataNewFlag(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+-    const u32 unk_param1 = rp.Pop<u32>();
+-    boss->ns_data_new_flag = rp.Pop<u8>();
++    const u32 ns_data_id = rp.Pop<u32>();
++    const u8 flag = rp.Pop<u8>();
++    {
++        std::scoped_lock lock(boss->spotpass_state->mutex);
++        boss->spotpass_state->ns_data_new_flags[ns_data_id] = flag;
++    }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(ResultSuccess);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) unk_param1={:#010x}, ns_data_new_flag={:#04x}", unk_param1,
+-                boss->ns_data_new_flag);
++    LOG_DEBUG(Service_BOSS, "ns_data_id={:#010x}, ns_data_new_flag={:#04x}", ns_data_id, flag);
+ }
+ 
+ void Module::Interface::GetNsDataNewFlag(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+-    const u32 unk_param1 = rp.Pop<u32>();
++    const u32 ns_data_id = rp.Pop<u32>();
++    // Files downloaded by Tangelo are new until the game clears the flag; other files keep
++    // the old behaviour (one flag for all).
++    u8 flag = boss->ns_data_new_flag;
++    {
++        std::scoped_lock lock(boss->spotpass_state->mutex);
++        const auto& flags = boss->spotpass_state->ns_data_new_flags;
++        if (const auto it = flags.find(ns_data_id); it != flags.end()) {
++            flag = it->second;
++        }
++    }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push<u8>(boss->ns_data_new_flag);
++    rb.Push<u8>(flag);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) unk_param1={:#010x}, ns_data_new_flag={:#04x}", unk_param1,
+-                boss->ns_data_new_flag);
++    LOG_DEBUG(Service_BOSS, "ns_data_id={:#010x}, ns_data_new_flag={:#04x}", ns_data_id, flag);
+ }
+ 
+ void Module::Interface::GetNsDataLastUpdate(Kernel::HLERequestContext& ctx) {
+@@ -874,12 +930,19 @@ void Module::Interface::RegisterImmediateTask(Kernel::HLERequestContext& ctx) {
+     const u8 unk_param3 = rp.Pop<u8>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    // Registered like RegisterTask; the game runs it with StartTaskImmediate.
++    const std::string task_id = online_service->RegisterTask(size, buffer);
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+     rb.PushMappedBuffer(buffer);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) size={:#010x}, unk_param2={:#04x}, unk_param3={:#04x}",
+-                size, unk_param2, unk_param3);
++    LOG_DEBUG(Service_BOSS, "task_id={}, unk_param2={:#04x}, unk_param3={:#04x}", task_id,
++              unk_param2, unk_param3);
+ }
+ 
+ void Module::Interface::SetTaskQuery(Kernel::HLERequestContext& ctx) {
+@@ -1079,6 +1142,10 @@ Module::Module(Core::System& system_) : system(system_) {
+         system.Kernel().CreateEvent(Kernel::ResetType::OneShot, "BOSS::task_finish_event");
+ }
+ 
++Module::~Module() {
++    spotpass_state->Shutdown();
++}
++
+ void InstallInterfaces(Core::System& system) {
+     auto& service_manager = system.ServiceManager();
+     auto boss = std::make_shared<Module>(system);
+diff --git a/src/core/hle/service/boss/boss.h b/src/core/hle/service/boss/boss.h
+index 46353a3..01a4801 100644
+--- a/src/core/hle/service/boss/boss.h
++++ b/src/core/hle/service/boss/boss.h
+@@ -25,7 +25,7 @@ namespace Service::BOSS {
+ class Module final {
+ public:
+     explicit Module(Core::System& system_);
+-    ~Module() = default;
++    ~Module();
+ 
+     struct SessionData : public Kernel::SessionRequestHandler::SessionDataBase {
+         std::shared_ptr<OnlineService> online_service{};
+@@ -985,6 +985,9 @@ private:
+     u8 ns_data_new_flag_privileged{};
+     u8 output_flag{};
+ 
++    /// Downloads and "new" flags of the built-in SpotPass (not saved in save states).
++    std::shared_ptr<SpotPassState> spotpass_state = std::make_shared<SpotPassState>();
++
+     template <class Archive>
+     void serialize(Archive& ar, const unsigned int);
+     friend class boost::serialization::access;
+diff --git a/src/core/hle/service/boss/boss_container.cpp b/src/core/hle/service/boss/boss_container.cpp
+new file mode 100644
+index 0000000..f1a0ec9
+--- /dev/null
++++ b/src/core/hle/service/boss/boss_container.cpp
+@@ -0,0 +1,94 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cryptopp/aes.h>
++#include <cryptopp/modes.h>
++#include "core/hle/service/boss/boss_container.h"
++
++namespace Service::BOSS {
++
++namespace {
++constexpr std::size_t HeaderSize = 0x28;
++constexpr std::size_t IvOffset = 0x1C;
++constexpr std::size_t IvSize = 12;
++constexpr std::size_t ContentHeaderSize = 0x132;
++constexpr std::size_t PayloadCountOffset = 0x10;
++constexpr std::size_t PayloadHeaderSize = 0x13C;
++constexpr std::size_t StoredHeaderSize = 0x34;
++constexpr u8 StoredHeaderLength = 0x18;
++
++u32 ReadBE32(std::span<const u8> d, std::size_t o) {
++    return (u32{d[o]} << 24) | (u32{d[o + 1]} << 16) | (u32{d[o + 2]} << 8) | u32{d[o + 3]};
++}
++
++u64 ReadBE64(std::span<const u8> d, std::size_t o) {
++    return (u64{ReadBE32(d, o)} << 32) | ReadBE32(d, o + 4);
++}
++
++void WriteBE32(std::vector<u8>& d, std::size_t o, u32 v) {
++    for (int i = 0; i < 4; ++i) {
++        d[o + i] = static_cast<u8>(v >> (24 - 8 * i));
++    }
++}
++} // namespace
++
++std::optional<std::vector<BossPayload>> DecodeBossContainer(std::span<const u8> file,
++                                                            const std::array<u8, 16>& key) {
++    if (file.size() < HeaderSize + ContentHeaderSize || file[0] != 'b' || file[1] != 'o' ||
++        file[2] != 's' || file[3] != 's' || ReadBE32(file, 4) != 0x00010001) {
++        return std::nullopt;
++    }
++    const u32 declared_size = ReadBE32(file, 8);
++    if (declared_size > file.size()) {
++        return std::nullopt;
++    }
++
++    std::array<u8, 16> iv{};
++    std::copy_n(file.begin() + IvOffset, IvSize, iv.begin());
++    iv[15] = 1;
++
++    std::vector<u8> plain(declared_size - HeaderSize);
++    CryptoPP::CTR_Mode<CryptoPP::AES>::Decryption decryption(key.data(), key.size(), iv.data());
++    decryption.ProcessData(plain.data(), file.data() + HeaderSize, plain.size());
++
++    const std::span<const u8> content(plain);
++    const u32 count = (u32{content[PayloadCountOffset]} << 8) | content[PayloadCountOffset + 1];
++    std::vector<BossPayload> payloads;
++    std::size_t offset = ContentHeaderSize;
++    for (u32 i = 0; i < count; ++i) {
++        if (offset + PayloadHeaderSize > content.size()) {
++            return std::nullopt;
++        }
++        BossPayload payload{
++            .program_id = ReadBE64(content, offset),
++            .datatype = ReadBE32(content, offset + 0xC),
++            .ns_data_id = ReadBE32(content, offset + 0x14),
++            .version = ReadBE32(content, offset + 0x18),
++        };
++        const u32 size = ReadBE32(content, offset + 0x10);
++        offset += PayloadHeaderSize;
++        if (size > content.size() - offset) {
++            return std::nullopt;
++        }
++        payload.data.assign(content.begin() + offset, content.begin() + offset + size);
++        offset += size;
++        payloads.push_back(std::move(payload));
++    }
++    return payloads;
++}
++
++std::vector<u8> MakeStoredNsData(const BossPayload& payload) {
++    std::vector<u8> file(StoredHeaderSize + payload.data.size(), 0);
++    file[0] = StoredHeaderLength;
++    WriteBE32(file, 0x18, static_cast<u32>(payload.program_id >> 32));
++    WriteBE32(file, 0x1C, static_cast<u32>(payload.program_id));
++    WriteBE32(file, 0x24, payload.datatype);
++    WriteBE32(file, 0x28, static_cast<u32>(payload.data.size()));
++    WriteBE32(file, 0x2C, payload.ns_data_id);
++    WriteBE32(file, 0x30, payload.version);
++    std::copy(payload.data.begin(), payload.data.end(), file.begin() + StoredHeaderSize);
++    return file;
++}
++
++} // namespace Service::BOSS
+diff --git a/src/core/hle/service/boss/boss_container.h b/src/core/hle/service/boss/boss_container.h
+new file mode 100644
+index 0000000..48d28be
+--- /dev/null
++++ b/src/core/hle/service/boss/boss_container.h
+@@ -0,0 +1,43 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <array>
++#include <optional>
++#include <span>
++#include <vector>
++#include "common/common_types.h"
++
++namespace Service::BOSS {
++
++/// One entry of a SpotPass ("boss") container, after decryption.
++struct BossPayload {
++    u64 program_id = 0;
++    u32 datatype = 0;
++    u32 ns_data_id = 0;
++    u32 version = 0;
++    std::vector<u8> data;
++};
++
++/**
++ * Decodes a SpotPass container as served by Nintendo's content server
++ * (https://www.3dbrew.org/wiki/SpotPass): a 0x28-byte header ("boss", 0x00010001, size, ...,
++ * 12-byte IV at 0x1C) followed by data encrypted with AES-128-CTR (IV + big-endian counter 1).
++ * The decrypted data starts with a 0x132-byte content header (payload count as a big-endian u16
++ * at 0x10), followed by each payload: a 0x13C-byte header (program ID, unknown, datatype, size,
++ * NsData ID, version, hash, signature; all big-endian) and its data.
++ * Signatures aren't checked. Returns nullopt for anything that isn't a valid container.
++ */
++std::optional<std::vector<BossPayload>> DecodeBossContainer(std::span<const u8> file,
++                                                            const std::array<u8, 16>& key);
++
++/**
++ * The file the BOSS module stores in the title's SpotPass extdata for a payload: a 0x34-byte
++ * header (header length 0x18, program ID at 0x18, datatype, payload size, NsData ID and version
++ * at 0x24..0x33, all big-endian) followed by the payload data.
++ */
++std::vector<u8> MakeStoredNsData(const BossPayload& payload);
++
++} // namespace Service::BOSS
+diff --git a/src/core/hle/service/boss/boss_download.cpp b/src/core/hle/service/boss/boss_download.cpp
+new file mode 100644
+index 0000000..f9942a9
+--- /dev/null
++++ b/src/core/hle/service/boss/boss_download.cpp
+@@ -0,0 +1,93 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <memory>
++#include <optional>
++#include <httplib.h>
++#include "common/logging/log.h"
++#include "common/settings.h"
++#include "common/web_util.h"
++#include "core/hle/service/boss/boss_download.h"
++#include "core/hle/service/http/spotpass_redirect.h"
++
++namespace Service::BOSS {
++
++namespace {
++// Larger than any file in the SpotPass archive (the biggest are ~30 MB).
++constexpr std::size_t MaxDownloadSize = 128 * 1024 * 1024;
++constexpr time_t ConnectionTimeoutSeconds = 10;
++constexpr time_t ReadTimeoutSeconds = 60;
++} // namespace
++
++TaskDownload DownloadTaskFile(const std::string& url, const std::string& if_modified_since,
++                              const std::atomic<bool>& cancel) {
++    TaskDownload download;
++
++    std::string request_url = url;
++    std::optional<std::string> original_host;
++    if (Settings::values.use_custom_spotpass_server.GetValue()) {
++        if (auto redirected =
++                HTTP::RedirectSpotPassUrl(url, Settings::values.spotpass_server_url.GetValue())) {
++            original_host = HTTP::GetUrlHost(url);
++            request_url = std::move(*redirected);
++        }
++    }
++    if (request_url.rfind("http://", 0) != 0 && request_url.rfind("https://", 0) != 0) {
++        download.error = "not an http(s) address";
++        return download;
++    }
++
++    const Common::URLInfo url_info = Common::SplitUrl(request_url);
++    std::unique_ptr<httplib::ClientImpl> client;
++    if (url_info.is_https) {
++        auto ssl_client = std::make_unique<httplib::SSLClient>(url_info.host, url_info.port);
++        ssl_client->enable_server_certificate_verification(false);
++        client = std::move(ssl_client);
++    } else {
++        client = std::make_unique<httplib::ClientImpl>(url_info.host, url_info.port);
++    }
++    client->set_connection_timeout(ConnectionTimeoutSeconds);
++    client->set_read_timeout(ReadTimeoutSeconds);
++
++    httplib::Headers headers{{"User-Agent", "PBOS-8.0/0000000000000000-0000000000000000/0.0.0/0"}};
++    if (original_host) {
++        headers.emplace("X-Tangelo-Original-Host", *original_host);
++    }
++    if (!if_modified_since.empty()) {
++        headers.emplace("If-Modified-Since", if_modified_since);
++    }
++
++    std::string body;
++    bool too_large = false;
++    const auto result = client->Get(url_info.path.empty() ? "/" : url_info.path, headers,
++                                    [&](const char* data, std::size_t length) {
++                                        if (cancel) {
++                                            return false;
++                                        }
++                                        if (body.size() + length > MaxDownloadSize) {
++                                            too_large = true;
++                                            return false;
++                                        }
++                                        body.append(data, length);
++                                        return true;
++                                    });
++
++    if (!result) {
++        download.error = cancel      ? "cancelled"
++                         : too_large ? "file too large"
++                                     : httplib::to_string(result.error());
++        LOG_WARNING(Service_BOSS, "SpotPass download of {} failed: {}", request_url,
++                    download.error);
++        return download;
++    }
++
++    download.status = result->status;
++    download.last_modified = result->get_header_value("Last-Modified");
++    download.body.assign(body.begin(), body.end());
++    LOG_INFO(Service_BOSS, "SpotPass download {} -> HTTP {}, {} bytes", request_url,
++             download.status, download.body.size());
++    return download;
++}
++
++} // namespace Service::BOSS
+diff --git a/src/core/hle/service/boss/boss_download.h b/src/core/hle/service/boss/boss_download.h
+new file mode 100644
+index 0000000..cee0232
+--- /dev/null
++++ b/src/core/hle/service/boss/boss_download.h
+@@ -0,0 +1,34 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <atomic>
++#include <string>
++#include <vector>
++#include "common/common_types.h"
++
++namespace Service::BOSS {
++
++struct TaskDownload {
++    /// HTTP status code, or 0 if no response was received.
++    int status = 0;
++    std::vector<u8> body;
++    /// The response's Last-Modified header (empty if none).
++    std::string last_modified;
++    /// Why the download failed (empty on a response).
++    std::string error;
++};
++
++/**
++ * Downloads a SpotPass task's file (a GET of the task URL), as the BOSS module does.
++ * When the custom SpotPass server is enabled, Nintendo's (and NetPass's) SpotPass URLs go to that
++ * server instead. `if_modified_since` is sent as If-Modified-Since when not empty, so a server
++ * can answer 304 when nothing changed. Server certificates aren't checked. Blocks until done,
++ * or until `cancel` becomes true.
++ */
++TaskDownload DownloadTaskFile(const std::string& url, const std::string& if_modified_since,
++                              const std::atomic<bool>& cancel);
++
++} // namespace Service::BOSS
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index 1cfbf70..8200858 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -2,10 +2,15 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <chrono>
++#include <ctime>
++#include <thread>
+ #include <boost/serialization/map.hpp>
++#include <fmt/format.h>
+ #include "common/archives.h"
+ #include "common/file_util.h"
+ #include "common/serialization/boost_std_variant.hpp"
++#include "common/settings.h"
+ #include "common/string_util.h"
+ #include "core/core.h"
+ #include "core/file_sys/archive_backend.h"
+@@ -15,7 +20,9 @@
+ #include "core/file_sys/errors.h"
+ #include "core/file_sys/file_backend.h"
+ #include "core/hle/kernel/hle_ipc.h"
++#include "core/hle/service/boss/boss_download.h"
+ #include "core/hle/service/boss/online_service.h"
++#include "core/hw/aes/key.h"
+ 
+ namespace Service::BOSS {
+ 
+@@ -27,6 +34,47 @@ enum {
+ };
+ }
+ 
++namespace {
++constexpr auto TaskStateProperty = static_cast<PropertyID>(0x1D);
++constexpr auto TaskHttpStatusProperty = static_cast<PropertyID>(0x23);
++constexpr auto TaskLastSuccessProperty = static_cast<PropertyID>(0x28);
++constexpr auto TaskLastModifiedProperty = static_cast<PropertyID>(0x2F);
++/// Seconds between the Unix epoch and 2000-01-01, the 3DS's epoch.
++constexpr s64 SecondsTo2000 = 946684800;
++
++/// A string property (e.g. the URL) up to its first NUL.
++std::string PropertyString(const BossTaskProperty& property) {
++    const auto* bytes = std::get_if<std::vector<u8>>(&property);
++    if (bytes == nullptr) {
++        return {};
++    }
++    std::string text(bytes->begin(), bytes->end());
++    return text.substr(0, text.find('\0'));
++}
++
++void SetPropertyString(BossTaskProperty& property, const std::string& text) {
++    auto* bytes = std::get_if<std::vector<u8>>(&property);
++    if (bytes == nullptr) {
++        return;
++    }
++    std::fill(bytes->begin(), bytes->end(), u8{0});
++    // Keep the last byte as terminator.
++    const std::size_t length = std::min(text.size(), bytes->empty() ? 0 : bytes->size() - 1);
++    std::copy_n(text.begin(), length, bytes->begin());
++}
++} // namespace
++
++std::string NormalizeTaskId(std::string_view task_id) {
++    task_id = task_id.substr(0, std::min(task_id.size(), TASK_ID_SIZE));
++    return std::string(task_id.substr(0, task_id.find('\0')));
++}
++
++void SpotPassState::Shutdown() {
++    cancel = true;
++    std::unique_lock lock(mutex);
++    workers_done.wait_for(lock, std::chrono::seconds(20), [this] { return active_workers == 0; });
++}
++
+ OnlineService::OnlineService(u64 program_id_, u64 extdata_id_)
+     : program_id(program_id_), extdata_id(extdata_id_) {}
+ 
+@@ -46,6 +94,15 @@ void OnlineService::serialize(Archive& ar, const unsigned int file_version) {
+             storage = has_storage ? std::optional<StorageInfo>{info} : std::nullopt;
+         }
+     }
++    if constexpr (Archive::is_loading::value) {
++        // Downloads don't survive a save state.
++        for (auto& [id, task] : task_id_list) {
++            auto& state = task.properties[static_cast<PropertyID>(0x1D)];
++            if (std::get<u8>(state) == static_cast<u8>(TaskState::Running)) {
++                state = static_cast<u8>(TaskState::Failed);
++            }
++        }
++    }
+ }
+ SERIALIZE_IMPL(OnlineService)
+ 
+@@ -67,6 +124,7 @@ Result OnlineService::InitializeSession(u64 init_program_id) {
+     // A four byte header (always 00 80 34 12?) followed by any number of 0x800(BOSS_A) and
+     // 0xC00(BOSS_SS and BOSS_SV) entries.
+ 
++    std::scoped_lock lock(mutex);
+     current_props = BossTaskProperties();
+ 
+     if (init_program_id == 0) {
+@@ -121,7 +179,8 @@ Result OnlineService::InitializeSession(u64 init_program_id) {
+         std::memcpy(url_vector.data(), ss_data.url.data(), URL_SIZE);
+         current_props.properties[PropertyID::Url] = url_vector;
+ 
+-        const auto task_id = std::string(sv_data.task_id.data());
++        const auto task_id =
++            NormalizeTaskId(std::string_view(sv_data.task_id.data(), sv_data.task_id.size()));
+         if (task_id_list.contains(task_id)) {
+             LOG_WARNING(Service_BOSS, "TaskId already in list, will be replaced");
+             task_id_list.erase(task_id);
+@@ -248,6 +307,7 @@ u32 OnlineService::GetStorageSize() const {
+ }
+ 
+ Result OnlineService::DeleteNsData(u32 ns_data_id) {
++    std::scoped_lock lock(mutex);
+     // Deleting data that isn't there is treated as done, as the old stub did: games call this
+     // for cleanup (e.g. DMW1 deletes 0x0B right after turning SpotPass on).
+     const auto entry = GetNsDataEntryFromId(ns_data_id);
+@@ -266,16 +326,25 @@ Result OnlineService::DeleteNsData(u32 ns_data_id) {
+     return result;
+ }
+ 
+-void OnlineService::RegisterTask(const u32 size, Kernel::MappedBuffer& buffer) {
+-    std::string task_id(size, 0);
+-    buffer.Read(task_id.data(), 0, size);
++std::string OnlineService::ReadTaskId(u32 size, Kernel::MappedBuffer& buffer) {
++    std::string task_id(std::min<std::size_t>(size, TASK_ID_SIZE), '\0');
++    buffer.Read(task_id.data(), 0, task_id.size());
++    return NormalizeTaskId(task_id);
++}
++
++std::string OnlineService::RegisterTask(const u32 size, Kernel::MappedBuffer& buffer) {
++    return RegisterTask(ReadTaskId(size, buffer));
++}
+ 
++std::string OnlineService::RegisterTask(std::string task_id) {
++    std::scoped_lock lock(mutex);
+     if (task_id_list.contains(task_id)) {
+         LOG_WARNING(Service_BOSS, "TaskId already in list, will be replaced");
+         task_id_list.erase(task_id);
+     }
+     task_id_list.emplace(task_id, std::move(current_props));
+     current_props = BossTaskProperties();
++    return task_id;
+ }
+ 
+ Result OnlineService::UnregisterTask(const u32 size, Kernel::MappedBuffer& buffer) {
+@@ -285,8 +354,8 @@ Result OnlineService::UnregisterTask(const u32 size, Kernel::MappedBuffer& buffe
+         return ResultUnknown;
+     }
+ 
+-    std::string task_id(size, 0);
+-    buffer.Read(task_id.data(), 0, size);
++    const std::string task_id = ReadTaskId(size, buffer);
++    std::scoped_lock lock(mutex);
+     if (task_id_list.erase(task_id) == 0) {
+         LOG_WARNING(Service_BOSS, "TaskId '{}' not in list", task_id);
+         return {ErrCodes::TaskNotFound, ErrorModule::BOSS, ErrorSummary::InvalidState,
+@@ -297,10 +366,12 @@ Result OnlineService::UnregisterTask(const u32 size, Kernel::MappedBuffer& buffe
+ }
+ 
+ void OnlineService::GetTaskIdList() {
++    std::scoped_lock lock(mutex);
+     current_props.properties[PropertyID::TotalTasks] = static_cast<u16>(task_id_list.size());
+ 
+     const auto num_task_ids = TASKIDLIST_SIZE / TASK_ID_SIZE;
+-    std::vector<std::array<u8, TASK_ID_SIZE>> task_ids(num_task_ids);
++    std::vector<std::array<u8, TASK_ID_SIZE>> task_ids(num_task_ids,
++                                                       std::array<u8, TASK_ID_SIZE>{});
+ 
+     u16 num_returned_task_ids = 0;
+     for (const auto& iter : task_id_list) {
+@@ -309,7 +380,8 @@ void OnlineService::GetTaskIdList() {
+             LOG_WARNING(Service_BOSS, "TaskId {} too long or too many TaskIds", current_task_id);
+             continue;
+         }
+-        std::memcpy(task_ids[num_returned_task_ids++].data(), current_task_id.data(), TASK_ID_SIZE);
++        std::memcpy(task_ids[num_returned_task_ids++].data(), current_task_id.data(),
++                    current_task_id.size());
+     }
+ 
+     auto* task_list_prop =
+@@ -365,6 +437,7 @@ std::vector<FileSys::Entry> OnlineService::GetBossExtDataFiles(
+ }
+ 
+ std::vector<NsDataEntry> OnlineService::GetNsDataEntries() {
++    std::scoped_lock lock(mutex);
+     auto boss_archive = OpenBossExtData();
+     if (!boss_archive) {
+         return {};
+@@ -465,6 +538,7 @@ std::optional<NsDataEntry> OnlineService::GetNsDataEntryFromId(const u32 ns_data
+ 
+ Result OnlineService::GetNsDataHeaderInfo(const u32 ns_data_id, const NsDataHeaderInfoType type,
+                                           const u32 size, Kernel::MappedBuffer& buffer) {
++    std::scoped_lock lock(mutex);
+     const auto entry = GetNsDataEntryFromId(ns_data_id);
+     if (!entry.has_value()) {
+         LOG_WARNING(Service_BOSS, "Failed to find NsData entry for ID {:#010X}", ns_data_id);
+@@ -529,6 +603,7 @@ Result OnlineService::GetNsDataHeaderInfo(const u32 ns_data_id, const NsDataHead
+ 
+ ResultVal<std::size_t> OnlineService::ReadNsData(const u32 ns_data_id, const u64 offset,
+                                                  const u32 size, Kernel::MappedBuffer& buffer) {
++    std::scoped_lock lock(mutex);
+     std::optional<NsDataEntry> entry = GetNsDataEntryFromId(ns_data_id);
+     if (!entry.has_value()) {
+         LOG_WARNING(Service_BOSS, "Failed to find NsData entry for ID {:#010X}", ns_data_id);
+@@ -659,4 +734,226 @@ Result OnlineService::ReceiveProperty(const u16 id, const u32 size, Kernel::Mapp
+     return ResultSuccess;
+ }
+ 
++bool OnlineService::StartTask(const std::string& task_id,
++                              const std::shared_ptr<SpotPassState>& state) {
++    std::string url;
++    std::string last_modified;
++    {
++        std::scoped_lock lock(mutex);
++        const auto task = task_id_list.find(task_id);
++        if (task == task_id_list.end()) {
++            return false;
++        }
++        auto& properties = task->second.properties;
++        if (std::get<u8>(properties[TaskStateProperty]) == static_cast<u8>(TaskState::Running)) {
++            LOG_DEBUG(Service_BOSS, "SpotPass task '{}' is already running", task_id);
++            return true;
++        }
++        url = PropertyString(properties[PropertyID::Url]);
++        last_modified = PropertyString(properties[TaskLastModifiedProperty]);
++        properties[TaskStateProperty] = static_cast<u8>(TaskState::Running);
++    }
++
++    {
++        std::scoped_lock state_lock(state->mutex);
++        state->tasks_run.emplace(session_program_id, task_id);
++        if (state->cancel) {
++            FinishTask(task_id, TaskState::Failed, 0, {});
++            return true;
++        }
++        ++state->active_workers;
++    }
++
++    LOG_INFO(Service_BOSS, "Running SpotPass task '{}': {}", task_id, url);
++    std::thread([self = shared_from_this(), task_id, url = std::move(url),
++                 last_modified = std::move(last_modified), state]() mutable {
++        self->RunTask(task_id, std::move(url), std::move(last_modified), state);
++        std::scoped_lock state_lock(state->mutex);
++        --state->active_workers;
++        state->workers_done.notify_all();
++    }).detach();
++    return true;
++}
++
++void OnlineService::RunTask(const std::string& task_id, std::string url, std::string last_modified,
++                            std::shared_ptr<SpotPassState> state) {
++    if (url.empty()) {
++        LOG_WARNING(Service_BOSS, "SpotPass task '{}' has no URL", task_id);
++        FinishTask(task_id, TaskState::Failed, 0, {});
++        return;
++    }
++
++    const TaskDownload download = DownloadTaskFile(url, last_modified, state->cancel);
++    if (state->cancel) {
++        return;
++    }
++    if (download.status == 304) {
++        LOG_INFO(Service_BOSS, "SpotPass task '{}': nothing new", task_id);
++        FinishTask(task_id, TaskState::Success, 304, last_modified);
++        return;
++    }
++    if (download.status != 200) {
++        LOG_WARNING(Service_BOSS, "SpotPass task '{}' failed: {}", task_id,
++                    download.status != 0 ? fmt::format("HTTP {}", download.status)
++                                         : download.error);
++        FinishTask(task_id, TaskState::Failed, download.status, {});
++        return;
++    }
++
++    if (!HW::AES::IsNormalKeyAvailable(HW::AES::BOSSDataKey)) {
++        LOG_ERROR(Service_BOSS, "SpotPass task '{}': the SpotPass key (slot 0x38) is missing",
++                  task_id);
++        FinishTask(task_id, TaskState::Failed, download.status, {});
++        return;
++    }
++    const auto payloads =
++        DecodeBossContainer(download.body, HW::AES::GetNormalKey(HW::AES::BOSSDataKey));
++    if (!payloads) {
++        LOG_WARNING(Service_BOSS, "SpotPass task '{}': the downloaded file isn't SpotPass data",
++                    task_id);
++        FinishTask(task_id, TaskState::Failed, download.status, {});
++        return;
++    }
++
++    const auto written = StoreNsData(*payloads);
++    if (!written) {
++        FinishTask(task_id, TaskState::Failed, download.status, {});
++        return;
++    }
++    if (!written->empty()) {
++        std::scoped_lock state_lock(state->mutex);
++        for (const u32 ns_data_id : *written) {
++            state->ns_data_new_flags[ns_data_id] = 1;
++        }
++        state->new_arrival = true;
++    }
++    LOG_INFO(Service_BOSS, "SpotPass task '{}' done: {} file(s), {} new or updated", task_id,
++             payloads->size(), written->size());
++    FinishTask(task_id, TaskState::Success, download.status, download.last_modified);
++}
++
++void OnlineService::FinishTask(const std::string& task_id, TaskState state, u32 http_status,
++                               const std::string& last_modified) {
++    std::scoped_lock lock(mutex);
++    const auto task = task_id_list.find(task_id);
++    if (task == task_id_list.end()) {
++        return;
++    }
++    auto& properties = task->second.properties;
++    properties[TaskStateProperty] = static_cast<u8>(state);
++    properties[TaskHttpStatusProperty] = http_status;
++    if (state == TaskState::Success) {
++        properties[TaskLastSuccessProperty] =
++            static_cast<u64>(static_cast<s64>(std::time(nullptr)) - SecondsTo2000);
++        SetPropertyString(properties[TaskLastModifiedProperty], last_modified);
++    }
++}
++
++void OnlineService::RunTasksAtStart(const std::shared_ptr<SpotPassState>& state,
++                                    std::optional<std::string> task_id) {
++    if (!Settings::values.use_custom_spotpass_server.GetValue()) {
++        return;
++    }
++
++    std::vector<std::string> task_ids;
++    {
++        std::scoped_lock lock(mutex);
++        for (auto& [id, task] : task_id_list) {
++            if ((!task_id || *task_id == id) &&
++                !PropertyString(task.properties[PropertyID::Url]).empty()) {
++                task_ids.push_back(id);
++            }
++        }
++    }
++    for (const auto& id : task_ids) {
++        {
++            std::scoped_lock state_lock(state->mutex);
++            if (state->tasks_run.contains({session_program_id, id})) {
++                continue;
++            }
++        }
++        StartTask(id, state);
++    }
++}
++
++std::optional<TaskState> OnlineService::GetTaskState(const std::string& task_id) {
++    std::scoped_lock lock(mutex);
++    const auto task = task_id_list.find(task_id);
++    if (task == task_id_list.end()) {
++        return std::nullopt;
++    }
++    return static_cast<TaskState>(std::get<u8>(task->second.properties[TaskStateProperty]));
++}
++
++bool OnlineService::LoadTaskProperties(const std::string& task_id) {
++    std::scoped_lock lock(mutex);
++    const auto task = task_id_list.find(task_id);
++    if (task == task_id_list.end()) {
++        return false;
++    }
++    current_props = task->second;
++    return true;
++}
++
++std::optional<std::vector<u32>> OnlineService::StoreNsData(
++    const std::vector<BossPayload>& payloads) {
++    std::scoped_lock lock(mutex);
++    auto boss_archive = OpenBossExtData();
++    if (!boss_archive) {
++        LOG_WARNING(Service_BOSS,
++                    "Can't store SpotPass data: the game hasn't created its SpotPass storage");
++        return std::nullopt;
++    }
++    const std::vector<NsDataEntry> existing = GetNsDataEntries();
++
++    std::vector<u32> written;
++    for (BossPayload payload : payloads) {
++        if (payload.program_id != program_id) {
++            // E.g. data from another region's server; stored for this game so it can read it.
++            LOG_WARNING(Service_BOSS,
++                        "SpotPass file {:#010x} is for program {:#018x}; storing it for {:#018x}",
++                        payload.ns_data_id, payload.program_id, program_id);
++            payload.program_id = program_id;
++        }
++
++        std::string filename = fmt::format("tangelo_{:08X}", payload.ns_data_id);
++        const auto old = std::find_if(existing.begin(), existing.end(), [&](const auto& entry) {
++            return entry.header.ns_data_id == payload.ns_data_id;
++        });
++        if (old != existing.end()) {
++            if (old->header.version == payload.version &&
++                old->header.payload_size == payload.data.size()) {
++                continue;
++            }
++            filename = old->filename;
++            boss_archive->DeleteFile(FileSys::Path(("/" + filename).c_str()));
++        }
++
++        const std::vector<u8> stored = MakeStoredNsData(payload);
++        const FileSys::Path path(("/" + filename).c_str());
++        if (boss_archive->CreateFile(path, stored.size()).IsError()) {
++            LOG_ERROR(Service_BOSS, "Could not create SpotPass file '{}'", filename);
++            continue;
++        }
++        FileSys::Mode mode{};
++        mode.write_flag.Assign(1);
++        auto file_result = boss_archive->OpenFile(path, mode);
++        if (!file_result.Succeeded()) {
++            LOG_ERROR(Service_BOSS, "Could not open SpotPass file '{}'", filename);
++            continue;
++        }
++        auto file = std::move(file_result).Unwrap();
++        const auto write_result = file->Write(0, stored.size(), true, false, stored.data());
++        file->Close();
++        if (!write_result.Succeeded() || write_result.Unwrap() != stored.size()) {
++            LOG_ERROR(Service_BOSS, "Could not write SpotPass file '{}'", filename);
++            continue;
++        }
++        LOG_INFO(Service_BOSS, "Stored SpotPass file '{}' (NsData {:#010x}, version {}, {} bytes)",
++                 filename, payload.ns_data_id, payload.version, payload.data.size());
++        written.push_back(payload.ns_data_id);
++    }
++    return written;
++}
++
+ } // namespace Service::BOSS
+diff --git a/src/core/hle/service/boss/online_service.h b/src/core/hle/service/boss/online_service.h
+index eba5c5d..648bfbe 100644
+--- a/src/core/hle/service/boss/online_service.h
++++ b/src/core/hle/service/boss/online_service.h
+@@ -4,16 +4,23 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++#include <condition_variable>
+ #include <map>
+ #include <memory>
++#include <mutex>
+ #include <optional>
++#include <set>
+ #include <string>
++#include <string_view>
++#include <utility>
+ #include <variant>
+ #include <vector>
+ 
+ #include <boost/serialization/version.hpp>
+ #include "common/common_types.h"
+ #include "core/hle/result.h"
++#include "core/hle/service/boss/boss_container.h"
+ #include "core/hle/service/boss/boss_storage.h"
+ #include "core/loader/loader.h"
+ 
+@@ -118,6 +125,35 @@ struct BossSSData {
+     std::array<u8, URL_SIZE> url;
+ };
+ 
++/// Task state codes (property 0x1D, GetTaskState).
++enum class TaskState : u8 {
++    Success = 0,
++    Running = 2,
++    NotStarted = 5,
++    Failed = 7,
++};
++
++/// SpotPass state shared by all BOSS sessions. Task downloads run on worker threads.
++struct SpotPassState {
++    std::mutex mutex;
++    /// NsData "new" flags, set for downloaded files and by SetNsDataNewFlag.
++    std::map<u32, u8> ns_data_new_flags;
++    bool new_arrival = false;
++    /// (program ID, task ID) of the tasks run since Tangelo started.
++    std::set<std::pair<u64, std::string>> tasks_run;
++
++    /// Set when the emulated system shuts down; running downloads stop.
++    std::atomic<bool> cancel{false};
++    std::condition_variable workers_done;
++    int active_workers = 0;
++
++    /// Stops running downloads and waits until their workers have finished.
++    void Shutdown();
++};
++
++/// The task ID as a string: up to 8 characters, cut off at the first NUL.
++std::string NormalizeTaskId(std::string_view task_id);
++
+ using BossTaskProperty = std::variant<u8, u16, u32, u64, std::vector<u8>, std::vector<u32>>;
+ struct BossTaskProperties {
+     bool task_result;
+@@ -181,12 +217,14 @@ struct BossTaskProperties {
+     friend class boost::serialization::access;
+ };
+ 
+-class OnlineService final {
++class OnlineService final : public std::enable_shared_from_this<OnlineService> {
+ public:
+     explicit OnlineService(u64 program_id_, u64 extdata_id_);
+ 
+     Result InitializeSession(u64 init_program_id);
+-    void RegisterTask(const u32 size, Kernel::MappedBuffer& buffer);
++    std::string RegisterTask(const u32 size, Kernel::MappedBuffer& buffer);
++    /// Registers the task (like RegisterTask); returns its task ID.
++    std::string RegisterTask(std::string task_id);
+     Result UnregisterTask(const u32 size, Kernel::MappedBuffer& buffer);
+     void GetTaskIdList();
+     u16 GetNsDataIdList(const u32 filter, const u32 max_entries, Kernel::MappedBuffer& buffer);
+@@ -207,7 +245,39 @@ public:
+     /// Deletes the downloaded SpotPass file with this NsData ID from the storage.
+     Result DeleteNsData(u32 ns_data_id);
+ 
++    /// Reads a task ID from a request buffer.
++    static std::string ReadTaskId(u32 size, Kernel::MappedBuffer& buffer);
++
++    /**
++     * Downloads the task's file in the background and stores its contents in the title's
++     * SpotPass extdata (StartTask). Returns false if the task isn't registered.
++     */
++    bool StartTask(const std::string& task_id, const std::shared_ptr<SpotPassState>& state);
++    /**
++     * With a custom SpotPass server set, starts each registered task (or only `task_id`) that
++     * hasn't run since Tangelo started. The 3DS runs SpotPass tasks in the background (mostly
++     * in sleep mode), which never happens in the emulator.
++     */
++    void RunTasksAtStart(const std::shared_ptr<SpotPassState>& state,
++                         std::optional<std::string> task_id = std::nullopt);
++    /// The task's state (property 0x1D), or nullopt if the task isn't registered.
++    std::optional<TaskState> GetTaskState(const std::string& task_id);
++    /// Makes the task's properties the current ones, so ReceiveProperty reads its results.
++    bool LoadTaskProperties(const std::string& task_id);
++
++    /**
++     * Stores downloaded SpotPass payloads in the title's extdata, replacing older files with
++     * the same NsData ID. Returns the NsData IDs that were written (unchanged files are skipped),
++     * or nullopt if the extdata couldn't be opened.
++     */
++    std::optional<std::vector<u32>> StoreNsData(const std::vector<BossPayload>& payloads);
++
+ private:
++    void RunTask(const std::string& task_id, std::string url, std::string last_modified,
++                 std::shared_ptr<SpotPassState> state);
++    void FinishTask(const std::string& task_id, TaskState state, u32 http_status,
++                    const std::string& last_modified);
++
+     std::unique_ptr<FileSys::ArchiveBackend> OpenBossSystemSaveData();
+     void LoadStorageInfo(FileSys::ArchiveBackend& archive);
+     bool SaveStorageInfo();
+@@ -226,6 +296,9 @@ private:
+     u64 session_program_id = 0;
+     std::optional<StorageInfo> storage;
+ 
++    /// Guards task_id_list and the extdata against the download workers.
++    std::recursive_mutex mutex;
++
+     // For serialization
+     explicit OnlineService() = default;
+ 
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index cfd1395..5ebb59f 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -6,6 +6,8 @@ add_executable(tests
+     core/file_sys/path_parser.cpp
+     core/hle/kernel/cpu_limiter.cpp
+     core/hle/kernel/hle_ipc.cpp
++    core/hle/service/boss_container.cpp
++    core/hle/service/boss_download.cpp
+     core/hle/service/boss_storage.cpp
+     core/hle/service/cecd_message.cpp
+     core/hle/service/ptm_steps.cpp
+@@ -37,7 +39,7 @@ if (BSD STREQUAL "NetBSD")
+     disable_pax_mprotect(tests)
+ endif()
+ 
+-target_link_libraries(tests PRIVATE citra_common citra_core video_core audio_core faad2)
++target_link_libraries(tests PRIVATE citra_common citra_core video_core audio_core faad2 cryptopp httplib)
+ target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} catch2 nihstro-headers Threads::Threads)
+ 
+ if (ENABLE_LIBRETRO)
+diff --git a/src/tests/core/hle/service/boss_container.cpp b/src/tests/core/hle/service/boss_container.cpp
+new file mode 100644
+index 0000000..224bb55
+--- /dev/null
++++ b/src/tests/core/hle/service/boss_container.cpp
+@@ -0,0 +1,123 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <array>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include <cryptopp/aes.h>
++#include <cryptopp/modes.h>
++#include "core/hle/service/boss/boss_container.h"
++
++using namespace Service::BOSS;
++
++namespace {
++constexpr std::array<u8, 16> TestKey{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
++                                     0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
++
++void PutBE32(std::vector<u8>& d, std::size_t o, u32 v) {
++    for (int i = 0; i < 4; ++i) {
++        d[o + i] = static_cast<u8>(v >> (24 - 8 * i));
++    }
++}
++
++/// Builds an encrypted container the way Nintendo's server laid them out.
++std::vector<u8> MakeContainer(const std::vector<BossPayload>& payloads) {
++    std::vector<u8> plain(0x132, 0);
++    plain[0x10] = static_cast<u8>(payloads.size() >> 8);
++    plain[0x11] = static_cast<u8>(payloads.size());
++    for (const auto& p : payloads) {
++        std::vector<u8> header(0x13C, 0);
++        PutBE32(header, 0x0, static_cast<u32>(p.program_id >> 32));
++        PutBE32(header, 0x4, static_cast<u32>(p.program_id));
++        PutBE32(header, 0xC, p.datatype);
++        PutBE32(header, 0x10, static_cast<u32>(p.data.size()));
++        PutBE32(header, 0x14, p.ns_data_id);
++        PutBE32(header, 0x18, p.version);
++        plain.insert(plain.end(), header.begin(), header.end());
++        plain.insert(plain.end(), p.data.begin(), p.data.end());
++    }
++
++    std::vector<u8> file(0x28, 0);
++    file[0] = 'b';
++    file[1] = 'o';
++    file[2] = 's';
++    file[3] = 's';
++    PutBE32(file, 4, 0x00010001);
++    PutBE32(file, 8, static_cast<u32>(0x28 + plain.size()));
++    for (int i = 0; i < 12; ++i) {
++        file[0x1C + i] = static_cast<u8>(0xA0 + i);
++    }
++    std::array<u8, 16> iv{};
++    std::copy_n(file.begin() + 0x1C, 12, iv.begin());
++    iv[15] = 1;
++    std::vector<u8> encrypted(plain.size());
++    CryptoPP::CTR_Mode<CryptoPP::AES>::Encryption enc(TestKey.data(), TestKey.size(), iv.data());
++    enc.ProcessData(encrypted.data(), plain.data(), plain.size());
++    file.insert(file.end(), encrypted.begin(), encrypted.end());
++    return file;
++}
++} // namespace
++
++TEST_CASE("SpotPass containers are decrypted into their payloads", "[service][boss]") {
++    const BossPayload first{.program_id = 0x00040000000EA900,
++                            .datatype = 0x00010010,
++                            .ns_data_id = 0x0B,
++                            .version = 1,
++                            .data = std::vector<u8>(0x50, 0x5A)};
++    const BossPayload second{.program_id = 0x00040000000EA900,
++                             .datatype = 0x00020001,
++                             .ns_data_id = 0x0C,
++                             .version = 3,
++                             .data = {1, 2, 3}};
++    const auto file = MakeContainer({first, second});
++
++    const auto payloads = DecodeBossContainer(file, TestKey);
++    REQUIRE(payloads);
++    REQUIRE(payloads->size() == 2);
++    CHECK((*payloads)[0].program_id == first.program_id);
++    CHECK((*payloads)[0].datatype == first.datatype);
++    CHECK((*payloads)[0].ns_data_id == 0x0B);
++    CHECK((*payloads)[0].version == 1);
++    CHECK((*payloads)[0].data == first.data);
++    CHECK((*payloads)[1].ns_data_id == 0x0C);
++    CHECK((*payloads)[1].data == second.data);
++}
++
++TEST_CASE("Invalid SpotPass containers are rejected", "[service][boss]") {
++    auto file = MakeContainer({{.program_id = 1, .data = {9}}});
++    CHECK(DecodeBossContainer(file, TestKey));
++
++    auto bad_magic = file;
++    bad_magic[0] = 'x';
++    CHECK_FALSE(DecodeBossContainer(bad_magic, TestKey));
++
++    auto truncated = file;
++    truncated.resize(0x28 + 0x100);
++    CHECK_FALSE(DecodeBossContainer(truncated, TestKey));
++
++    // A payload claiming more data than the container holds.
++    auto too_big = file;
++    too_big[0x28 + 0x132 + 0x13] ^= 0x7F; // flips bits of the encrypted size field
++    CHECK_FALSE(DecodeBossContainer(too_big, TestKey));
++
++    CHECK_FALSE(DecodeBossContainer(std::vector<u8>{}, TestKey));
++}
++
++TEST_CASE("Stored NsData files use the BOSS module's layout", "[service][boss]") {
++    const BossPayload payload{.program_id = 0x00040000000EA900,
++                              .datatype = 0x00010010,
++                              .ns_data_id = 0x0B,
++                              .version = 1,
++                              .data = std::vector<u8>(0x50, 0x33)};
++    const auto stored = MakeStoredNsData(payload);
++    REQUIRE(stored.size() == 0x34 + 0x50);
++    // Same header bytes as a file written by the real module (offsets 0x0C-0x13 unknown, zero).
++    const std::vector<u8> expected_header{
++        0x18, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,
++        0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0x00, 0x04,
++        0x00, 0x00, 0x00, 0x0e, 0xa9, 0x00, 0,    0,    0,    0,    0x00, 0x01, 0x00,
++        0x10, 0x00, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x01};
++    CHECK(std::vector<u8>(stored.begin(), stored.begin() + 0x34) == expected_header);
++    CHECK(std::vector<u8>(stored.begin() + 0x34, stored.end()) == payload.data);
++}
+diff --git a/src/tests/core/hle/service/boss_download.cpp b/src/tests/core/hle/service/boss_download.cpp
+new file mode 100644
+index 0000000..918403d
+--- /dev/null
++++ b/src/tests/core/hle/service/boss_download.cpp
+@@ -0,0 +1,146 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <atomic>
++#include <filesystem>
++#include <string>
++#include <thread>
++#include <catch2/catch_test_macros.hpp>
++#include <httplib.h>
++#include "common/file_util.h"
++#include "common/settings.h"
++#include "core/file_sys/archive_extsavedata.h"
++#include "core/hle/service/boss/boss_download.h"
++#include "core/hle/service/boss/online_service.h"
++
++using namespace Service::BOSS;
++
++TEST_CASE("Task IDs are cut off at the first NUL", "[service][boss]") {
++    CHECK(NormalizeTaskId(std::string("PANEL\0\0\0", 8)) == "PANEL");
++    CHECK(NormalizeTaskId(std::string("PANEL\0", 6)) == "PANEL");
++    CHECK(NormalizeTaskId("MIIDATA") == "MIIDATA");
++    CHECK(NormalizeTaskId("ABCDEFGHIJ") == "ABCDEFGH");
++    CHECK(NormalizeTaskId(std::string("\0XYZ", 4)).empty());
++}
++
++TEST_CASE("SpotPass task files are downloaded from the custom server", "[service][boss]") {
++    httplib::Server server;
++    std::string seen_path;
++    std::string seen_host;
++    server.Get(R"(/p01/nsa/.*)", [&](const httplib::Request& request, httplib::Response& response) {
++        seen_path = request.path;
++        seen_host = request.get_header_value("X-Tangelo-Original-Host");
++        if (request.get_header_value("If-Modified-Since") == "Tue, 01 Jan 2030 00:00:00 GMT") {
++            response.status = 304;
++            return;
++        }
++        if (request.path.ends_with("/missing")) {
++            response.status = 404;
++            return;
++        }
++        response.set_header("Last-Modified", "Tue, 01 Jan 2030 00:00:00 GMT");
++        response.set_content(std::string("boss\x00\x01\x00\x01", 8), "application/octet-stream");
++    });
++    const int port = server.bind_to_any_port("127.0.0.1");
++    REQUIRE(port > 0);
++    std::thread thread([&] { server.listen_after_bind(); });
++    server.wait_until_ready();
++
++    const bool old_enabled = Settings::values.use_custom_spotpass_server.GetValue();
++    const std::string old_url = Settings::values.spotpass_server_url.GetValue();
++    Settings::values.use_custom_spotpass_server.SetValue(true);
++    Settings::values.spotpass_server_url.SetValue("http://127.0.0.1:" + std::to_string(port));
++
++    std::atomic<bool> cancel{false};
++    const auto ok = DownloadTaskFile(
++        "https://npdl.cdn.nintendowifi.net/p01/nsa/tjca9oAeXj1R9EfU/PANEL/PanelData.dat", "",
++        cancel);
++    CHECK(ok.status == 200);
++    CHECK(ok.body.size() == 8);
++    CHECK(ok.last_modified == "Tue, 01 Jan 2030 00:00:00 GMT");
++    CHECK(seen_path == "/p01/nsa/tjca9oAeXj1R9EfU/PANEL/PanelData.dat");
++    CHECK(seen_host == "npdl.cdn.nintendowifi.net");
++
++    const auto unchanged = DownloadTaskFile(
++        "https://api.netpass.cafe/npdl/p01/nsa/tjca9oAeXj1R9EfU/PANEL/PanelData.dat",
++        "Tue, 01 Jan 2030 00:00:00 GMT", cancel);
++    CHECK(unchanged.status == 304);
++    CHECK(unchanged.body.empty());
++
++    const auto missing = DownloadTaskFile(
++        "https://npdl.cdn.nintendowifi.net/p01/nsa/tjca9oAeXj1R9EfU/PANEL/missing", "", cancel);
++    CHECK(missing.status == 404);
++
++    CHECK(DownloadTaskFile("", "", cancel).status == 0);
++
++    Settings::values.use_custom_spotpass_server.SetValue(old_enabled);
++    Settings::values.spotpass_server_url.SetValue(old_url);
++    server.stop();
++    thread.join();
++}
++
++TEST_CASE("Downloaded SpotPass files are stored in the game's extdata", "[service][boss]") {
++    constexpr u64 ProgramId = 0x0004001000022800;
++    constexpr u64 ExtdataId = 0x00000000000000E0;
++
++    const std::string old_sdmc = FileUtil::GetUserPath(FileUtil::UserPath::SDMCDir);
++    const std::string sdmc =
++        (std::filesystem::temp_directory_path() / "tangelo-boss-test").string() + "/";
++    FileUtil::DeleteDirRecursively(sdmc);
++    REQUIRE(FileUtil::CreateFullPath(sdmc));
++    FileUtil::UpdateUserPath(FileUtil::UserPath::SDMCDir, sdmc);
++
++    FileSys::ArchiveFactory_ExtSaveData factory(sdmc, FileSys::ExtSaveDataType::Boss);
++    const auto boss_dir =
++        FileSys::GetExtSaveDataPath(factory.GetMountPoint(),
++                                    FileSys::ConstructExtDataBinaryPath(1, 0, ExtdataId)) +
++        "boss/";
++    REQUIRE(FileUtil::CreateFullPath(boss_dir));
++
++    auto service = std::make_shared<OnlineService>(ProgramId, ExtdataId);
++    std::vector<BossPayload> payloads{
++        {.program_id = ProgramId,
++         .datatype = 0x10001,
++         .ns_data_id = 1,
++         .version = 1,
++         .data = std::vector<u8>(0x40, 0x11)},
++        // Another region's program ID: stored for this game.
++        {.program_id = 0x0004001000021800,
++         .datatype = 0x10002,
++         .ns_data_id = 2,
++         .version = 3,
++         .data = std::vector<u8>(0x20, 0x22)},
++    };
++
++    auto written = service->StoreNsData(payloads);
++    REQUIRE(written);
++    CHECK(*written == std::vector<u32>{1, 2});
++    auto first = service->GetNsDataEntryFromId(1);
++    REQUIRE(first);
++    CHECK(first->header.payload_size == 0x40);
++    auto second = service->GetNsDataEntryFromId(2);
++    REQUIRE(second);
++    CHECK(second->header.program_id == ProgramId);
++    CHECK(second->header.version == 3);
++
++    // Same version again: nothing is rewritten.
++    written = service->StoreNsData(payloads);
++    REQUIRE(written);
++    CHECK(written->empty());
++
++    // A new version replaces the old file (keeping its name).
++    payloads[0].version = 2;
++    payloads[0].data = std::vector<u8>(0x80, 0x33);
++    written = service->StoreNsData({payloads[0]});
++    REQUIRE(written);
++    CHECK(*written == std::vector<u32>{1});
++    const auto updated = service->GetNsDataEntryFromId(1);
++    REQUIRE(updated);
++    CHECK(updated->filename == first->filename);
++    CHECK(updated->header.version == 2);
++    CHECK(updated->header.payload_size == 0x80);
++
++    FileUtil::DeleteDirRecursively(sdmc);
++    FileUtil::UpdateUserPath(FileUtil::UserPath::SDMCDir, old_sdmc);
++}
+-- 
+2.43.0
+

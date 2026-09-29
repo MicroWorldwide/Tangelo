@@ -1,0 +1,182 @@
+From 74702035f354b91a10a317672bb608806a2a84c5 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 14:47:53 +0200
+Subject: [PATCH] nim/ac: CheckSysupdateAvailableSOAP, GetInitializeResult,
+ SetFromApplication
+
+Calls seen when StreetPass Mii Plaza goes online, previously answered by
+the generic "unimplemented" fallback:
+
+- nim:s 0x000A CheckSysupdateAvailableSOAP: now replies success with the
+  "update available" flag set to 0. The fallback left that word as whatever
+  was in the buffer, so apps could see an update (the Nintendo Zone viewer,
+  for one, stops using the connection when an update is reported).
+- nim:s 0x003F GetInitializeResult: success (NIM is ready).
+- ac:u/ac:i 0x002C SetFromApplication: takes the value and ACConfig and
+  hands the config back, like SetRequestEulaVersion.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp     | 15 +++++++++++++++
+ src/core/hle/service/ac/ac.h       | 11 +++++++++++
+ src/core/hle/service/ac/ac_i.cpp   |  1 +
+ src/core/hle/service/ac/ac_u.cpp   |  1 +
+ src/core/hle/service/nim/nim_s.cpp | 27 ++++++++++++++++++++++++++-
+ src/core/hle/service/nim/nim_s.h   | 15 +++++++++++++++
+ 6 files changed, 69 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index b11e651..0fe474b 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -151,6 +151,21 @@ void Module::Interface::GetInfraPriority(Kernel::HLERequestContext& ctx) {
+     LOG_WARNING(Service_AC, "(STUBBED) called");
+ }
+ 
++void Module::Interface::SetFromApplication(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    const u32 value = rp.Pop<u32>();
++    const std::vector<u8>& ac_config = rp.PopStaticBuffer();
++
++    // Like SetRequestEulaVersion: the setting only matters to the real connection logic, so the
++    // config is handed back as it came in.
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(ac_config), 0);
++
++    LOG_DEBUG(Service_AC, "called, value={}", value);
++}
++
+ void Module::Interface::SetRequestEulaVersion(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index 29711bd..a7655bd 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -129,6 +129,17 @@ public:
+          */
+         void SetRequestEulaVersion(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::SetFromApplication service function
++         *  Inputs:
++         *      1 : u32, value set in the connection config (Mii Plaza passes 4)
++         *      2-3 : Static buffer with the ACConfig (0x200 bytes)
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2-3 : Static buffer with the ACConfig
++         */
++        void SetFromApplication(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::GetNZoneBeaconNotFoundEvent service function
+          *  Inputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index 2533269..f7d226c 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -26,6 +26,7 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0027, &AC_I::GetInfraPriority, "GetInfraPriority"},
++        {0x002C, &AC_I::SetFromApplication, "SetFromApplication"},
+         {0x002D, &AC_I::SetRequestEulaVersion, "SetRequestEulaVersion"},
+         {0x002F, &AC_I::GetNZoneBeaconNotFoundEvent, "GetNZoneBeaconNotFoundEvent"},
+         {0x0030, &AC_I::RegisterDisconnectEvent, "RegisterDisconnectEvent"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 3211847..93b1725 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -26,6 +26,7 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0027, &AC_U::GetInfraPriority, "GetInfraPriority"},
++        {0x002C, &AC_U::SetFromApplication, "SetFromApplication"},
+         {0x002D, &AC_U::SetRequestEulaVersion, "SetRequestEulaVersion"},
+         {0x002F, &AC_U::GetNZoneBeaconNotFoundEvent, "GetNZoneBeaconNotFoundEvent"},
+         {0x0030, &AC_U::RegisterDisconnectEvent, "RegisterDisconnectEvent"},
+diff --git a/src/core/hle/service/nim/nim_s.cpp b/src/core/hle/service/nim/nim_s.cpp
+index 06d9104..e0e857a 100644
+--- a/src/core/hle/service/nim/nim_s.cpp
++++ b/src/core/hle/service/nim/nim_s.cpp
+@@ -3,6 +3,8 @@
+ // Refer to the license.txt file included.
+ 
+ #include "common/archives.h"
++#include "common/logging/log.h"
++#include "core/hle/ipc_helpers.h"
+ #include "core/hle/service/nim/nim_s.h"
+ 
+ SERIALIZE_EXPORT_IMPL(Service::NIM::NIM_S)
+@@ -12,10 +14,11 @@ namespace Service::NIM {
+ NIM_S::NIM_S() : ServiceFramework("nim:s", 1) {
+     const FunctionInfo functions[] = {
+         // clang-format off
+-        {0x000A, nullptr, "CheckSysupdateAvailableSOAP"},
++        {0x000A, &NIM_S::CheckSysupdateAvailableSOAP, "CheckSysupdateAvailableSOAP"},
+         {0x0016, nullptr, "ListTitles"},
+         {0x0029, nullptr, "AccountCheckBalanceSOAP"},
+         {0x002D, nullptr, "DownloadTickets"},
++        {0x003F, &NIM_S::GetInitializeResult, "GetInitializeResult"},
+         {0x0042, nullptr, "StartDownload"},
+         // clang-format on
+     };
+@@ -24,4 +27,26 @@ NIM_S::NIM_S() : ServiceFramework("nim:s", 1) {
+ 
+ NIM_S::~NIM_S() = default;
+ 
++void NIM_S::CheckSysupdateAvailableSOAP(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    // Nintendo's update servers are gone and emulated system files aren't updated this way, so
++    // never report an update: apps such as the Nintendo Zone viewer stop using the connection
++    // when one is reported.
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u8>(0);
++
++    LOG_DEBUG(Service_NIM, "called, reporting no system update");
++}
++
++void NIM_S::GetInitializeResult(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_NIM, "called");
++}
++
+ } // namespace Service::NIM
+diff --git a/src/core/hle/service/nim/nim_s.h b/src/core/hle/service/nim/nim_s.h
+index 10b0414..19c8ce8 100644
+--- a/src/core/hle/service/nim/nim_s.h
++++ b/src/core/hle/service/nim/nim_s.h
+@@ -14,6 +14,21 @@ public:
+     ~NIM_S();
+ 
+ private:
++    /**
++     * NIM::CheckSysupdateAvailableSOAP service function
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     *      2 : u8, whether a system update is available
++     */
++    void CheckSysupdateAvailableSOAP(Kernel::HLERequestContext& ctx);
++
++    /**
++     * NIM::GetInitializeResult service function
++     *  Outputs:
++     *      1 : Result of NIM's initialization, 0 if it is ready
++     */
++    void GetInitializeResult(Kernel::HLERequestContext& ctx);
++
+     SERVICE_SERIALIZATION_SIMPLE
+ };
+ 
+-- 
+2.43.0
+
