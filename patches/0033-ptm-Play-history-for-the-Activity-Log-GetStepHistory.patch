@@ -1,0 +1,598 @@
+From d07a21acd559242107c048cf0fd3846f456c339e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 19:00:15 +0200
+Subject: [PATCH] ptm: Play history for the Activity Log, GetStepHistoryAll
+
+The Activity Log showed an empty Software Library: PTM kept no play history.
+
+- Play history in /PlayHistory.dat in the PTM system save data (0x00010022), in the
+  console's layout (https://www.3dbrew.org/wiki/PTM_Savegame): 0xC-byte entries with
+  the title ID and an event (launch/close, applet/application) plus minutes since
+  2000. The title that runs is logged as launched when emulation starts (also when
+  the HOME Menu starts a title, which restarts emulation) and as closed when it stops.
+  A file from a console (ring buffer) is read and kept, oldest entry first.
+- GetPlayHistory returns the entries, GetPlayHistoryLength their number.
+- GetStepHistoryAll (0x000F, Activity Log) answers with zeroed buffers and no entries;
+  its layout is not documented.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/CMakeLists.txt                       |   2 +
+ src/core/hle/service/ptm/ptm.cpp              | 133 +++++++++++++++++-
+ src/core/hle/service/ptm/ptm.h                |  37 ++++-
+ src/core/hle/service/ptm/ptm_gets.cpp         |   2 +-
+ src/core/hle/service/ptm/ptm_play.cpp         |   2 +-
+ src/core/hle/service/ptm/ptm_play_history.cpp |  63 +++++++++
+ src/core/hle/service/ptm/ptm_play_history.h   |  70 +++++++++
+ src/core/hle/service/ptm/ptm_sysm.cpp         |   2 +-
+ src/core/hle/service/ptm/ptm_u.cpp            |   2 +-
+ src/tests/CMakeLists.txt                      |   1 +
+ .../core/hle/service/ptm_play_history.cpp     |  65 +++++++++
+ 11 files changed, 366 insertions(+), 13 deletions(-)
+ create mode 100644 src/core/hle/service/ptm/ptm_play_history.cpp
+ create mode 100644 src/core/hle/service/ptm/ptm_play_history.h
+ create mode 100644 src/tests/core/hle/service/ptm_play_history.cpp
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 385aeb9..8ecf9c2 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -427,6 +427,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
+     hle/service/ps/ps_ps.cpp
+     hle/service/ps/ps_ps.h
+     hle/service/ptm/ptm.cpp
++    hle/service/ptm/ptm_play_history.cpp
++    hle/service/ptm/ptm_play_history.h
+     hle/service/ptm/ptm.h
+     hle/service/ptm/ptm_gets.cpp
+     hle/service/ptm/ptm_gets.h
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index 1d8bece..dd11506 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -10,6 +10,7 @@
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "core/file_sys/archive_extsavedata.h"
++#include "core/file_sys/archive_systemsavedata.h"
+ #include "core/file_sys/errors.h"
+ #include "core/file_sys/file_backend.h"
+ #include "core/hle/kernel/event.h"
+@@ -22,6 +23,7 @@
+ #include "core/hle/service/ptm/ptm_sets.h"
+ #include "core/hle/service/ptm/ptm_sysm.h"
+ #include "core/hle/service/ptm/ptm_u.h"
++#include "core/loader/loader.h"
+ 
+ SERIALIZE_EXPORT_IMPL(Service::PTM::Module)
+ SERVICE_CONSTRUCT_IMPL(Service::PTM::Module)
+@@ -191,11 +193,41 @@ void Module::Interface::GetPlayHistory(Kernel::HLERequestContext& ctx) {
+     const u32 count = rp.Pop<u32>();
+     auto& buffer = rp.PopMappedBuffer();
+ 
++    // Entries are kept oldest first, so the history starts at index 0.
++    const auto& entries = ptm->play_history.Entries();
++    using Entry = PlayHistory::Entry;
++    u32 written = 0;
++    for (u32 i = 0; i < count && start + i < entries.size() &&
++                    (written + 1) * sizeof(Entry) <= buffer.GetSize();
++         i++) {
++        buffer.Write(&entries[start + i], written * sizeof(Entry), sizeof(Entry));
++        written++;
++    }
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
+     rb.Push(ResultSuccess);
+-    rb.Push<u32>(0);
++    rb.Push<u32>(written);
+     rb.PushMappedBuffer(buffer);
+-    LOG_DEBUG(Service_PTM, "start={}, count={} (no play history)", start, count);
++    LOG_DEBUG(Service_PTM, "start={}, count={}, written={}", start, count, written);
++}
++
++void Module::Interface::GetStepHistoryAll(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 size1 = rp.Pop<u32>();
++    const u32 size2 = rp.Pop<u32>();
++    auto& buffer1 = rp.PopMappedBuffer();
++    auto& buffer2 = rp.PopMappedBuffer();
++
++    std::vector<u8> zeros(std::max<std::size_t>(buffer1.GetSize(), buffer2.GetSize()), 0);
++    buffer1.Write(zeros.data(), 0, buffer1.GetSize());
++    buffer2.Write(zeros.data(), 0, buffer2.GetSize());
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 4);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0);
++    rb.PushMappedBuffer(buffer1);
++    rb.PushMappedBuffer(buffer2);
++    LOG_DEBUG(Service_PTM, "size1={:#x}, size2={:#x} (no step log)", size1, size2);
+ }
+ 
+ void Module::Interface::GetPlayHistoryStart(Kernel::HLERequestContext& ctx) {
+@@ -208,10 +240,11 @@ void Module::Interface::GetPlayHistoryStart(Kernel::HLERequestContext& ctx) {
+ 
+ void Module::Interface::GetPlayHistoryLength(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
++    const u32 length = static_cast<u32>(ptm->play_history.Entries().size());
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push<u32>(0);
+-    LOG_DEBUG(Service_PTM, "called");
++    rb.Push<u32>(length);
++    LOG_DEBUG(Service_PTM, "length={}", length);
+ }
+ 
+ void CheckNew3DS(IPC::RequestBuilder& rb) {
+@@ -363,6 +396,98 @@ Module::Module(Core::System& system_) : system(system_) {
+     if (archive_result.Code() == FileSys::ResultNotFormatted) {
+         WriteGameCoinData(default_game_coin);
+     }
++
++    LoadPlayHistory();
++    if (system.GetAppLoader().ReadProgramId(running_title_id) != Loader::ResultStatus::Success) {
++        running_title_id = 0;
++    }
++    if (running_title_id != 0) {
++        launch_ms_since_2000 = system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
++        launch_host_time = std::chrono::steady_clock::now();
++        const u8 event = PlayHistory::IsApplet(running_title_id) ? PlayHistory::Applet : 0;
++        play_history.Add(running_title_id, event, launch_ms_since_2000);
++        SavePlayHistory();
++        LOG_INFO(Service_PTM, "Play history: {:016X} launched", running_title_id);
++    }
++}
++
++Module::~Module() {
++    if (running_title_id == 0) {
++        return;
++    }
++    // The kernel may already be gone here; the close time is the launch time plus the time
++    // that has passed since.
++    const auto played = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now() - launch_host_time);
++    const u8 event =
++        PlayHistory::Close | (PlayHistory::IsApplet(running_title_id) ? PlayHistory::Applet : 0);
++    play_history.Add(running_title_id, event,
++                     launch_ms_since_2000 + static_cast<u64>(played.count()));
++    SavePlayHistory();
++    LOG_INFO(Service_PTM, "Play history: {:016X} closed after {} min", running_title_id,
++             played.count() / 60000);
++}
++
++namespace {
++constexpr std::array<u8, 8> ptm_system_savedata_id{0x00, 0x00, 0x00, 0x00, 0x22, 0x00, 0x01, 0x00};
++constexpr char play_history_path[] = "/PlayHistory.dat";
++
++std::unique_ptr<FileSys::ArchiveBackend> OpenPtmSaveData() {
++    const std::string& nand_directory = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir);
++    FileSys::ArchiveFactory_SystemSaveData factory(nand_directory);
++    const FileSys::Path archive_path(
++        std::vector<u8>(ptm_system_savedata_id.begin(), ptm_system_savedata_id.end()));
++    if (factory.Open(archive_path, 0).Code() == FileSys::ResultNotFound) {
++        factory.Format(archive_path, FileSys::ArchiveFormatInfo(), 0, 0, 0);
++    }
++    auto archive_result = factory.Open(archive_path, 0);
++    if (archive_result.Failed()) {
++        LOG_ERROR(Service_PTM, "Could not open the PTM system save data");
++        return nullptr;
++    }
++    return std::move(archive_result).Unwrap();
++}
++} // namespace
++
++void Module::LoadPlayHistory() {
++    auto archive = OpenPtmSaveData();
++    if (!archive) {
++        return;
++    }
++    FileSys::Mode mode{};
++    mode.read_flag.Assign(1);
++    auto file_result = archive->OpenFile(FileSys::Path(play_history_path), mode);
++    if (file_result.Failed()) {
++        return; // No history yet.
++    }
++    auto file = std::move(file_result).Unwrap();
++    std::vector<u8> data(file->GetSize());
++    file->Read(0, data.size(), data.data());
++    file->Close();
++    if (!play_history.Load(data)) {
++        LOG_WARNING(Service_PTM, "PlayHistory.dat is not a valid play history; starting a new one");
++    }
++}
++
++void Module::SavePlayHistory() const {
++    auto archive = OpenPtmSaveData();
++    if (!archive) {
++        return;
++    }
++    const std::vector<u8> data = play_history.Save();
++    const FileSys::Path path(play_history_path);
++    FileSys::Mode mode{};
++    mode.write_flag.Assign(1);
++    mode.create_flag.Assign(1);
++    auto file_result = archive->OpenFile(path, mode);
++    if (file_result.Failed()) {
++        LOG_ERROR(Service_PTM, "Could not write PlayHistory.dat");
++        return;
++    }
++    auto file = std::move(file_result).Unwrap();
++    file->SetSize(data.size());
++    file->Write(0, data.size(), true, false, data.data());
++    file->Close();
+ }
+ 
+ template <class Archive>
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index 81ba906..de464c2 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -6,9 +6,11 @@
+ 
+ #include <vector>
+ 
++#include <chrono>
+ #include <memory>
+ #include "common/common_types.h"
+ #include "core/hle/ipc_helpers.h"
++#include "core/hle/service/ptm/ptm_play_history.h"
+ #include "core/hle/service/service.h"
+ 
+ namespace Core {
+@@ -59,7 +61,8 @@ public:
+ 
+     /// Hour-by-hour steps of the virtual walk, as GetStepHistory reports them.
+     static std::vector<u16> VirtualStepHistory(u64 start_ms, u32 hours, u64 now_ms);
+-    ~Module() = default;
++    /// Logs the running title as closed in the play history.
++    ~Module();
+ 
+     static u16 GetPlayCoins();
+     static void SetPlayCoins(u16 play_coins);
+@@ -170,12 +173,12 @@ public:
+         void ClearSoftwareClosedFlag(Kernel::HLERequestContext& ctx);
+ 
+         /**
+-         * PTM::GetPlayHistory service function (Activity Log, HOME Menu). Tangelo doesn't record
+-         * play history yet, so no entries are returned.
++         * PTM::GetPlayHistory service function (Activity Log, HOME Menu): 0xC-byte entries from
++         * the play history (see PlayHistory).
+          *  Inputs:
+          *      1: Index of the first entry
+          *      2: Number of entries
+-         *      3-4: Mapped output buffer (8 bytes per entry)
++         *      3-4: Mapped output buffer (0xC bytes per entry)
+          *  Outputs:
+          *      1: Result code, 0 on success, otherwise error code
+          *      2: Number of entries written
+@@ -184,7 +187,8 @@ public:
+ 
+         /**
+          * PTM::GetPlayHistoryStart / GetPlayHistoryLength service functions: the index of the
+-         * first play history entry and the number of entries (both 0, the history is empty).
++         * first play history entry (always 0, Tangelo keeps it oldest first) and the number of
++         * entries.
+          *  Outputs:
+          *      1: Result code, 0 on success, otherwise error code
+          *      2: u32 value
+@@ -192,6 +196,19 @@ public:
+         void GetPlayHistoryStart(Kernel::HLERequestContext& ctx);
+         void GetPlayHistoryLength(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * PTM::GetStepHistoryAll service function (Activity Log). The layout of its two output
++         * buffers is not documented; Tangelo keeps no step log beyond GetStepHistory, so they
++         * are zeroed and no entries are reported.
++         *  Inputs:
++         *      1-2 : Sizes of the two output buffers
++         *      3-6 : Mapped output buffers
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2 : Number of entries (0)
++         */
++        void GetStepHistoryAll(Kernel::HLERequestContext& ctx);
++
+         /**
+          * PTM::CheckNew3DS service function
+          *  Outputs:
+@@ -225,6 +242,16 @@ private:
+     bool battery_is_charging = true;
+     bool pedometer_is_counting = false;
+ 
++    /// Play history (/PlayHistory.dat in the PTM system save data 0x00010022). A title is
++    /// logged as launched when emulation starts (also after the HOME Menu starts a title, which
++    /// restarts emulation with that title) and as closed when it stops.
++    void LoadPlayHistory();
++    void SavePlayHistory() const;
++    PlayHistory play_history;
++    u64 running_title_id = 0;
++    u64 launch_ms_since_2000 = 0;
++    std::chrono::steady_clock::time_point launch_host_time;
++
+     template <class Archive>
+     void serialize(Archive& ar, const unsigned int);
+     friend class boost::serialization::access;
+diff --git a/src/core/hle/service/ptm/ptm_gets.cpp b/src/core/hle/service/ptm/ptm_gets.cpp
+index 25ece18..7b0ccc5 100644
+--- a/src/core/hle/service/ptm/ptm_gets.cpp
++++ b/src/core/hle/service/ptm/ptm_gets.cpp
+@@ -28,7 +28,7 @@ PTM_Gets::PTM_Gets(std::shared_ptr<Module> ptm)
+         {0x000C, &PTM_Gets::GetTotalStepCount, "GetTotalStepCount"},
+         {0x000D, nullptr, "SetPedometerRecordingMode"},
+         {0x000E, nullptr, "GetPedometerRecordingMode"},
+-        {0x000F, nullptr, "GetStepHistoryAll"},
++        {0x000F, &PTM_Gets::GetStepHistoryAll, "GetStepHistoryAll"},
+         // ptm:gets
+         {0x0401, &PTM_Gets::GetSystemTime, "GetSystemTime"},
+         // clang-format on
+diff --git a/src/core/hle/service/ptm/ptm_play.cpp b/src/core/hle/service/ptm/ptm_play.cpp
+index 6f731e7..06cbf69 100644
+--- a/src/core/hle/service/ptm/ptm_play.cpp
++++ b/src/core/hle/service/ptm/ptm_play.cpp
+@@ -28,7 +28,7 @@ PTM_Play::PTM_Play(std::shared_ptr<Module> ptm)
+         {0x000C, &PTM_Play::GetTotalStepCount, "GetTotalStepCount"},
+         {0x000D, nullptr, "SetPedometerRecordingMode"},
+         {0x000E, nullptr, "GetPedometerRecordingMode"},
+-        {0x000F, nullptr, "GetStepHistoryAll"},
++        {0x000F, &PTM_Play::GetStepHistoryAll, "GetStepHistoryAll"},
+         // ptm:play
+         {0x0807, &PTM_Play::GetPlayHistory, "GetPlayHistory"},
+         {0x0808, &PTM_Play::GetPlayHistoryStart, "GetPlayHistoryStart"},
+diff --git a/src/core/hle/service/ptm/ptm_play_history.cpp b/src/core/hle/service/ptm/ptm_play_history.cpp
+new file mode 100644
+index 0000000..5d8b2c3
+--- /dev/null
++++ b/src/core/hle/service/ptm/ptm_play_history.cpp
+@@ -0,0 +1,63 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cstring>
++#include "core/hle/service/ptm/ptm_play_history.h"
++
++namespace Service::PTM {
++
++bool PlayHistory::Load(std::span<const u8> file) {
++    entries.clear();
++    if (file.size() < 8) {
++        return false;
++    }
++    u32 start = 0;
++    u32 count = 0;
++    std::memcpy(&start, file.data(), sizeof(u32));
++    std::memcpy(&count, file.data() + 4, sizeof(u32));
++    const std::size_t capacity = (file.size() - 8) / sizeof(Entry);
++    if (capacity == 0 || start >= capacity || count > capacity) {
++        return count == 0;
++    }
++    entries.resize(count);
++    for (u32 i = 0; i < count; i++) {
++        const std::size_t index = (start + i) % capacity;
++        std::memcpy(&entries[i], file.data() + 8 + index * sizeof(Entry), sizeof(Entry));
++    }
++    return true;
++}
++
++std::vector<u8> PlayHistory::Save() const {
++    std::vector<u8> file(FileSize, 0);
++    const u32 start = 0;
++    const u32 count = static_cast<u32>(entries.size());
++    std::memcpy(file.data(), &start, sizeof(u32));
++    std::memcpy(file.data() + 4, &count, sizeof(u32));
++    if (!entries.empty()) {
++        std::memcpy(file.data() + 8, entries.data(), entries.size() * sizeof(Entry));
++    }
++    return file;
++}
++
++PlayHistory::Entry PlayHistory::MakeEntry(u64 title_id, u8 event, u64 ms_since_2000) {
++    const u64 minutes = ms_since_2000 / 60000;
++    return Entry{
++        .title_id_high = static_cast<u32>(title_id >> 32),
++        .title_id_low = static_cast<u32>(title_id),
++        .info_and_time = (static_cast<u32>(minutes & 0x0FFFFFFF) << 4) | (event & 0xF),
++    };
++}
++
++void PlayHistory::Add(u64 title_id, u8 event, u64 ms_since_2000) {
++    if (entries.size() >= MaxEntries) {
++        entries.erase(entries.begin(), entries.begin() + (entries.size() - MaxEntries + 1));
++    }
++    entries.push_back(MakeEntry(title_id, event, ms_since_2000));
++}
++
++bool PlayHistory::IsApplet(u64 title_id) {
++    return (title_id >> 32) == 0x00040030;
++}
++
++} // namespace Service::PTM
+diff --git a/src/core/hle/service/ptm/ptm_play_history.h b/src/core/hle/service/ptm/ptm_play_history.h
+new file mode 100644
+index 0000000..ba00842
+--- /dev/null
++++ b/src/core/hle/service/ptm/ptm_play_history.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <span>
++#include <vector>
++#include "common/common_types.h"
++
++namespace Service::PTM {
++
++/**
++ * The play log PTM keeps in its save data (/PlayHistory.dat) and hands to the Activity Log
++ * (GetPlayHistory). See https://www.3dbrew.org/wiki/PTM_Savegame
++ */
++class PlayHistory {
++public:
++    /// One log entry (0xC bytes): title ID high, title ID low, event bits 0-3 + minutes since
++    /// 2000-01-01 in bits 4-31.
++    struct Entry {
++        u32 title_id_high = 0;
++        u32 title_id_low = 0;
++        u32 info_and_time = 0;
++
++        u64 TitleId() const {
++            return (static_cast<u64>(title_id_high) << 32) | title_id_low;
++        }
++        u8 Event() const {
++            return static_cast<u8>(info_and_time & 0xF);
++        }
++        u32 Minutes() const {
++            return info_and_time >> 4;
++        }
++    };
++    static_assert(sizeof(Entry) == 0xC);
++
++    /// Event bits: bit 0 = closed, bit 1 = applet, bit 2 = resume/suspend.
++    enum EventBits : u8 {
++        Close = 1 << 0,
++        Applet = 1 << 1,
++        ResumeSuspend = 1 << 2,
++    };
++
++    static constexpr u32 MaxEntries = 0x11D28;
++    static constexpr std::size_t FileSize = 8 + MaxEntries * sizeof(Entry); // 0xD5DE8
++
++    /// Reads PlayHistory.dat (a ring buffer: start index, entry count, entries). Returns false
++    /// and leaves the history empty if the data is not a valid play history.
++    bool Load(std::span<const u8> file);
++    /// The file contents, with the oldest entry first (start index 0).
++    std::vector<u8> Save() const;
++
++    /// Adds an entry; the oldest entry is dropped when the log is full.
++    void Add(u64 title_id, u8 event, u64 ms_since_2000);
++
++    static Entry MakeEntry(u64 title_id, u8 event, u64 ms_since_2000);
++    /// Whether a title is logged as an applet (HOME Menu, Activity Log, ...) rather than an
++    /// application: system applets have title ID high 0x00040030.
++    static bool IsApplet(u64 title_id);
++
++    const std::vector<Entry>& Entries() const {
++        return entries;
++    }
++
++private:
++    std::vector<Entry> entries; // oldest first
++};
++
++} // namespace Service::PTM
+diff --git a/src/core/hle/service/ptm/ptm_sysm.cpp b/src/core/hle/service/ptm/ptm_sysm.cpp
+index 3b1521d..c7476cc 100644
+--- a/src/core/hle/service/ptm/ptm_sysm.cpp
++++ b/src/core/hle/service/ptm/ptm_sysm.cpp
+@@ -29,7 +29,7 @@ PTM_S_Common::PTM_S_Common(std::shared_ptr<Module> ptm, const char* name)
+         {0x000C, &PTM_S_Common::GetTotalStepCount, "GetTotalStepCount"},
+         {0x000D, nullptr, "SetPedometerRecordingMode"},
+         {0x000E, nullptr, "GetPedometerRecordingMode"},
+-        {0x000F, nullptr, "GetStepHistoryAll"},
++        {0x000F, &PTM_S_Common::GetStepHistoryAll, "GetStepHistoryAll"},
+         // ptm:sysm & ptm:s
+         {0x0401, nullptr, "SetRtcAlarmEx"},
+         {0x0402, nullptr, "ReplySleepQuery"},
+diff --git a/src/core/hle/service/ptm/ptm_u.cpp b/src/core/hle/service/ptm/ptm_u.cpp
+index 6eefa75..aa2610a 100644
+--- a/src/core/hle/service/ptm/ptm_u.cpp
++++ b/src/core/hle/service/ptm/ptm_u.cpp
+@@ -26,7 +26,7 @@ PTM_U::PTM_U(std::shared_ptr<Module> ptm) : Module::Interface(std::move(ptm), "p
+         {0x000C, &PTM_U::GetTotalStepCount, "GetTotalStepCount"},
+         {0x000D, nullptr, "SetPedometerRecordingMode"},
+         {0x000E, nullptr, "GetPedometerRecordingMode"},
+-        {0x000F, nullptr, "GetStepHistoryAll"},
++        {0x000F, &PTM_U::GetStepHistoryAll, "GetStepHistoryAll"},
+         // clang-format on
+     };
+     RegisterHandlers(functions);
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 755ba19..97035af 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -11,6 +11,7 @@ add_executable(tests
+     core/hle/service/boss_download.cpp
+     core/hle/service/boss_storage.cpp
+     core/hle/service/cecd_message.cpp
++    core/hle/service/ptm_play_history.cpp
+     core/hle/service/ptm_steps.cpp
+     core/hle/service/spotpass_redirect.cpp
+     core/memory/memory.cpp
+diff --git a/src/tests/core/hle/service/ptm_play_history.cpp b/src/tests/core/hle/service/ptm_play_history.cpp
+new file mode 100644
+index 0000000..c838c98
+--- /dev/null
++++ b/src/tests/core/hle/service/ptm_play_history.cpp
+@@ -0,0 +1,65 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cstring>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/service/ptm/ptm_play_history.h"
++
++using Service::PTM::PlayHistory;
++
++TEST_CASE("Play history entries use the PTM save data layout", "[service][ptm]") {
++    constexpr u64 MiiPlaza = 0x0004001000022800;
++    // 2026-09-29 18:00 = 13,787,640 minutes after 2000-01-01.
++    constexpr u64 Ms = 13'787'640ULL * 60'000 + 59'999;
++    const auto entry = PlayHistory::MakeEntry(MiiPlaza, PlayHistory::Close, Ms);
++    CHECK(entry.title_id_high == 0x00040010);
++    CHECK(entry.title_id_low == 0x00022800);
++    CHECK(entry.Minutes() == 13'787'640);
++    CHECK(entry.Event() == PlayHistory::Close);
++
++    CHECK(PlayHistory::IsApplet(0x0004003000009802)); // HOME Menu
++    CHECK_FALSE(PlayHistory::IsApplet(MiiPlaza));
++    CHECK_FALSE(PlayHistory::IsApplet(0x0004000000198F00));
++}
++
++TEST_CASE("Play history is saved oldest first and loaded from a ring buffer", "[service][ptm]") {
++    PlayHistory history;
++    history.Add(0x0004003000009802, PlayHistory::Applet, 60'000);
++    history.Add(0x0004001000022800, 0, 120'000);
++    history.Add(0x0004001000022800, PlayHistory::Close, 180'000);
++
++    const auto file = history.Save();
++    REQUIRE(file.size() == PlayHistory::FileSize);
++    CHECK(file.size() == 0xD5DE8);
++    u32 start = 1, count = 0;
++    std::memcpy(&start, file.data(), 4);
++    std::memcpy(&count, file.data() + 4, 4);
++    CHECK(start == 0);
++    CHECK(count == 3);
++
++    PlayHistory loaded;
++    REQUIRE(loaded.Load(file));
++    REQUIRE(loaded.Entries().size() == 3);
++    CHECK(loaded.Entries()[0].TitleId() == 0x0004003000009802);
++    CHECK(loaded.Entries()[2].Event() == PlayHistory::Close);
++
++    // A console's file where the log wrapped: start index 2 of a 4-entry buffer.
++    std::vector<u8> ring(8 + 4 * sizeof(PlayHistory::Entry), 0);
++    const u32 ring_start = 2, ring_count = 3;
++    std::memcpy(ring.data(), &ring_start, 4);
++    std::memcpy(ring.data() + 4, &ring_count, 4);
++    for (u32 slot = 0; slot < 4; slot++) {
++        const auto e = PlayHistory::MakeEntry(0x1000 + slot, 0, slot * 60'000ULL);
++        std::memcpy(ring.data() + 8 + slot * sizeof(e), &e, sizeof(e));
++    }
++    REQUIRE(loaded.Load(ring));
++    REQUIRE(loaded.Entries().size() == 3);
++    CHECK(loaded.Entries()[0].TitleId() == 0x1002);
++    CHECK(loaded.Entries()[1].TitleId() == 0x1003);
++    CHECK(loaded.Entries()[2].TitleId() == 0x1000);
++
++    CHECK_FALSE(loaded.Load(std::vector<u8>{1, 2, 3}));
++    CHECK(loaded.Entries().empty());
++}
+-- 
+2.43.0
+
