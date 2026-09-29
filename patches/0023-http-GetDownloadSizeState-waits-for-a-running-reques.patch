@@ -1,0 +1,99 @@
+From 7237e3ff83021f5338e8cf659e4fd13a35c50091 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 02:12:27 +0200
+Subject: [PATCH] http: GetDownloadSizeState waits for a running request
+
+The host performs a whole HTTP request at once, and GetDownloadSizeState
+reported a total of 0 until it had finished. The real console reports
+the size as soon as the response headers are in.
+
+The BOSS module calls GetDownloadSizeState right after BeginRequest.
+With a fast (local) SpotPass server it got 0, never read the data,
+marked the task as failed and Disney Magical World showed error
+004-6007, although the server had sent a valid 742-byte file.
+
+GetDownloadSizeState now waits for a running request in the
+background (like GetResponseStatusCode), then reports the real size.
+It falls back to the body length when there is no Content-Length
+header. Requests that haven't started still report 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/http/http_c.cpp | 58 ++++++++++++++++++----------
+ 1 file changed, 37 insertions(+), 21 deletions(-)
+
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 7c2b471..59d90f1 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -2058,29 +2058,45 @@ void HTTP_C::GetDownloadSizeState(Kernel::HLERequestContext& ctx) {
+         return;
+     }
+ 
+-    Context& http_context = GetContext(context_handle);
+-
+-    // On the real console, the current downloaded progress and the total size of the content gets
+-    // returned. Since we do not support chunked downloads on the host, always return the content
+-    // length if the download is complete and 0 otherwise.
+-    u32 content_length = 0;
+-    const bool is_complete = http_context.request_future.wait_for(std::chrono::milliseconds(0)) ==
+-                             std::future_status::ready;
+-    if (is_complete) {
+-        const auto& headers = http_context.response.headers;
+-        const auto& it = headers.find("Content-Length");
+-        if (it != headers.end()) {
+-            content_length = std::stoi(it->second);
+-        }
+-    }
++    // On the real console this reports the downloaded amount and the total size as soon as the
++    // response headers are in. The host performs the whole request at once, so a request that is
++    // still running is waited for first (like GetResponseStatusCode does); otherwise a caller that
++    // asks right after BeginRequest (e.g. the BOSS module) sees a total of 0 and gives up.
++    ctx.RunAsync(
++        [this, context_handle](Kernel::HLERequestContext& ctx) {
++            Context& http_context = GetContext(context_handle);
++            if (http_context.request_future.valid()) {
++                http_context.request_future.wait();
++            }
++            return 0;
++        },
++        [this, context_handle](Kernel::HLERequestContext& ctx) {
++            Context& http_context = GetContext(context_handle);
++
++            u32 content_length = 0;
++            const bool is_complete = http_context.request_future.valid() &&
++                                     http_context.request_future.wait_for(
++                                         std::chrono::milliseconds(0)) == std::future_status::ready;
++            if (is_complete) {
++                const auto& headers = http_context.response.headers;
++                const auto it = headers.find("Content-Length");
++                if (it != headers.end()) {
++                    content_length =
++                        static_cast<u32>(std::strtoul(it->second.c_str(), nullptr, 10));
++                } else {
++                    content_length = static_cast<u32>(http_context.response.body.size());
++                }
++            }
+ 
+-    LOG_DEBUG(Service_HTTP, "current={}, total={}", http_context.current_copied_data,
+-              content_length);
++            LOG_DEBUG(Service_HTTP, "current={}, total={}", http_context.current_copied_data,
++                      content_length);
+ 
+-    IPC::RequestBuilder rb = rp.MakeBuilder(3, 0);
+-    rb.Push(ResultSuccess);
+-    rb.Push(static_cast<u32>(http_context.current_copied_data));
+-    rb.Push(content_length);
++            IPC::RequestBuilder rb(ctx, static_cast<u16>(ctx.CommandHeader().command_id.Value()), 3,
++                                   0);
++            rb.Push(ResultSuccess);
++            rb.Push(static_cast<u32>(http_context.current_copied_data));
++            rb.Push(content_length);
++        });
+ }
+ 
+ SessionData* HTTP_C::EnsureSessionInitialized(Kernel::HLERequestContext& ctx,
+-- 
+2.43.0
+

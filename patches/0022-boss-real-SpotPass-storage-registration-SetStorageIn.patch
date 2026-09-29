@@ -1,0 +1,702 @@
+From 195eb2578c34c974dc24d73f08595425f931a32b Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 29 Sep 2026 01:36:24 +0200
+Subject: [PATCH] boss: real SpotPass storage registration
+ (SetStorageInfo/GetStorageInfo)
+
+HLE BOSS answered GetStorageInfo with 0 and ignored SetStorageInfo, so a
+title that had registered its SpotPass storage (e.g. Disney Magical World
+with online LLE on) found none with LLE off and showed "The SD card is
+not readable".
+
+- BOSS_A.db (the BOSS module's per-title database, layout from 3dbrew
+  "BOSS Savegame") is now read when a session is initialized, so storage
+  registered by the real module is picked up.
+- SetStorageInfo stores the extdata ID, size and media type and writes
+  them to the title's BOSS_A.db entry (updating it, or appending a new
+  entry), so the registration survives restarts and is shared with LLE.
+- GetStorageInfo returns the registered size; UnregisterStorage clears it.
+- The registered extdata ID is used to find downloaded SpotPass files.
+- DeleteNsData deletes the matching file from the SpotPass extdata
+  (unknown IDs still succeed, as before).
+- OnlineService serialization gets version 1 for the new fields; older
+  savestates still load.
+
+Tests: src/tests/core/hle/service/boss_storage.cpp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/CMakeLists.txt                      |   2 +
+ src/core/hle/service/boss/boss.cpp           |  44 +++--
+ src/core/hle/service/boss/boss_storage.cpp   | 117 +++++++++++++
+ src/core/hle/service/boss/boss_storage.h     |  56 ++++++
+ src/core/hle/service/boss/online_service.cpp | 174 ++++++++++++++++---
+ src/core/hle/service/boss/online_service.h   |  25 ++-
+ src/tests/CMakeLists.txt                     |   1 +
+ src/tests/core/hle/service/boss_storage.cpp  |  87 ++++++++++
+ 8 files changed, 468 insertions(+), 38 deletions(-)
+ create mode 100644 src/core/hle/service/boss/boss_storage.cpp
+ create mode 100644 src/core/hle/service/boss/boss_storage.h
+ create mode 100644 src/tests/core/hle/service/boss_storage.cpp
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index cd2d363..5188fba 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -248,6 +248,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
+     hle/service/boss/boss_p.h
+     hle/service/boss/boss_u.cpp
+     hle/service/boss/boss_u.h
++    hle/service/boss/boss_storage.cpp
++    hle/service/boss/boss_storage.h
+     hle/service/boss/online_service.cpp
+     hle/service/boss/online_service.h
+     hle/service/cam/cam.cpp
+diff --git a/src/core/hle/service/boss/boss.cpp b/src/core/hle/service/boss/boss.cpp
+index c30d423..b523579 100644
+--- a/src/core/hle/service/boss/boss.cpp
++++ b/src/core/hle/service/boss/boss.cpp
+@@ -79,31 +79,49 @@ void Module::Interface::SetStorageInfo(Kernel::HLERequestContext& ctx) {
+     const u32 boss_size = rp.Pop<u32>();
+     const u8 extdata_type = rp.Pop<u8>(); /// 0 = NAND, 1 = SD
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    const Result result = online_service->SetStorageInfo(
++        {.extdata_id = extdata_id, .size = boss_size, .media_type = extdata_type});
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+-    rb.Push(ResultSuccess);
++    rb.Push(result);
+ 
+-    LOG_WARNING(Service_BOSS,
+-                "(STUBBED) extdata_id={:#018x}, boss_size={:#010x}, extdata_type={:#04x}",
+-                extdata_id, boss_size, extdata_type);
++    LOG_DEBUG(Service_BOSS, "called, extdata_id={:#018x}, boss_size={:#010x}, extdata_type={:#04x}",
++              extdata_id, boss_size, extdata_type);
+ }
+ 
+ void Module::Interface::UnregisterStorage(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    const Result result = online_service->UnregisterStorage();
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+-    rb.Push(ResultSuccess);
++    rb.Push(result);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) called");
++    LOG_DEBUG(Service_BOSS, "called");
+ }
+ 
+ void Module::Interface::GetStorageInfo(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    const u32 storage_size = online_service->GetStorageSize();
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push<u32>(0);
++    rb.Push<u32>(storage_size);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) called");
++    LOG_DEBUG(Service_BOSS, "called, storage_size={:#x}", storage_size);
+ }
+ 
+ void Module::Interface::RegisterPrivateRootCa(Kernel::HLERequestContext& ctx) {
+@@ -623,10 +641,16 @@ void Module::Interface::DeleteNsData(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u32 ns_data_id = rp.Pop<u32>();
+ 
++    const auto online_service = GetSessionService(ctx, rp);
++    if (online_service == nullptr) {
++        return;
++    }
++    const Result result = online_service->DeleteNsData(ns_data_id);
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+-    rb.Push(ResultSuccess);
++    rb.Push(result);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) ns_data_id={:#010x}", ns_data_id);
++    LOG_DEBUG(Service_BOSS, "called, ns_data_id={:#010x}, result={:#010x}", ns_data_id, result.raw);
+ }
+ 
+ void Module::Interface::GetNsDataHeaderInfo(Kernel::HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/boss/boss_storage.cpp b/src/core/hle/service/boss/boss_storage.cpp
+new file mode 100644
+index 0000000..b5c4d8d
+--- /dev/null
++++ b/src/core/hle/service/boss/boss_storage.cpp
+@@ -0,0 +1,117 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cstring>
++#include "core/hle/service/boss/boss_storage.h"
++
++namespace Service::BOSS::BossA {
++
++namespace {
++
++// Entry header
++constexpr std::size_t EntryProgramId = 0x0;
++constexpr std::size_t EntryValid = 0x8;
++constexpr std::size_t EntryVersion = 0x9;
++constexpr u8 LatestVersion = 3;
++// Title information
++constexpr std::size_t TitleInfo = 0x10;
++constexpr std::size_t TitleProgramId = TitleInfo + 0x0;
++constexpr std::size_t TitleSessionMaker = TitleInfo + 0x8;
++constexpr u8 SessionMakerUser = 1;
++// StorageEntry
++constexpr std::size_t Storage = TitleInfo + 0x10;
++constexpr std::size_t StorageRegistered = Storage + 0x0;
++constexpr std::size_t StorageMediaType = Storage + 0x1;
++constexpr std::size_t StorageSize = Storage + 0x4;
++constexpr std::size_t StorageExtdataId = Storage + 0x8;
++
++template <typename T>
++T Get(std::span<const u8> data, std::size_t offset) {
++    T value;
++    std::memcpy(&value, data.data() + offset, sizeof(T));
++    return value;
++}
++
++template <typename T>
++void Put(std::span<u8> data, std::size_t offset, T value) {
++    std::memcpy(data.data() + offset, &value, sizeof(T));
++}
++
++bool IsWellFormed(std::span<const u8> db) {
++    return db.size() >= HeaderSize && (db.size() - HeaderSize) % EntrySize == 0 &&
++           Get<u32>(db, 0) == Magic;
++}
++
++std::optional<std::size_t> FindEntry(std::span<const u8> db, u64 program_id) {
++    for (std::size_t offset = HeaderSize; offset + EntrySize <= db.size(); offset += EntrySize) {
++        const auto entry = db.subspan(offset, EntrySize);
++        if (entry[EntryValid] != 0 && Get<u64>(entry, EntryProgramId) == program_id) {
++            return offset;
++        }
++    }
++    return std::nullopt;
++}
++
++} // namespace
++
++std::optional<StorageInfo> FindStorage(std::span<const u8> db, u64 program_id) {
++    if (!IsWellFormed(db)) {
++        return std::nullopt;
++    }
++    const auto offset = FindEntry(db, program_id);
++    if (!offset) {
++        return std::nullopt;
++    }
++    const auto entry = db.subspan(*offset, EntrySize);
++    if (entry[StorageRegistered] == 0) {
++        return std::nullopt;
++    }
++    return StorageInfo{
++        .extdata_id = Get<u64>(entry, StorageExtdataId),
++        .size = Get<u32>(entry, StorageSize),
++        .media_type = entry[StorageMediaType],
++    };
++}
++
++bool SetStorage(std::vector<u8>& db, u64 program_id, const std::optional<StorageInfo>& storage) {
++    if (!IsWellFormed(db)) {
++        if (!storage) {
++            return false;
++        }
++        db.assign(HeaderSize, 0);
++        Put<u32>(db, 0, Magic);
++    }
++
++    auto offset = FindEntry(db, program_id);
++    if (!offset) {
++        if (!storage) {
++            return false;
++        }
++        offset = db.size();
++        db.resize(db.size() + EntrySize, 0);
++        std::span<u8> entry(db.data() + *offset, EntrySize);
++        Put<u64>(entry, EntryProgramId, program_id);
++        entry[EntryValid] = 1;
++        entry[EntryVersion] = LatestVersion;
++        Put<u64>(entry, TitleProgramId, program_id);
++        entry[TitleSessionMaker] = SessionMakerUser;
++    }
++
++    std::span<u8> entry(db.data() + *offset, EntrySize);
++    const std::vector<u8> before(entry.begin() + Storage, entry.begin() + Storage + 0x10);
++    if (storage) {
++        entry[StorageRegistered] = 1;
++        entry[StorageMediaType] = storage->media_type;
++        Put<u32>(entry, StorageSize, storage->size);
++        Put<u64>(entry, StorageExtdataId, storage->extdata_id);
++    } else {
++        entry[StorageRegistered] = 0;
++        entry[StorageMediaType] = 0;
++        Put<u32>(entry, StorageSize, 0);
++        Put<u64>(entry, StorageExtdataId, 0);
++    }
++    return !std::equal(before.begin(), before.end(), entry.begin() + Storage);
++}
++
++} // namespace Service::BOSS::BossA
+diff --git a/src/core/hle/service/boss/boss_storage.h b/src/core/hle/service/boss/boss_storage.h
+new file mode 100644
+index 0000000..38cfcd2
+--- /dev/null
++++ b/src/core/hle/service/boss/boss_storage.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <optional>
++#include <span>
++#include <vector>
++#include "common/common_types.h"
++
++namespace Service::BOSS {
++
++/// SpotPass storage registered by a title with SetStorageInfo (the StorageEntry in BOSS_A.db).
++struct StorageInfo {
++    u64 extdata_id = 0;
++    u32 size = 0;
++    u8 media_type = 1; ///< 0: NAND, 1: SD
++
++    bool operator==(const StorageInfo&) const = default;
++
++    template <class Archive>
++    void serialize(Archive& ar, const unsigned int) {
++        ar & extdata_id;
++        ar & size;
++        ar & media_type;
++    }
++};
++
++/**
++ * Reading and updating BOSS_A.db, the per-title database of the BOSS module
++ * (https://www.3dbrew.org/wiki/BOSS_Savegame): a u32 magic 0x12348000 followed by 0x800-byte
++ * entries. Each entry starts with {u64 program ID, bool valid, u8 version} and holds the title
++ * information at 0x10: {u64 program ID, u8 session maker, bool opt-out, bool arrival, ...,
++ * StorageEntry at +0x10}. StorageEntry: {bool registered, u8 media type, u16 entry ID,
++ * u32 storage size, u64 extdata ID, ...}.
++ */
++namespace BossA {
++
++constexpr u32 Magic = 0x12348000;
++constexpr std::size_t HeaderSize = 4;
++constexpr std::size_t EntrySize = 0x800;
++
++/// The storage registered for `program_id`, if the database has a valid entry with one.
++std::optional<StorageInfo> FindStorage(std::span<const u8> db, u64 program_id);
++
++/**
++ * Registers (`storage` set) or unregisters (`storage` empty) the storage of `program_id`.
++ * Updates the title's entry, or appends a new one; an empty or malformed database is recreated.
++ * Returns true if `db` changed.
++ */
++bool SetStorage(std::vector<u8>& db, u64 program_id, const std::optional<StorageInfo>& storage);
++
++} // namespace BossA
++
++} // namespace Service::BOSS
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index 5d4d2ad..1cfbf70 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -31,11 +31,21 @@ OnlineService::OnlineService(u64 program_id_, u64 extdata_id_)
+     : program_id(program_id_), extdata_id(extdata_id_) {}
+ 
+ template <class Archive>
+-void OnlineService::serialize(Archive& ar, const unsigned int) {
++void OnlineService::serialize(Archive& ar, const unsigned int file_version) {
+     ar & current_props;
+     ar & task_id_list;
+     ar & program_id;
+     ar & extdata_id;
++    if (file_version >= 1) {
++        ar & session_program_id;
++        bool has_storage = storage.has_value();
++        StorageInfo info = storage.value_or(StorageInfo{});
++        ar & has_storage;
++        ar & info;
++        if constexpr (Archive::is_loading::value) {
++            storage = has_storage ? std::optional<StorageInfo>{info} : std::nullopt;
++        }
++    }
+ }
+ SERIALIZE_IMPL(OnlineService)
+ 
+@@ -63,39 +73,17 @@ Result OnlineService::InitializeSession(u64 init_program_id) {
+         init_program_id = program_id;
+     }
+ 
+-    const std::string& nand_directory = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir);
+-    FileSys::ArchiveFactory_SystemSaveData systemsavedata_factory(nand_directory);
+-
+-    // Open the SystemSaveData archive 0x00010034
+-    const FileSys::Path archive_path(boss_system_savedata_id);
+-    auto archive_result = systemsavedata_factory.Open(archive_path, 0);
+-
+-    std::unique_ptr<FileSys::ArchiveBackend> boss_system_save_data_archive;
+-    if (archive_result.Succeeded()) {
+-        boss_system_save_data_archive = std::move(archive_result).Unwrap();
+-    } else if (archive_result.Code() == FileSys::ResultNotFound) {
+-        // If the archive didn't exist, create the files inside
+-        systemsavedata_factory.Format(archive_path, FileSys::ArchiveFormatInfo(), 0, 0, 0);
+-
+-        // Open it again to get a valid archive now that the folder exists
+-        auto create_archive_result = systemsavedata_factory.Open(archive_path, 0);
+-        if (!create_archive_result.Succeeded()) {
+-            LOG_ERROR(Service_BOSS, "Could not open BOSS savedata");
+-            // TODO: Proper error code.
+-            return ResultUnknown;
+-        }
+-        boss_system_save_data_archive = std::move(create_archive_result).Unwrap();
+-    } else {
+-        LOG_ERROR(Service_BOSS, "Could not open BOSS savedata");
++    auto boss_system_save_data_archive = OpenBossSystemSaveData();
++    if (!boss_system_save_data_archive) {
+         // TODO: Proper error code.
+         return ResultUnknown;
+     }
++    session_program_id = init_program_id;
++    LoadStorageInfo(*boss_system_save_data_archive);
+ 
+     FileSys::Mode open_mode = {};
+     open_mode.read_flag.Assign(1);
+ 
+-    // TODO: Read data from BOSS_A.db
+-
+     auto boss_sv_result =
+         boss_system_save_data_archive->OpenFile(FileSys::Path("/BOSS_SV.db"), open_mode);
+     auto boss_ss_result =
+@@ -146,6 +134,138 @@ Result OnlineService::InitializeSession(u64 init_program_id) {
+     return ResultSuccess;
+ }
+ 
++std::unique_ptr<FileSys::ArchiveBackend> OnlineService::OpenBossSystemSaveData() {
++    const std::string& nand_directory = FileUtil::GetUserPath(FileUtil::UserPath::NANDDir);
++    FileSys::ArchiveFactory_SystemSaveData systemsavedata_factory(nand_directory);
++
++    // Open the SystemSaveData archive 0x00010034
++    const FileSys::Path archive_path(boss_system_savedata_id);
++    auto archive_result = systemsavedata_factory.Open(archive_path, 0);
++    if (archive_result.Succeeded()) {
++        return std::move(archive_result).Unwrap();
++    }
++    if (archive_result.Code() == FileSys::ResultNotFound) {
++        // If the archive didn't exist, create the files inside
++        systemsavedata_factory.Format(archive_path, FileSys::ArchiveFormatInfo(), 0, 0, 0);
++
++        // Open it again to get a valid archive now that the folder exists
++        auto create_archive_result = systemsavedata_factory.Open(archive_path, 0);
++        if (create_archive_result.Succeeded()) {
++            return std::move(create_archive_result).Unwrap();
++        }
++    }
++    LOG_ERROR(Service_BOSS, "Could not open BOSS savedata");
++    return nullptr;
++}
++
++namespace {
++constexpr std::string_view BossADbPath = "/BOSS_A.db";
++
++std::vector<u8> ReadWholeFile(FileSys::ArchiveBackend& archive, std::string_view path) {
++    FileSys::Mode mode{};
++    mode.read_flag.Assign(1);
++    auto file_result = archive.OpenFile(FileSys::Path(std::string(path).c_str()), mode);
++    if (!file_result.Succeeded()) {
++        return {};
++    }
++    auto file = std::move(file_result).Unwrap();
++    std::vector<u8> data(file->GetSize());
++    if (!data.empty()) {
++        const auto read = file->Read(0, data.size(), data.data());
++        if (!read.Succeeded() || read.Unwrap() != data.size()) {
++            return {};
++        }
++    }
++    return data;
++}
++} // namespace
++
++void OnlineService::LoadStorageInfo(FileSys::ArchiveBackend& archive) {
++    const std::vector<u8> db = ReadWholeFile(archive, BossADbPath);
++    storage = BossA::FindStorage(db, session_program_id);
++    if (storage) {
++        extdata_id = storage->extdata_id;
++        LOG_INFO(Service_BOSS,
++                 "SpotPass storage for {:#018x}: extdata {:#018x}, size {:#x}, media type {}",
++                 session_program_id, storage->extdata_id, storage->size, storage->media_type);
++    }
++}
++
++bool OnlineService::SaveStorageInfo() {
++    auto archive = OpenBossSystemSaveData();
++    if (!archive) {
++        return false;
++    }
++    std::vector<u8> db = ReadWholeFile(*archive, BossADbPath);
++    if (!BossA::SetStorage(db, session_program_id, storage)) {
++        return true;
++    }
++
++    FileSys::Mode mode{};
++    mode.write_flag.Assign(1);
++    mode.create_flag.Assign(1);
++    auto file_result = archive->OpenFile(FileSys::Path(std::string(BossADbPath).c_str()), mode);
++    if (!file_result.Succeeded()) {
++        LOG_ERROR(Service_BOSS, "Could not open BOSS_A.db for writing");
++        return false;
++    }
++    auto file = std::move(file_result).Unwrap();
++    file->SetSize(db.size());
++    const auto written = file->Write(0, db.size(), true, false, db.data());
++    file->Close();
++    if (!written.Succeeded() || written.Unwrap() != db.size()) {
++        LOG_ERROR(Service_BOSS, "Could not write BOSS_A.db");
++        return false;
++    }
++    return true;
++}
++
++Result OnlineService::SetStorageInfo(const StorageInfo& info) {
++    if (session_program_id == 0) {
++        session_program_id = program_id;
++    }
++    storage = info;
++    extdata_id = info.extdata_id;
++    if (info.media_type != 1) {
++        LOG_WARNING(Service_BOSS, "SpotPass storage on media type {} (only SD is read)",
++                    info.media_type);
++    }
++    SaveStorageInfo();
++    return ResultSuccess;
++}
++
++Result OnlineService::UnregisterStorage() {
++    if (session_program_id == 0) {
++        session_program_id = program_id;
++    }
++    storage.reset();
++    SaveStorageInfo();
++    return ResultSuccess;
++}
++
++u32 OnlineService::GetStorageSize() const {
++    return storage ? storage->size : 0;
++}
++
++Result OnlineService::DeleteNsData(u32 ns_data_id) {
++    // Deleting data that isn't there is treated as done, as the old stub did: games call this
++    // for cleanup (e.g. DMW1 deletes 0x0B right after turning SpotPass on).
++    const auto entry = GetNsDataEntryFromId(ns_data_id);
++    if (!entry) {
++        return ResultSuccess;
++    }
++    auto boss_archive = OpenBossExtData();
++    if (!boss_archive) {
++        return ResultSuccess;
++    }
++    const Result result = boss_archive->DeleteFile(FileSys::Path(("/" + entry->filename).c_str()));
++    if (result.IsError()) {
++        LOG_WARNING(Service_BOSS, "Could not delete SpotPass file '{}' (NsData {:#010x})",
++                    entry->filename, ns_data_id);
++    }
++    return result;
++}
++
+ void OnlineService::RegisterTask(const u32 size, Kernel::MappedBuffer& buffer) {
+     std::string task_id(size, 0);
+     buffer.Read(task_id.data(), 0, size);
+diff --git a/src/core/hle/service/boss/online_service.h b/src/core/hle/service/boss/online_service.h
+index 88514e2..eba5c5d 100644
+--- a/src/core/hle/service/boss/online_service.h
++++ b/src/core/hle/service/boss/online_service.h
+@@ -4,12 +4,17 @@
+ 
+ #pragma once
+ 
++#include <map>
++#include <memory>
++#include <optional>
+ #include <string>
+ #include <variant>
+ #include <vector>
+ 
++#include <boost/serialization/version.hpp>
+ #include "common/common_types.h"
+ #include "core/hle/result.h"
++#include "core/hle/service/boss/boss_storage.h"
+ #include "core/loader/loader.h"
+ 
+ namespace Kernel {
+@@ -193,7 +198,20 @@ public:
+     Result SendProperty(const u16 id, const u32 size, Kernel::MappedBuffer& buffer);
+     Result ReceiveProperty(const u16 id, const u32 size, Kernel::MappedBuffer& buffer);
+ 
++    /// Registers the title's SpotPass storage (SetStorageInfo) and saves it to BOSS_A.db.
++    Result SetStorageInfo(const StorageInfo& info);
++    /// Removes the title's SpotPass storage registration (UnregisterStorage).
++    Result UnregisterStorage();
++    /// The registered storage size, or 0 if the title has none (GetStorageInfo).
++    u32 GetStorageSize() const;
++    /// Deletes the downloaded SpotPass file with this NsData ID from the storage.
++    Result DeleteNsData(u32 ns_data_id);
++
+ private:
++    std::unique_ptr<FileSys::ArchiveBackend> OpenBossSystemSaveData();
++    void LoadStorageInfo(FileSys::ArchiveBackend& archive);
++    bool SaveStorageInfo();
++
+     std::unique_ptr<FileSys::ArchiveBackend> OpenBossExtData();
+     std::vector<FileSys::Entry> GetBossExtDataFiles(FileSys::ArchiveBackend* boss_archive);
+     FileSys::Path GetBossDataDir();
+@@ -204,13 +222,18 @@ private:
+ 
+     u64 program_id;
+     u64 extdata_id;
++    /// Program ID the session was initialized for (BOSS_A.db key) and its registered storage.
++    u64 session_program_id = 0;
++    std::optional<StorageInfo> storage;
+ 
+     // For serialization
+     explicit OnlineService() = default;
+ 
+     template <class Archive>
+-    void serialize(Archive& ar, const unsigned int);
++    void serialize(Archive& ar, const unsigned int file_version);
+     friend class boost::serialization::access;
+ };
+ 
+ } // namespace Service::BOSS
++
++BOOST_CLASS_VERSION(Service::BOSS::OnlineService, 1)
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 130ac5c..cfd1395 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_executable(tests
+     core/file_sys/path_parser.cpp
+     core/hle/kernel/cpu_limiter.cpp
+     core/hle/kernel/hle_ipc.cpp
++    core/hle/service/boss_storage.cpp
+     core/hle/service/cecd_message.cpp
+     core/hle/service/ptm_steps.cpp
+     core/hle/service/spotpass_redirect.cpp
+diff --git a/src/tests/core/hle/service/boss_storage.cpp b/src/tests/core/hle/service/boss_storage.cpp
+new file mode 100644
+index 0000000..4cf8b2b
+--- /dev/null
++++ b/src/tests/core/hle/service/boss_storage.cpp
+@@ -0,0 +1,87 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cstring>
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/service/boss/boss_storage.h"
++
++using namespace Service::BOSS;
++
++namespace {
++constexpr u64 Dmw1 = 0x00040000000EA900;
++constexpr u64 Other = 0x0004000000055D00;
++
++template <typename T>
++T At(const std::vector<u8>& db, std::size_t offset) {
++    T value;
++    std::memcpy(&value, db.data() + offset, sizeof(T));
++    return value;
++}
++} // namespace
++
++TEST_CASE("BOSS_A.db: registering storage creates a documented entry", "[service][boss]") {
++    std::vector<u8> db;
++    const StorageInfo info{.extdata_id = 0xEA9, .size = 0x100000, .media_type = 1};
++
++    CHECK_FALSE(BossA::FindStorage(db, Dmw1));
++    REQUIRE(BossA::SetStorage(db, Dmw1, info));
++    REQUIRE(db.size() == BossA::HeaderSize + BossA::EntrySize);
++
++    // Header and layout from https://www.3dbrew.org/wiki/BOSS_Savegame
++    CHECK(At<u32>(db, 0) == 0x12348000);
++    constexpr std::size_t e = BossA::HeaderSize;
++    CHECK(At<u64>(db, e + 0x0) == Dmw1);  // entry header: program ID
++    CHECK(db[e + 0x8] == 1);              // valid
++    CHECK(db[e + 0x9] == 3);              // version
++    CHECK(At<u64>(db, e + 0x10) == Dmw1); // title info: program ID
++    CHECK(db[e + 0x18] == 1);             // session maker: user
++    CHECK(db[e + 0x20] == 1);             // storage: registered
++    CHECK(db[e + 0x21] == 1);             // media type SD
++    CHECK(At<u32>(db, e + 0x24) == 0x100000);
++    CHECK(At<u64>(db, e + 0x28) == 0xEA9);
++
++    CHECK(BossA::FindStorage(db, Dmw1) == info);
++    CHECK_FALSE(BossA::FindStorage(db, Other));
++}
++
++TEST_CASE("BOSS_A.db: updating, unregistering and several titles", "[service][boss]") {
++    std::vector<u8> db;
++    REQUIRE(BossA::SetStorage(db, Dmw1, StorageInfo{.extdata_id = 0xEA9, .size = 0x1000}));
++    REQUIRE(BossA::SetStorage(db, Other, StorageInfo{.extdata_id = 0x55D, .size = 0x2000}));
++    CHECK(db.size() == BossA::HeaderSize + 2 * BossA::EntrySize);
++
++    // Same value again: nothing changes.
++    CHECK_FALSE(BossA::SetStorage(db, Dmw1, StorageInfo{.extdata_id = 0xEA9, .size = 0x1000}));
++    // New size updates the existing entry instead of adding one.
++    CHECK(BossA::SetStorage(db, Dmw1, StorageInfo{.extdata_id = 0xEA9, .size = 0x3000}));
++    CHECK(db.size() == BossA::HeaderSize + 2 * BossA::EntrySize);
++    CHECK(BossA::FindStorage(db, Dmw1)->size == 0x3000);
++
++    // Unregister keeps the entry but clears its storage.
++    CHECK(BossA::SetStorage(db, Dmw1, std::nullopt));
++    CHECK_FALSE(BossA::FindStorage(db, Dmw1));
++    CHECK(BossA::FindStorage(db, Other)->extdata_id == 0x55D);
++    CHECK(db.size() == BossA::HeaderSize + 2 * BossA::EntrySize);
++}
++
++TEST_CASE("BOSS_A.db: invalid entries and malformed files", "[service][boss]") {
++    std::vector<u8> db;
++    REQUIRE(BossA::SetStorage(db, Dmw1, StorageInfo{.extdata_id = 0xEA9, .size = 0x1000}));
++
++    // An entry marked invalid is ignored.
++    db[BossA::HeaderSize + 0x8] = 0;
++    CHECK_FALSE(BossA::FindStorage(db, Dmw1));
++
++    // Unregistering something that isn't there changes nothing.
++    std::vector<u8> empty;
++    CHECK_FALSE(BossA::SetStorage(empty, Dmw1, std::nullopt));
++    CHECK(empty.empty());
++
++    // A malformed file (wrong magic or size) isn't read, and is recreated on write.
++    std::vector<u8> bad(BossA::HeaderSize + 10, 0xFF);
++    CHECK_FALSE(BossA::FindStorage(bad, Dmw1));
++    REQUIRE(BossA::SetStorage(bad, Dmw1, StorageInfo{.extdata_id = 0xEA9, .size = 0x1000}));
++    CHECK(bad.size() == BossA::HeaderSize + BossA::EntrySize);
++    CHECK(BossA::FindStorage(bad, Dmw1)->size == 0x1000);
++}
+-- 
+2.43.0
+
