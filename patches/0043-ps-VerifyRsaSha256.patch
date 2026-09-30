@@ -1,0 +1,216 @@
+From 8ee9fd4aef24982ace52e2f1ef54de10850fcd38 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 23:20:27 +0200
+Subject: [PATCH] ps: VerifyRsaSha256
+
+The BOSS module (LLE) checks the signatures in downloaded SpotPass files
+with ps:ps VerifyRsaSha256 (e.g. Miitopia's Mii Central MiiTube.dat and
+questionnaire). The call was unimplemented; the "success" it returned
+only came from the generic unimplemented-function reply.
+
+VerifyRsaSha256 now really checks the RSA PKCS#1 v1.5 SHA-256
+signature with the modulus and exponent from the RSA context buffer and
+logs the outcome, then reports success either way: files from a custom
+SpotPass server (edited or new content) can't carry Nintendo's
+signature and must still be accepted. Test with a generated key.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ps/ps_ps.cpp     | 69 ++++++++++++++++++++++++++-
+ src/core/hle/service/ps/ps_ps.h       |  9 ++++
+ src/tests/CMakeLists.txt              |  1 +
+ src/tests/core/hle/service/ps_rsa.cpp | 46 ++++++++++++++++++
+ 4 files changed, 124 insertions(+), 1 deletion(-)
+ create mode 100644 src/tests/core/hle/service/ps_rsa.cpp
+
+diff --git a/src/core/hle/service/ps/ps_ps.cpp b/src/core/hle/service/ps/ps_ps.cpp
+index c6ca195..2a95c1e 100644
+--- a/src/core/hle/service/ps/ps_ps.cpp
++++ b/src/core/hle/service/ps/ps_ps.cpp
+@@ -2,8 +2,11 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include <cryptopp/aes.h>
++#include <cryptopp/integer.h>
+ #include <cryptopp/modes.h>
++#include <cryptopp/nbtheory.h>
+ #include "common/archives.h"
+ #include "common/logging/log.h"
+ #include "core/core.h"
+@@ -40,6 +43,70 @@ constexpr std::array<u8, 10> KeyTypes{{
+     HW::AES::DLPNFCDataKey,
+ }};
+ 
++bool VerifyRsaSha256Pkcs1(std::span<const u8, 0x20> hash, std::span<const u8> modulus,
++                          std::span<const u8> exponent, std::span<const u8> signature) {
++    // DER DigestInfo prefix for SHA-256 (RFC 8017).
++    static constexpr std::array<u8, 19> DigestInfo{0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60,
++                                                   0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
++                                                   0x01, 0x05, 0x00, 0x04, 0x20};
++    const std::size_t size = modulus.size();
++    if (size < DigestInfo.size() + hash.size() + 11 || signature.size() != size) {
++        return false;
++    }
++    const CryptoPP::Integer n(modulus.data(), modulus.size());
++    const CryptoPP::Integer e(exponent.data(), exponent.size());
++    const CryptoPP::Integer sig(signature.data(), signature.size());
++    if (n.IsZero() || e.IsZero() || sig >= n) {
++        return false;
++    }
++    std::vector<u8> decoded(size);
++    CryptoPP::ModularExponentiation(sig, e, n).Encode(decoded.data(), decoded.size());
++
++    // 00 01 FF..FF 00 DigestInfo hash
++    std::vector<u8> expected(size, 0xFF);
++    expected[0] = 0x00;
++    expected[1] = 0x01;
++    const std::size_t digest_start = size - hash.size() - DigestInfo.size();
++    expected[digest_start - 1] = 0x00;
++    std::copy(DigestInfo.begin(), DigestInfo.end(), expected.begin() + digest_start);
++    std::copy(hash.begin(), hash.end(), expected.end() - hash.size());
++    return decoded == expected;
++}
++
++void PS_PS::VerifyRsaSha256(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    std::array<u8, 0x20> hash;
++    rp.PopRaw(hash);
++    [[maybe_unused]] const u32 signature_size = rp.Pop<u32>();
++    const std::vector<u8> context = rp.PopStaticBuffer();
++    auto& signature_buffer = rp.PopMappedBuffer();
++
++    // RSA context: modulus (0x100), exponent (0x100), u32 key size in bits, ...
++    constexpr std::size_t RsaBlockSize = 0x100;
++    bool valid = false;
++    if (context.size() >= 2 * RsaBlockSize) {
++        std::vector<u8> signature(RsaBlockSize);
++        signature_buffer.Read(signature.data(), 0,
++                              std::min<std::size_t>(signature.size(), signature_buffer.GetSize()));
++        valid =
++            VerifyRsaSha256Pkcs1(hash, std::span(context).first(RsaBlockSize),
++                                 std::span(context).subspan(RsaBlockSize, RsaBlockSize), signature);
++    }
++
++    // BOSS uses this to check the signatures in SpotPass files. The result is only logged:
++    // files from a custom SpotPass server (edited or new content) can't carry Nintendo's
++    // signature and must still be accepted.
++    if (valid) {
++        LOG_DEBUG(Service_PS, "RSA-SHA256 signature is valid");
++    } else {
++        LOG_INFO(Service_PS, "RSA-SHA256 signature doesn't match; accepted anyway");
++    }
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushMappedBuffer(signature_buffer);
++}
++
+ void PS_PS::EncryptDecryptAes(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     auto src_size = rp.Pop<u32>();
+@@ -165,7 +232,7 @@ PS_PS::PS_PS() : ServiceFramework("ps:ps", DefaultMaxSessions) {
+     static const FunctionInfo functions[] = {
+         // clang-format off
+         {0x0001, nullptr, "SignRsaSha256"},
+-        {0x0002, nullptr, "VerifyRsaSha256"},
++        {0x0002, &PS_PS::VerifyRsaSha256, "VerifyRsaSha256"},
+         {0x0004, &PS_PS::EncryptDecryptAes, "EncryptDecryptAes"},
+         {0x0005, nullptr, "EncryptSignDecryptVerifyAesCcm"},
+         {0x0006, nullptr, "GetRomId"},
+diff --git a/src/core/hle/service/ps/ps_ps.h b/src/core/hle/service/ps/ps_ps.h
+index f5005d4..23c6a06 100644
+--- a/src/core/hle/service/ps/ps_ps.h
++++ b/src/core/hle/service/ps/ps_ps.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <span>
++
+ #include "core/hle/service/service.h"
+ 
+ namespace Core {
+@@ -230,6 +232,13 @@ private:
+ };
+ 
+ /// Initializes the PS_PS Service
++/**
++ * Checks an RSA PKCS#1 v1.5 SHA-256 signature: `signature` (big-endian, same size as the modulus)
++ * decrypted with (`modulus`, `exponent`) must hold the DigestInfo for `hash`.
++ */
++bool VerifyRsaSha256Pkcs1(std::span<const u8, 0x20> hash, std::span<const u8> modulus,
++                          std::span<const u8> exponent, std::span<const u8> signature);
++
+ void InstallInterfaces(Core::System& system);
+ 
+ } // namespace Service::PS
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 0dedfc8..8e0e105 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -14,6 +14,7 @@ add_executable(tests
+     core/hle/service/erreula_param.cpp
+     core/hle/service/nasc_client.cpp
+     core/hle/service/news_arrivals.cpp
++    core/hle/service/ps_rsa.cpp
+     core/hle/service/ptm_play_history.cpp
+     core/hle/service/ptm_steps.cpp
+     core/hle/service/soap_result.cpp
+diff --git a/src/tests/core/hle/service/ps_rsa.cpp b/src/tests/core/hle/service/ps_rsa.cpp
+new file mode 100644
+index 0000000..17d652b
+--- /dev/null
++++ b/src/tests/core/hle/service/ps_rsa.cpp
+@@ -0,0 +1,46 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <array>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include <cryptopp/osrng.h>
++#include <cryptopp/rsa.h>
++#include <cryptopp/sha.h>
++#include "core/hle/service/ps/ps_ps.h"
++
++using Service::PS::VerifyRsaSha256Pkcs1;
++
++TEST_CASE("ps:ps RSA-SHA256 signatures are checked", "[service][ps]") {
++    CryptoPP::AutoSeededRandomPool rng;
++    CryptoPP::RSA::PrivateKey key;
++    key.GenerateRandomWithKeySize(rng, 2048);
++
++    const std::vector<u8> message{'S', 'p', 'o', 't', 'P', 'a', 's', 's'};
++    std::array<u8, 0x20> hash;
++    CryptoPP::SHA256().CalculateDigest(hash.data(), message.data(), message.size());
++
++    CryptoPP::RSASS<CryptoPP::PKCS1v15, CryptoPP::SHA256>::Signer signer(key);
++    std::vector<u8> signature(signer.MaxSignatureLength());
++    signature.resize(signer.SignMessage(rng, message.data(), message.size(), signature.data()));
++    REQUIRE(signature.size() == 0x100);
++
++    std::vector<u8> modulus(0x100);
++    std::vector<u8> exponent(0x100);
++    key.GetModulus().Encode(modulus.data(), modulus.size());
++    key.GetPublicExponent().Encode(exponent.data(), exponent.size());
++
++    CHECK(VerifyRsaSha256Pkcs1(hash, modulus, exponent, signature));
++
++    auto other_hash = hash;
++    other_hash[0] ^= 1;
++    CHECK_FALSE(VerifyRsaSha256Pkcs1(other_hash, modulus, exponent, signature));
++
++    auto bad_signature = signature;
++    bad_signature[0x80] ^= 1;
++    CHECK_FALSE(VerifyRsaSha256Pkcs1(hash, modulus, exponent, bad_signature));
++
++    CHECK_FALSE(VerifyRsaSha256Pkcs1(hash, std::vector<u8>(0x100, 0), exponent, signature));
++    CHECK_FALSE(VerifyRsaSha256Pkcs1(hash, modulus, exponent, std::vector<u8>(0x80, 1)));
++}
+-- 
+2.43.0
+
