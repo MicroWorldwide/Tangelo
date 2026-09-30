@@ -1,0 +1,506 @@
+From 48a42891731529eac11e343445bcf04cf6b0e2b1 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 20:16:35 +0200
+Subject: [PATCH] http, apt: Log eShop SOAP results and error applet codes
+
+The eShop, ECS/IAS/CAS and NUS answer HTTP 200 and report failures
+inside the SOAP body, so a title could stop with an error screen while
+the log only showed successful requests.
+
+- http:C logs the operation, ErrorCode and ErrorMessage (or SOAP
+  faultstring) of every XML SOAP reply: info for success, warning for
+  errors. Nothing else from the body is logged.
+- apt StartLibraryApplet logs the error code ("005-5928") or error text
+  an application passes to the error applet, also when the applet runs
+  as LLE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/CMakeLists.txt                      |   2 +
+ src/core/hle/applets/erreula.cpp             |  41 ++++++
+ src/core/hle/applets/erreula.h               |  10 ++
+ src/core/hle/service/apt/apt.cpp             |   7 ++
+ src/core/hle/service/http/http_c.cpp         |  29 +++++
+ src/core/hle/service/http/http_c.h           |   2 +
+ src/core/hle/service/http/soap_result.cpp    | 126 +++++++++++++++++++
+ src/core/hle/service/http/soap_result.h      |  24 ++++
+ src/tests/CMakeLists.txt                     |   2 +
+ src/tests/core/hle/service/erreula_param.cpp |  37 ++++++
+ src/tests/core/hle/service/soap_result.cpp   |  60 +++++++++
+ 11 files changed, 340 insertions(+)
+ create mode 100644 src/core/hle/service/http/soap_result.cpp
+ create mode 100644 src/core/hle/service/http/soap_result.h
+ create mode 100644 src/tests/core/hle/service/erreula_param.cpp
+ create mode 100644 src/tests/core/hle/service/soap_result.cpp
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 8ecf9c2..1211ca0 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -338,6 +338,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
+     hle/service/hid/hid_user.h
+     hle/service/http/http_c.cpp
+     hle/service/http/http_c.h
++    hle/service/http/soap_result.cpp
++    hle/service/http/soap_result.h
+     hle/service/http/spotpass_redirect.cpp
+     hle/service/http/spotpass_redirect.h
+     hle/service/ir/extra_hid.cpp
+diff --git a/src/core/hle/applets/erreula.cpp b/src/core/hle/applets/erreula.cpp
+index 30b0100..ecc88cb 100644
+--- a/src/core/hle/applets/erreula.cpp
++++ b/src/core/hle/applets/erreula.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <cstring>
++#include <fmt/format.h>
+ #include "common/string_util.h"
+ #include "core/core.h"
+ #include "core/hle/applets/erreula.h"
+@@ -65,4 +67,43 @@ Result ErrEula::Finalize() {
+ 
+ void ErrEula::Update() {}
+ 
++std::optional<std::string> DescribeErrEulaParam(std::span<const u8> param) {
++    ErrEula::ErrEulaParam info;
++    if (param.size() < sizeof(info)) {
++        return std::nullopt;
++    }
++    std::memcpy(&info, param.data(), sizeof(info));
++
++    // Shown as "XXX-YYYY": the module number, then the description within that module.
++    const auto code = static_cast<u32>(info.error_code);
++    const std::string code_text = fmt::format("{:03}-{:04}", code / 10000 % 1000, code % 10000);
++
++    std::size_t length = 0;
++    while (length < ErrEula::ErrEulaParam::MESSAGE_SIZE && info.message[length] != u'\0') {
++        ++length;
++    }
++    constexpr std::size_t max_logged_chars = 400;
++    std::string message =
++        Common::UTF16ToUTF8(std::u16string(info.message, std::min(length, max_logged_chars)));
++    for (char& c : message) {
++        if (c == '\n' || c == '\r') {
++            c = ' ';
++        }
++    }
++
++    switch (info.type) {
++    case ErrEula::DisplayType::ErrorCode:
++        return fmt::format("error code {}", code_text);
++    case ErrEula::DisplayType::Error:
++        return fmt::format("error text \"{}\" (code {})", message, code_text);
++    default:
++        // Language-specific error codes and EULA screens use other type values.
++        if (static_cast<u8>(info.type) >= 2 && static_cast<u8>(info.type) <= 5) {
++            return std::nullopt;
++        }
++        return fmt::format("type {}, error code {}{}", static_cast<u8>(info.type), code_text,
++                           message.empty() ? "" : fmt::format(", text \"{}\"", message));
++    }
++}
++
+ } // namespace HLE::Applets
+diff --git a/src/core/hle/applets/erreula.h b/src/core/hle/applets/erreula.h
+index 0943373..3f149ce 100644
+--- a/src/core/hle/applets/erreula.h
++++ b/src/core/hle/applets/erreula.h
+@@ -4,6 +4,9 @@
+ 
+ #pragma once
+ 
++#include <optional>
++#include <span>
++#include <string>
+ #include "core/hle/applets/applet.h"
+ #include "core/hle/kernel/shared_memory.h"
+ #include "core/hle/result.h"
+@@ -57,4 +60,11 @@ private:
+     ErrEulaParam param{};
+ };
+ 
++/**
++ * Describes the error an application asked the error applet to show, e.g. "error code 005-5928"
++ * or "error text: ...". Returns nullopt if `param` is too small to be an ErrEulaParam or asks
++ * for an EULA screen.
++ */
++std::optional<std::string> DescribeErrEulaParam(std::span<const u8> param);
++
+ } // namespace HLE::Applets
+diff --git a/src/core/hle/service/apt/apt.cpp b/src/core/hle/service/apt/apt.cpp
+index fbef160..65210e8 100644
+--- a/src/core/hle/service/apt/apt.cpp
++++ b/src/core/hle/service/apt/apt.cpp
+@@ -14,6 +14,7 @@
+ #include "core/file_sys/archive_ncch.h"
+ #include "core/file_sys/file_backend.h"
+ #include "core/hle/applets/applet.h"
++#include "core/hle/applets/erreula.h"
+ #include "core/hle/kernel/mutex.h"
+ #include "core/hle/kernel/shared_memory.h"
+ #include "core/hle/romfs.h"
+@@ -908,6 +909,12 @@ void Module::APTInterface::StartLibraryApplet(Kernel::HLERequestContext& ctx) {
+ 
+     LOG_DEBUG(Service_APT, "called, applet_id={:08X}, size={:08X}", applet_id, buffer_size);
+ 
++    if (applet_id == AppletId::Error || applet_id == AppletId::Error2) {
++        if (const auto description = HLE::Applets::DescribeErrEulaParam(buffer)) {
++            LOG_WARNING(Service_APT, "Error applet started: {}", *description);
++        }
++    }
++
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(apt->applet_manager->StartLibraryApplet(applet_id, object, buffer));
+ }
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 794477a..6269d15 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -24,6 +24,7 @@
+ #include "core/hle/romfs.h"
+ #include "core/hle/service/fs/archive.h"
+ #include "core/hle/service/http/http_c.h"
++#include "core/hle/service/http/soap_result.h"
+ #include "core/hle/service/http/spotpass_redirect.h"
+ #include "core/hw/aes/key.h"
+ 
+@@ -350,6 +351,34 @@ void Context::MakeRequest() {
+     } else {
+         MakeRequestNonSSL(request, url_info, pending_headers);
+     }
++
++    LogSoapResult();
++}
++
++void Context::LogSoapResult() const {
++    if (state != RequestState::ReceivingBody) {
++        return;
++    }
++    // eShop (ECS/IAS/CAS) and system update (NUS) servers answer HTTP 200 and put the real
++    // result in the SOAP body, so the status code alone doesn't show why a title gave up.
++    const auto content_type = response.get_header_value("Content-Type");
++    if (content_type.find("xml") == std::string::npos) {
++        return;
++    }
++    const auto result = ParseSoapResult(response.body);
++    if (!result) {
++        return;
++    }
++    const std::string where = Common::SplitUrl(url).path;
++    if (result->error_code.value_or(0) == 0 && result->error_message.empty()) {
++        LOG_INFO(Service_HTTP, "SOAP {} {}: HTTP {}, ErrorCode {}", where, result->operation,
++                 response.status, result->error_code.value_or(0));
++        return;
++    }
++    LOG_WARNING(Service_HTTP, "SOAP {} {}: HTTP {}, ErrorCode {}, ErrorMessage \"{}\"", where,
++                result->operation, response.status,
++                result->error_code ? std::to_string(*result->error_code) : "none",
++                result->error_message);
+ }
+ 
+ void Context::MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo& url_info,
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index 0e288b0..2f96e3c 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -316,6 +316,8 @@ public:
+     void ParseAsciiPostData();
+     std::string ParseMultipartFormData();
+     void MakeRequest();
++    /// Logs the result of eShop/NUS SOAP replies (they fail with HTTP 200).
++    void LogSoapResult() const;
+     void MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo& url_info,
+                            std::vector<Context::RequestHeader>& pending_headers);
+     void MakeRequestSSL(httplib::Request& request, const Common::URLInfo& url_info,
+diff --git a/src/core/hle/service/http/soap_result.cpp b/src/core/hle/service/http/soap_result.cpp
+new file mode 100644
+index 0000000..d2e98fe
+--- /dev/null
++++ b/src/core/hle/service/http/soap_result.cpp
+@@ -0,0 +1,126 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cstdlib>
++#include "core/hle/service/http/soap_result.h"
++
++namespace Service::HTTP {
++
++namespace {
++
++bool IsNameChar(char c) {
++    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
++           c == '-' || c == '.';
++}
++
++/// Finds the opening tag <name> or <prefix:name> (or the empty element <name/>) at or after
++/// `from`. Returns the position just past the tag's '>', or npos.
++std::size_t FindOpeningTag(std::string_view body, std::string_view name, std::size_t from = 0) {
++    for (std::size_t pos = body.find(name, from); pos != std::string_view::npos;
++         pos = body.find(name, pos + 1)) {
++        if (pos == 0) {
++            continue;
++        }
++        const char before = body[pos - 1];
++        if (before == ':') {
++            // <prefix:name>
++            std::size_t p = pos - 1;
++            while (p > 0 && IsNameChar(body[p - 1])) {
++                --p;
++            }
++            if (p == 0 || p == pos - 1 || body[p - 1] != '<') {
++                continue;
++            }
++        } else if (before != '<') {
++            continue;
++        }
++        const std::size_t after = pos + name.size();
++        if (after >= body.size()) {
++            return std::string_view::npos;
++        }
++        const char next = body[after];
++        if (next != '>' && next != ' ' && next != '\t' && next != '\r' && next != '\n' &&
++            next != '/') {
++            continue;
++        }
++        const std::size_t close = body.find('>', after);
++        if (close == std::string_view::npos) {
++            return std::string_view::npos;
++        }
++        return close + 1;
++    }
++    return std::string_view::npos;
++}
++
++std::optional<std::string> ElementText(std::string_view body, std::string_view name) {
++    const std::size_t start = FindOpeningTag(body, name);
++    if (start == std::string_view::npos) {
++        return std::nullopt;
++    }
++    if (body[start - 2] == '/') {
++        return std::string{};
++    }
++    const std::size_t end = body.find('<', start);
++    if (end == std::string_view::npos) {
++        return std::nullopt;
++    }
++    std::string_view text = body.substr(start, end - start);
++    while (!text.empty() && (text.front() == ' ' || text.front() == '\n' || text.front() == '\r' ||
++                             text.front() == '\t')) {
++        text.remove_prefix(1);
++    }
++    while (!text.empty() && (text.back() == ' ' || text.back() == '\n' || text.back() == '\r' ||
++                             text.back() == '\t')) {
++        text.remove_suffix(1);
++    }
++    return std::string(text);
++}
++
++} // namespace
++
++std::optional<SoapResult> ParseSoapResult(std::string_view body) {
++    if (FindOpeningTag(body, "Envelope") == std::string_view::npos) {
++        return std::nullopt;
++    }
++    const std::size_t body_start = FindOpeningTag(body, "Body");
++    if (body_start == std::string_view::npos) {
++        return std::nullopt;
++    }
++
++    SoapResult result;
++
++    // The operation is the first element inside the Body.
++    const std::size_t op = body.find('<', body_start);
++    if (op != std::string_view::npos && op + 1 < body.size() && body[op + 1] != '/') {
++        std::size_t name_end = op + 1;
++        while (name_end < body.size() && (IsNameChar(body[name_end]) || body[name_end] == ':')) {
++            ++name_end;
++        }
++        std::string_view name = body.substr(op + 1, name_end - op - 1);
++        if (const std::size_t colon = name.rfind(':'); colon != std::string_view::npos) {
++            name.remove_prefix(colon + 1);
++        }
++        result.operation = std::string(name);
++    }
++
++    if (const auto code = ElementText(body.substr(body_start), "ErrorCode")) {
++        char* end = nullptr;
++        const long value = std::strtol(code->c_str(), &end, 10);
++        if (!code->empty() && end == code->c_str() + code->size()) {
++            result.error_code = value;
++        }
++    }
++    if (auto message = ElementText(body.substr(body_start), "ErrorMessage")) {
++        result.error_message = std::move(*message);
++    }
++    // SOAP faults carry a <faultstring> instead.
++    if (result.error_message.empty()) {
++        if (auto fault = ElementText(body.substr(body_start), "faultstring")) {
++            result.error_message = std::move(*fault);
++        }
++    }
++    return result;
++}
++
++} // namespace Service::HTTP
+diff --git a/src/core/hle/service/http/soap_result.h b/src/core/hle/service/http/soap_result.h
+new file mode 100644
+index 0000000..814cbfd
+--- /dev/null
++++ b/src/core/hle/service/http/soap_result.h
+@@ -0,0 +1,24 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace Service::HTTP {
++
++/// The parts of a SOAP reply (eShop ECS/IAS/CAS, NUS) that explain a failure.
++struct SoapResult {
++    std::string operation; ///< First element in the SOAP body, e.g. "GetRegistrationInfoResponse"
++    std::optional<long> error_code; ///< <ErrorCode>, 0 means success
++    std::string error_message;      ///< <ErrorMessage>, if present
++};
++
++/// Returns the operation, ErrorCode and ErrorMessage of a SOAP reply, or nullopt if `body` isn't a
++/// SOAP envelope. Namespace prefixes on the element names are ignored.
++std::optional<SoapResult> ParseSoapResult(std::string_view body);
++
++} // namespace Service::HTTP
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index 97035af..06ec3f2 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -11,8 +11,10 @@ add_executable(tests
+     core/hle/service/boss_download.cpp
+     core/hle/service/boss_storage.cpp
+     core/hle/service/cecd_message.cpp
++    core/hle/service/erreula_param.cpp
+     core/hle/service/ptm_play_history.cpp
+     core/hle/service/ptm_steps.cpp
++    core/hle/service/soap_result.cpp
+     core/hle/service/spotpass_redirect.cpp
+     core/memory/memory.cpp
+     core/memory/vm_manager.cpp
+diff --git a/src/tests/core/hle/service/erreula_param.cpp b/src/tests/core/hle/service/erreula_param.cpp
+new file mode 100644
+index 0000000..74d789c
+--- /dev/null
++++ b/src/tests/core/hle/service/erreula_param.cpp
+@@ -0,0 +1,37 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <cstring>
++#include <vector>
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/applets/erreula.h"
++
++using HLE::Applets::DescribeErrEulaParam;
++using HLE::Applets::ErrEula;
++
++namespace {
++std::vector<u8> MakeParam(ErrEula::DisplayType type, s32 code, std::u16string_view text = {}) {
++    ErrEula::ErrEulaParam param{};
++    param.type = type;
++    param.error_code = code;
++    std::memcpy(param.message, text.data(), text.size() * sizeof(char16_t));
++    std::vector<u8> buffer(sizeof(param));
++    std::memcpy(buffer.data(), &param, sizeof(param));
++    return buffer;
++}
++} // namespace
++
++TEST_CASE("Error applet parameters are described", "[applets][erreula]") {
++    CHECK(DescribeErrEulaParam(MakeParam(ErrEula::DisplayType::ErrorCode, 55928)) ==
++          "error code 005-5928");
++    CHECK(DescribeErrEulaParam(MakeParam(ErrEula::DisplayType::ErrorCode, 22)) ==
++          "error code 000-0022");
++    CHECK(DescribeErrEulaParam(MakeParam(ErrEula::DisplayType::Error, 0, u"Line one\nline two")) ==
++          "error text \"Line one line two\" (code 000-0000)");
++    CHECK_FALSE(DescribeErrEulaParam(MakeParam(ErrEula::DisplayType::Agree, 0)));
++
++    auto short_buffer = MakeParam(ErrEula::DisplayType::ErrorCode, 55928);
++    short_buffer.resize(0x100);
++    CHECK_FALSE(DescribeErrEulaParam(short_buffer));
++}
+diff --git a/src/tests/core/hle/service/soap_result.cpp b/src/tests/core/hle/service/soap_result.cpp
+new file mode 100644
+index 0000000..c435761
+--- /dev/null
++++ b/src/tests/core/hle/service/soap_result.cpp
+@@ -0,0 +1,60 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/service/http/soap_result.h"
++
++using Service::HTTP::ParseSoapResult;
++
++TEST_CASE("SOAP replies: success", "[service][http][soap]") {
++    const auto result = ParseSoapResult(
++        R"(<?xml version="1.0" encoding="utf-8"?>)"
++        R"(<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">)"
++        R"(<soapenv:Body><GetAccountStatusResponse xmlns="urn:ecs.wsapi.broadon.com">)"
++        R"(<Version>2.0</Version><DeviceId>1</DeviceId><MessageId>x</MessageId>)"
++        R"(<TimeStamp>1</TimeStamp><ErrorCode>0</ErrorCode><ServiceStandbyMode>false)"
++        R"(</ServiceStandbyMode></GetAccountStatusResponse></soapenv:Body></soapenv:Envelope>)");
++    REQUIRE(result);
++    CHECK(result->operation == "GetAccountStatusResponse");
++    REQUIRE(result->error_code);
++    CHECK(*result->error_code == 0);
++    CHECK(result->error_message.empty());
++}
++
++TEST_CASE("SOAP replies: error code and message", "[service][http][soap]") {
++    const auto result = ParseSoapResult(
++        "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://schemas.xmlsoap.org/soap/envelope/\">\n"
++        "  <SOAP-ENV:Body>\n"
++        "    <ias:GetRegistrationInfoResponse xmlns:ias=\"urn:ias.wsapi.broadon.com\">\n"
++        "      <ias:ErrorCode> 928 </ias:ErrorCode>\n"
++        "      <ias:ErrorMessage>IAS - Device token mismatch</ias:ErrorMessage>\n"
++        "    </ias:GetRegistrationInfoResponse>\n"
++        "  </SOAP-ENV:Body>\n"
++        "</SOAP-ENV:Envelope>\n");
++    REQUIRE(result);
++    CHECK(result->operation == "GetRegistrationInfoResponse");
++    REQUIRE(result->error_code);
++    CHECK(*result->error_code == 928);
++    CHECK(result->error_message == "IAS - Device token mismatch");
++}
++
++TEST_CASE("SOAP replies: faults and odd content", "[service][http][soap]") {
++    const auto fault = ParseSoapResult(
++        "<env:Envelope><env:Body><env:Fault><faultcode>env:Server</faultcode>"
++        "<faultstring>Internal error</faultstring></env:Fault></env:Body></env:Envelope>");
++    REQUIRE(fault);
++    CHECK(fault->operation == "Fault");
++    CHECK_FALSE(fault->error_code);
++    CHECK(fault->error_message == "Internal error");
++
++    // Elements whose names only end in "ErrorCode" don't count.
++    const auto other = ParseSoapResult("<Envelope><Body><R><NotErrorCode>5</NotErrorCode>"
++                                       "<ErrorCode/></R></Body></Envelope>");
++    REQUIRE(other);
++    CHECK_FALSE(other->error_code);
++
++    CHECK_FALSE(ParseSoapResult(""));
++    CHECK_FALSE(ParseSoapResult(R"({"json": true})"));
++    CHECK_FALSE(ParseSoapResult("<html><body>Not SOAP</body></html>"));
++}
+-- 
+2.43.0
+
