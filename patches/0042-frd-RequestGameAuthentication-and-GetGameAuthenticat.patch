@@ -1,0 +1,640 @@
+From c5d11002131a55f43f5777e9ea4d679905f59727 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 22:19:45 +0200
+Subject: [PATCH] frd: RequestGameAuthentication and GetGameAuthenticationData
+
+Games that go online (e.g. Mario & Sonic at the Rio 2016 Olympic Games
+refreshing its online tournaments) ask the friends service to log in at
+the game server login (NASC) for their game server id, then read the
+result. With the HLE friends service both calls were unimplemented.
+
+- RequestGameAuthentication (frd:u/frd:a 0x0028) does a NASC LOGIN at
+  the Nintendo services server when one is set for the game server login
+  (Configure > General > Network), with the game id, title id, SDK
+  version and in-game name, and signals the game's event when done.
+  Without that server, or when it can't be reached, the answer is 110
+  (game server no longer available), which is what Nintendo's 3DS game
+  servers give since they closed. Each login is logged.
+- GetGameAuthenticationData (0x0029) returns the result as
+  GameAuthenticationData (0x138 bytes): NASC result, HTTP status, game
+  server address and port, token and server time.
+- NASC form encoding (base64 with ".-*") in frd/nasc_client, with tests
+  from the NintendoClients wiki examples.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/CMakeLists.txt                    |   2 +
+ src/core/hle/service/frd/frd.cpp           | 143 +++++++++++++++
+ src/core/hle/service/frd/frd.h             |  25 +++
+ src/core/hle/service/frd/frd_a.cpp         |   4 +-
+ src/core/hle/service/frd/frd_u.cpp         |   4 +-
+ src/core/hle/service/frd/nasc_client.cpp   | 197 +++++++++++++++++++++
+ src/core/hle/service/frd/nasc_client.h     |  52 ++++++
+ src/tests/CMakeLists.txt                   |   1 +
+ src/tests/core/hle/service/nasc_client.cpp |  54 ++++++
+ 9 files changed, 478 insertions(+), 4 deletions(-)
+ create mode 100644 src/core/hle/service/frd/nasc_client.cpp
+ create mode 100644 src/core/hle/service/frd/nasc_client.h
+ create mode 100644 src/tests/core/hle/service/nasc_client.cpp
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 0c84358..c353444 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -314,6 +314,8 @@ add_library(citra_core STATIC EXCLUDE_FROM_ALL
+     hle/service/frd/frd_a.h
+     hle/service/frd/frd_u.cpp
+     hle/service/frd/frd_u.h
++    hle/service/frd/nasc_client.cpp
++    hle/service/frd/nasc_client.h
+     hle/service/fs/archive.cpp
+     hle/service/fs/archive.h
+     hle/service/fs/directory.cpp
+diff --git a/src/core/hle/service/frd/frd.cpp b/src/core/hle/service/frd/frd.cpp
+index 5ebb5e3..c33caa7 100644
+--- a/src/core/hle/service/frd/frd.cpp
++++ b/src/core/hle/service/frd/frd.cpp
+@@ -5,9 +5,13 @@
+ #include <array>
+ #include <cstring>
+ #include <vector>
++#include <httplib.h>
+ #include "common/archives.h"
+ #include "common/assert.h"
+ #include "common/logging/log.h"
++#include "common/settings.h"
++#include "common/string_util.h"
++#include "common/web_util.h"
+ #include "core/core.h"
+ #include "core/hle/applets/mii_selector.h"
+ #include "core/hle/ipc_helpers.h"
+@@ -18,6 +22,8 @@
+ #include "core/hle/service/frd/frd.h"
+ #include "core/hle/service/frd/frd_a.h"
+ #include "core/hle/service/frd/frd_u.h"
++#include "core/hle/service/frd/nasc_client.h"
++#include "core/hle/service/http/spotpass_redirect.h"
+ 
+ SERVICE_CONSTRUCT_IMPL(Service::FRD::Module)
+ 
+@@ -314,6 +320,143 @@ void Module::Interface::GetLastResponseResult(Kernel::HLERequestContext& ctx) {
+     rb.Push(ResultSuccess);
+ }
+ 
++namespace {
++constexpr std::string_view NascUrl = "https://nasc.nintendowifi.net/ac";
++
++/// NASC LOGIN at the Nintendo services server, if one is set for the game server login.
++/// Nintendo's own NASC isn't asked: its 3DS game servers are gone, so it answers 110 anyway.
++GameAuthenticationData RequestNascLogin(u32 game_id, u64 title_id, u32 sdk_major, u32 sdk_minor,
++                                        const std::string& ingame_name) {
++    if (!Settings::values.use_nintendo_services_server.GetValue() ||
++        !Settings::values.nintendo_services_nasc.GetValue()) {
++        LOG_INFO(Service_FRD,
++                 "Game server login for {:08X}: Nintendo's 3DS game servers are closed, "
++                 "answering 110 (set a Nintendo services server to ask it instead)",
++                 game_id);
++        return MakeFailedGameAuthentication(NascResultServerGone, 0);
++    }
++    const auto url = HTTP::RedirectNintendoServiceUrl(
++        NascUrl, Settings::values.nintendo_services_server_url.GetValue());
++    if (!url) {
++        LOG_WARNING(Service_FRD, "Nintendo services server address is empty or invalid");
++        return MakeFailedGameAuthentication(NascResultServerGone, 0);
++    }
++
++    const std::string game_id_text = fmt::format("{:08X}", game_id);
++    const std::string body = MakeNascForm({
++        {"action", "LOGIN"},
++        {"gameid", game_id_text},
++        {"sdkver", fmt::format("{:03}{:03}", sdk_major % 1000, sdk_minor % 1000)},
++        {"titleid", fmt::format("{:016X}", title_id)},
++        {"gamecd", "----"},
++        {"unitcd", "2"},
++        {"servertype", "L1"},
++        {"fpdver", "0010"},
++        {"ingamesn", ingame_name},
++    });
++
++    const Common::URLInfo info = Common::SplitUrl(*url);
++    std::unique_ptr<httplib::ClientImpl> client;
++    if (info.is_https) {
++        auto ssl_client = std::make_unique<httplib::SSLClient>(info.host, info.port);
++        ssl_client->enable_server_certificate_verification(false);
++        client = std::move(ssl_client);
++    } else {
++        client = std::make_unique<httplib::ClientImpl>(info.host, info.port);
++    }
++    client->set_connection_timeout(5);
++    client->set_read_timeout(10);
++    const httplib::Headers headers{
++        {"X-GameId", game_id_text},
++        {"User-Agent", "CTR FPD/0010"},
++        {"X-Tangelo-Original-Host", "nasc.nintendowifi.net"},
++    };
++    const auto response = client->Post(info.path.empty() ? "/ac" : info.path, headers, body,
++                                       "application/x-www-form-urlencoded");
++    if (!response) {
++        LOG_WARNING(Service_FRD, "Game server login for {:08X}: {} unreachable ({}), answering 110",
++                    game_id, *url, httplib::to_string(response.error()));
++        return MakeFailedGameAuthentication(NascResultServerGone, 0);
++    }
++    if (response->status != 200) {
++        LOG_WARNING(Service_FRD, "Game server login for {:08X}: HTTP {}", game_id,
++                    response->status);
++        return MakeFailedGameAuthentication(NascResultServerGone, response->status);
++    }
++    const auto data =
++        MakeGameAuthenticationData(ParseNascResponse(response->body), response->status);
++    if (data.result == NascResultSuccess) {
++        LOG_INFO(Service_FRD, "Game server login for {:08X}: server {}:{}", game_id,
++                 data.server_address.data(), static_cast<u16>(data.server_port));
++    } else {
++        LOG_INFO(Service_FRD, "Game server login for {:08X}: returncd {:03}", game_id,
++                 static_cast<s32>(data.result));
++    }
++    return data;
++}
++} // namespace
++
++void Module::Interface::RequestGameAuthentication(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 game_id = rp.Pop<u32>();
++    const auto ingame_sn = rp.PopRaw<std::array<u16_le, 12>>();
++    const u32 sdk_major = rp.Pop<u32>();
++    const u32 sdk_minor = rp.Pop<u32>();
++    rp.PopPID();
++    const auto event = rp.PopObject<Kernel::Event>();
++
++    struct AsyncData {
++        u32 game_id;
++        u64 title_id;
++        u32 sdk_major;
++        u32 sdk_minor;
++        std::string ingame_name;
++        std::shared_ptr<Kernel::Event> event;
++        GameAuthenticationData data{};
++    };
++    auto async_data = std::make_shared<AsyncData>();
++    async_data->game_id = game_id;
++    async_data->title_id = frd->system.Kernel().GetCurrentProcess()->codeset->program_id;
++    async_data->sdk_major = sdk_major;
++    async_data->sdk_minor = sdk_minor;
++    async_data->ingame_name = Common::UTF16BufferToUTF8(ingame_sn);
++    async_data->event = event;
++
++    LOG_DEBUG(Service_FRD, "called, game_id={:08X}, title_id={:016X}", game_id,
++              async_data->title_id);
++
++    ctx.RunAsync(
++        [async_data](Kernel::HLERequestContext&) {
++            async_data->data =
++                RequestNascLogin(async_data->game_id, async_data->title_id, async_data->sdk_major,
++                                 async_data->sdk_minor, async_data->ingame_name);
++            return 0;
++        },
++        [this, async_data](Kernel::HLERequestContext& ctx) {
++            frd->game_authentication_data = async_data->data;
++            if (async_data->event) {
++                async_data->event->Signal();
++            }
++            IPC::RequestBuilder rb(ctx, 1, 0);
++            rb.Push(ResultSuccess);
++        },
++        true);
++}
++
++void Module::Interface::GetGameAuthenticationData(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    std::vector<u8> buffer(sizeof(GameAuthenticationData));
++    std::memcpy(buffer.data(), &frd->game_authentication_data, buffer.size());
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(buffer), 0);
++
++    LOG_DEBUG(Service_FRD, "called, result={}",
++              static_cast<s32>(frd->game_authentication_data.result));
++}
++
+ Module::Module(Core::System& system) : system(system) {};
+ Module::~Module() = default;
+ 
+diff --git a/src/core/hle/service/frd/frd.h b/src/core/hle/service/frd/frd.h
+index 39e733e..fb609c7 100644
+--- a/src/core/hle/service/frd/frd.h
++++ b/src/core/hle/service/frd/frd.h
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ #include "common/common_types.h"
++#include "core/hle/service/frd/nasc_client.h"
+ #include "core/hle/service/service.h"
+ 
+ namespace Core {
+@@ -286,6 +287,29 @@ public:
+          */
+         void GetLastResponseResult(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * FRD::RequestGameAuthentication service function. Logs in at the game server login
++         * (NASC) for the game's server id; the answer is read with GetGameAuthenticationData.
++         *  Inputs:
++         *      1 : Game server id
++         *    2-7 : In-game screen name (UTF-16, 12 characters)
++         *      8 : SDK major version
++         *      9 : SDK minor version
++         *   10-11: Process ID translate header, process ID
++         *   12-13: Handle translate header, event signalled when the login is done
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void RequestGameAuthentication(Kernel::HLERequestContext& ctx);
++
++        /**
++         * FRD::GetGameAuthenticationData service function.
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *    2-3 : Static buffer 0: GameAuthenticationData (0x138 bytes)
++         */
++        void GetGameAuthenticationData(Kernel::HLERequestContext& ctx);
++
+     protected:
+         std::shared_ptr<Module> frd;
+     };
+@@ -294,6 +318,7 @@ private:
+     FriendKey my_friend_key = {0, 0, 0ull};
+     MyPresence my_presence = {};
+     bool logged_in = false;
++    GameAuthenticationData game_authentication_data{};
+     std::shared_ptr<Kernel::Event> login_event;
+     Core::TimingEventType* login_delay_event;
+     Core::System& system;
+diff --git a/src/core/hle/service/frd/frd_a.cpp b/src/core/hle/service/frd/frd_a.cpp
+index fa6c660..ca39c5c 100644
+--- a/src/core/hle/service/frd/frd_a.cpp
++++ b/src/core/hle/service/frd/frd_a.cpp
+@@ -50,8 +50,8 @@ FRD_A::FRD_A(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x0025, nullptr, "FriendCodeToPrincipalId"},
+         {0x0026, nullptr, "IsValidFriendCode"},
+         {0x0027, nullptr, "ResultToErrorCode"},
+-        {0x0028, nullptr, "RequestGameAuthentication"},
+-        {0x0029, nullptr, "GetGameAuthenticationData"},
++        {0x0028, &FRD_A::RequestGameAuthentication, "RequestGameAuthentication"},
++        {0x0029, &FRD_A::GetGameAuthenticationData, "GetGameAuthenticationData"},
+         {0x002A, nullptr, "RequestServiceLocator"},
+         {0x002B, nullptr, "GetServiceLocatorData"},
+         {0x002C, nullptr, "DetectNatProperties"},
+diff --git a/src/core/hle/service/frd/frd_u.cpp b/src/core/hle/service/frd/frd_u.cpp
+index 3761c99..f7b4cda 100644
+--- a/src/core/hle/service/frd/frd_u.cpp
++++ b/src/core/hle/service/frd/frd_u.cpp
+@@ -50,8 +50,8 @@ FRD_U::FRD_U(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x0025, nullptr, "FriendCodeToPrincipalId"},
+         {0x0026, nullptr, "IsValidFriendCode"},
+         {0x0027, nullptr, "ResultToErrorCode"},
+-        {0x0028, nullptr, "RequestGameAuthentication"},
+-        {0x0029, nullptr, "GetGameAuthenticationData"},
++        {0x0028, &FRD_U::RequestGameAuthentication, "RequestGameAuthentication"},
++        {0x0029, &FRD_U::GetGameAuthenticationData, "GetGameAuthenticationData"},
+         {0x002A, nullptr, "RequestServiceLocator"},
+         {0x002B, nullptr, "GetServiceLocatorData"},
+         {0x002C, nullptr, "DetectNatProperties"},
+diff --git a/src/core/hle/service/frd/nasc_client.cpp b/src/core/hle/service/frd/nasc_client.cpp
+new file mode 100644
+index 0000000..cb8e725
+--- /dev/null
++++ b/src/core/hle/service/frd/nasc_client.cpp
+@@ -0,0 +1,197 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <algorithm>
++#include <cctype>
++#include <cstdlib>
++#include <cstring>
++#include "core/hle/service/frd/nasc_client.h"
++
++namespace Service::FRD {
++
++namespace {
++constexpr std::string_view Alphabet =
++    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-";
++
++int AlphabetIndex(char c) {
++    // Accept standard base64 too.
++    if (c == '+') {
++        return 62;
++    }
++    if (c == '/') {
++        return 63;
++    }
++    const auto pos = Alphabet.find(c);
++    return pos == std::string_view::npos ? -1 : static_cast<int>(pos);
++}
++
++std::string UrlEncode(std::string_view text) {
++    static constexpr char hex[] = "0123456789ABCDEF";
++    std::string out;
++    for (const unsigned char c : text) {
++        if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
++            out.push_back(static_cast<char>(c));
++        } else {
++            out.push_back('%');
++            out.push_back(hex[c >> 4]);
++            out.push_back(hex[c & 0xF]);
++        }
++    }
++    return out;
++}
++
++std::string UrlDecode(std::string_view text) {
++    std::string out;
++    for (std::size_t i = 0; i < text.size(); i++) {
++        if (text[i] == '%' && i + 2 < text.size()) {
++            const std::string hex(text.substr(i + 1, 2));
++            char* end = nullptr;
++            const long value = std::strtol(hex.c_str(), &end, 16);
++            if (end == hex.c_str() + 2) {
++                out.push_back(static_cast<char>(value));
++                i += 2;
++                continue;
++            }
++        }
++        out.push_back(text[i] == '+' ? ' ' : text[i]);
++    }
++    return out;
++}
++
++template <std::size_t N>
++void CopyString(std::array<char, N>& out, std::string_view text) {
++    out.fill(0);
++    std::memcpy(out.data(), text.data(), std::min(text.size(), N - 1));
++}
++} // namespace
++
++std::string NascEncode(std::string_view value) {
++    std::string out;
++    std::size_t i = 0;
++    for (; i + 2 < value.size(); i += 3) {
++        const u32 n = (static_cast<u8>(value[i]) << 16) | (static_cast<u8>(value[i + 1]) << 8) |
++                      static_cast<u8>(value[i + 2]);
++        out += Alphabet[(n >> 18) & 63];
++        out += Alphabet[(n >> 12) & 63];
++        out += Alphabet[(n >> 6) & 63];
++        out += Alphabet[n & 63];
++    }
++    const std::size_t rest = value.size() - i;
++    if (rest == 1) {
++        const u32 n = static_cast<u8>(value[i]) << 16;
++        out += Alphabet[(n >> 18) & 63];
++        out += Alphabet[(n >> 12) & 63];
++        out += "**";
++    } else if (rest == 2) {
++        const u32 n = (static_cast<u8>(value[i]) << 16) | (static_cast<u8>(value[i + 1]) << 8);
++        out += Alphabet[(n >> 18) & 63];
++        out += Alphabet[(n >> 12) & 63];
++        out += Alphabet[(n >> 6) & 63];
++        out += '*';
++    }
++    return out;
++}
++
++std::string NascDecode(std::string_view value) {
++    std::string out;
++    u32 buffer = 0;
++    int bits = 0;
++    for (const char c : value) {
++        if (c == '*' || c == '=') {
++            break;
++        }
++        const int index = AlphabetIndex(c);
++        if (index < 0) {
++            continue;
++        }
++        buffer = (buffer << 6) | static_cast<u32>(index);
++        bits += 6;
++        if (bits >= 8) {
++            bits -= 8;
++            out.push_back(static_cast<char>((buffer >> bits) & 0xFF));
++        }
++    }
++    return out;
++}
++
++std::string MakeNascForm(const std::map<std::string, std::string>& fields) {
++    std::string out;
++    for (const auto& [key, value] : fields) {
++        if (!out.empty()) {
++            out += '&';
++        }
++        out += key;
++        out += '=';
++        out += UrlEncode(NascEncode(value));
++    }
++    return out;
++}
++
++std::map<std::string, std::string> ParseNascResponse(std::string_view body) {
++    std::map<std::string, std::string> fields;
++    while (!body.empty()) {
++        const auto amp = body.find('&');
++        const std::string_view pair = body.substr(0, amp);
++        const auto eq = pair.find('=');
++        if (eq != std::string_view::npos) {
++            std::string key(pair.substr(0, eq));
++            key.erase(std::remove_if(key.begin(), key.end(),
++                                     [](unsigned char c) { return std::isspace(c); }),
++                      key.end());
++            fields[key] = NascDecode(UrlDecode(pair.substr(eq + 1)));
++        }
++        if (amp == std::string_view::npos) {
++            break;
++        }
++        body.remove_prefix(amp + 1);
++    }
++    return fields;
++}
++
++GameAuthenticationData MakeFailedGameAuthentication(s32 result, s32 http_status) {
++    GameAuthenticationData data{};
++    data.result = result;
++    data.http_status_code = http_status;
++    return data;
++}
++
++GameAuthenticationData MakeGameAuthenticationData(const std::map<std::string, std::string>& fields,
++                                                  s32 http_status) {
++    const auto returncd = fields.find("returncd");
++    s32 result = NascResultServerGone;
++    if (returncd != fields.end()) {
++        char* end = nullptr;
++        const long value = std::strtol(returncd->second.c_str(), &end, 10);
++        if (end != returncd->second.c_str()) {
++            result = static_cast<s32>(value);
++        }
++    }
++    GameAuthenticationData data = MakeFailedGameAuthentication(result, http_status);
++    if (result != NascResultSuccess) {
++        return data;
++    }
++
++    const auto locator = fields.find("locator");
++    if (locator != fields.end()) {
++        const std::string& text = locator->second;
++        const auto colon = text.rfind(':');
++        CopyString(data.server_address, text.substr(0, colon));
++        if (colon != std::string::npos) {
++            data.server_port =
++                static_cast<u16>(std::strtoul(text.c_str() + colon + 1, nullptr, 10));
++        }
++    }
++    const auto token = fields.find("token");
++    if (token != fields.end()) {
++        CopyString(data.token, token->second);
++    }
++    const auto datetime = fields.find("datetime");
++    if (datetime != fields.end()) {
++        // "%Y%m%d%H%M%S"; kept as that number (how the real module stores it is unverified).
++        data.server_time = std::strtoull(datetime->second.c_str(), nullptr, 10);
++    }
++    return data;
++}
++
++} // namespace Service::FRD
+diff --git a/src/core/hle/service/frd/nasc_client.h b/src/core/hle/service/frd/nasc_client.h
+new file mode 100644
+index 0000000..22f1b72
+--- /dev/null
++++ b/src/core/hle/service/frd/nasc_client.h
+@@ -0,0 +1,52 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <array>
++#include <map>
++#include <string>
++#include <string_view>
++#include <vector>
++#include "common/common_funcs.h"
++#include "common/common_types.h"
++#include "common/swap.h"
++
++namespace Service::FRD {
++
++/// NASC "game server not available any more", the answer since Nintendo's 3DS servers closed.
++constexpr s32 NascResultServerGone = 110;
++constexpr s32 NascResultSuccess = 1;
++
++/// frd GetGameAuthenticationData output (libctru GameAuthenticationData).
++struct GameAuthenticationData {
++    s32_le result;           ///< NASC returncd (1 = success, 110 = game server gone, ...)
++    s32_le http_status_code; ///< HTTP status of the NASC request, 0 if none was made
++    std::array<char, 0x20> server_address;
++    u16_le server_port;
++    INSERT_PADDING_BYTES(2);
++    INSERT_PADDING_BYTES(4);
++    std::array<char, 0x100> token;
++    u64_le server_time;
++};
++static_assert(sizeof(GameAuthenticationData) == 0x138, "GameAuthenticationData has the wrong size");
++
++/// NASC form values: base64 with "+/=" replaced by ".-*".
++std::string NascEncode(std::string_view value);
++std::string NascDecode(std::string_view value);
++
++/// URL-encoded NASC request body for these fields.
++std::string MakeNascForm(const std::map<std::string, std::string>& fields);
++
++/// Decodes a NASC response ("locator=...&returncd=...&...").
++std::map<std::string, std::string> ParseNascResponse(std::string_view body);
++
++/// Turns a decoded NASC LOGIN response into what the game reads.
++GameAuthenticationData MakeGameAuthenticationData(const std::map<std::string, std::string>& fields,
++                                                  s32 http_status);
++
++/// A failed login with this NASC result (e.g. 110) and HTTP status.
++GameAuthenticationData MakeFailedGameAuthentication(s32 result, s32 http_status);
++
++} // namespace Service::FRD
+diff --git a/src/tests/CMakeLists.txt b/src/tests/CMakeLists.txt
+index fe1599b..0dedfc8 100644
+--- a/src/tests/CMakeLists.txt
++++ b/src/tests/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_executable(tests
+     core/hle/service/boss_storage.cpp
+     core/hle/service/cecd_message.cpp
+     core/hle/service/erreula_param.cpp
++    core/hle/service/nasc_client.cpp
+     core/hle/service/news_arrivals.cpp
+     core/hle/service/ptm_play_history.cpp
+     core/hle/service/ptm_steps.cpp
+diff --git a/src/tests/core/hle/service/nasc_client.cpp b/src/tests/core/hle/service/nasc_client.cpp
+new file mode 100644
+index 0000000..db0d10b
+--- /dev/null
++++ b/src/tests/core/hle/service/nasc_client.cpp
+@@ -0,0 +1,54 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <string>
++#include <catch2/catch_test_macros.hpp>
++#include "core/hle/service/frd/nasc_client.h"
++
++using namespace Service::FRD;
++
++// Examples from https://github.com/kinnay/NintendoClients/wiki/NASC-Server
++TEST_CASE("NASC values use base64 with .-*", "[service][frd][nasc]") {
++    CHECK(NascEncode("00030600") == "MDAwMzA2MDA*");
++    CHECK(NascEncode("LOGIN") == "TE9HSU4*");
++    CHECK(NascEncode("0004000000030700") == "MDAwNDAwMDAwMDAzMDcwMA**");
++    CHECK(NascEncode("000") == "MDAw");
++    CHECK(NascDecode("MzUuMTYzLjIuODk6NDA0NjA*") == "35.163.2.89:40460");
++    CHECK(NascDecode(NascEncode(std::string("\xFB\xEF\xBE", 3))) == "\xFB\xEF\xBE");
++    CHECK(NascEncode(std::string("\xFB\xEF\xBE", 3)) == "...."); // "++++" in base64
++    CHECK(NascEncode(std::string("\xFF\xFF\xFF", 3)) == "----"); // "////"
++    CHECK(MakeNascForm({{"action", "LOGIN"}, {"gameid", "00030600"}}) ==
++          "action=TE9HSU4%2A&gameid=MDAwMzA2MDA%2A");
++}
++
++TEST_CASE("NASC LOGIN responses", "[service][frd][nasc]") {
++    const auto ok = ParseNascResponse(
++        "locator=MzUuMTYzLjIuODk6NDA0NjA*&retry=MA**&returncd=MDAx&token=dGVzdA**&datetime="
++        "MjAyMjAxMTgxMDUwMzc*");
++    CHECK(ok.at("locator") == "35.163.2.89:40460");
++    CHECK(ok.at("returncd") == "001");
++    CHECK(ok.at("datetime") == "20220118105037");
++
++    const auto data = MakeGameAuthenticationData(ok, 200);
++    CHECK(data.result == NascResultSuccess);
++    CHECK(data.http_status_code == 200);
++    CHECK(std::string(data.server_address.data()) == "35.163.2.89");
++    CHECK(data.server_port == 40460);
++    CHECK(std::string(data.token.data()) == "test");
++    CHECK(data.server_time == 20220118105037ULL);
++
++    // "Game server no longer available" (what the Tangelo server answers by default).
++    const auto gone = MakeGameAuthenticationData(
++        ParseNascResponse("retry=MA**&returncd=MTEw&datetime=MjAyNjA5MzAxOTI4MTk*"), 200);
++    CHECK(gone.result == NascResultServerGone);
++    CHECK(gone.server_address[0] == 0);
++    CHECK(gone.server_port == 0);
++
++    // No returncd at all: treated as gone.
++    CHECK(MakeGameAuthenticationData({}, 200).result == NascResultServerGone);
++
++    const auto failed = MakeFailedGameAuthentication(NascResultServerGone, 0);
++    CHECK(failed.result == 110);
++    CHECK(failed.http_status_code == 0);
++}
+-- 
+2.43.0
+
