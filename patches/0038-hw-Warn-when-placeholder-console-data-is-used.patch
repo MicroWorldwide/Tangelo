@@ -1,0 +1,120 @@
+From a312a9bfdf2ebf975159fe7a6c62ff6b5f11ae8d Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 20:41:49 +0200
+Subject: [PATCH] hw: Warn when placeholder console data is used
+
+With the required online LLE modules enabled, a missing otp.bin,
+SecureInfo_A, LocalFriendCodeSeed_B or movable.sed is silently replaced
+by a placeholder, so the console looks linked. Nintendo's servers then
+reject it: the eShop fails with 005-5928 (IAS Register: "Device cert
+does not verify").
+
+Log which file is missing and that a placeholder is used, and say in
+the CTCert verification error what it breaks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/file_sys/otp.cpp   | 12 ++++++++----
+ src/core/hw/unique_data.cpp | 34 ++++++++++++++++++++++++----------
+ 2 files changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/src/core/file_sys/otp.cpp b/src/core/file_sys/otp.cpp
+index bd7694e..26bf703 100644
+--- a/src/core/file_sys/otp.cpp
++++ b/src/core/file_sys/otp.cpp
+@@ -39,8 +39,12 @@ Loader::ResultStatus OTP::Load(const std::string& file_path, std::span<const u8>
+     FileUtil::IOFile file(file_path, "rb");
+     if (!file.IsOpen()) {
+         if(Settings::values.enable_required_online_lle_modules.GetValue()){
+-        	memcpy(&temp_otp, dummy_otp, sizeof(dummy_otp));
+-		} else return Loader::ResultStatus::ErrorNotFound;
++            LOG_WARNING(HW_AES,
++                        "{} not found, using a placeholder OTP: Nintendo's servers "
++                        "reject its device certificate. Link your console to fix this.",
++                        file_path);
++            memcpy(&temp_otp, dummy_otp, sizeof(dummy_otp));
++        } else return Loader::ResultStatus::ErrorNotFound;
+ 	} else {
+ 		if (file.GetSize() != sizeof(OTPBin)) {
+ 			LOG_ERROR(HW_AES, "Invalid OTP size");
+@@ -71,8 +75,8 @@ Loader::ResultStatus OTP::Load(const std::string& file_path, std::span<const u8>
+     hash.CalculateDigest(digest.data(), reinterpret_cast<u8*>(&temp_otp.body),
+                          sizeof(temp_otp.body));
+     if (temp_otp.hash != digest) {
+-        LOG_ERROR(HW_AES, "OTP is corrupted");
+-    //    return Loader::ResultStatus::Error;
++        LOG_ERROR(HW_AES, "OTP is corrupted (hash mismatch): {}", file_path);
++        //    return Loader::ResultStatus::Error;
+     }
+ 
+     otp = temp_otp;
+diff --git a/src/core/hw/unique_data.cpp b/src/core/hw/unique_data.cpp
+index 47742a3..2c2941f 100644
+--- a/src/core/hw/unique_data.cpp
++++ b/src/core/hw/unique_data.cpp
+@@ -132,8 +132,12 @@ SecureDataLoadStatus LoadSecureInfoA() {
+     std::string file_path = GetSecureInfoAPath();
+     if (!FileUtil::Exists(file_path)) {
+ 		if(Settings::values.enable_required_online_lle_modules.GetValue()){
+-        	memcpy(&secure_info_a, dummy_secure_info, sizeof(dummy_secure_info));
+-		} else return SecureDataLoadStatus::NotFound;
++            LOG_WARNING(HW,
++                        "{} not found, using a placeholder ({}): Nintendo's servers "
++                        "reject placeholder console data. Link your console to fix this.",
++                        file_path, "SecureInfo_A");
++            memcpy(&secure_info_a, dummy_secure_info, sizeof(dummy_secure_info));
++        } else return SecureDataLoadStatus::NotFound;
+     } else {
+ 		FileUtil::IOFile file(file_path, "rb");
+ 		if (!file.IsOpen()) {
+@@ -190,8 +194,13 @@ SecureDataLoadStatus LoadLocalFriendCodeSeedB() {
+     std::string file_path = GetLocalFriendCodeSeedBPath();
+     if (!FileUtil::Exists(file_path)) {
+         if(Settings::values.enable_required_online_lle_modules.GetValue()){
+-        	memcpy(&local_friend_code_seed_b, dummy_local_friend_code_seed, sizeof(dummy_local_friend_code_seed));
+-		} else return SecureDataLoadStatus::NotFound;
++            LOG_WARNING(HW,
++                        "{} not found, using a placeholder ({}): Nintendo's servers "
++                        "reject placeholder console data. Link your console to fix this.",
++                        file_path, "LocalFriendCodeSeed_B");
++            memcpy(&local_friend_code_seed_b, dummy_local_friend_code_seed,
++                   sizeof(dummy_local_friend_code_seed));
++        } else return SecureDataLoadStatus::NotFound;
+     } else {
+ 		FileUtil::IOFile file(file_path, "rb");
+ 		if (!file.IsOpen()) {
+@@ -264,10 +273,11 @@ SecureDataLoadStatus LoadOTP() {
+                      HW::ECC::CreateECCSignature(otp.GetCTCertSignature()));
+ 
+     if (!ct_cert.VerifyMyself(HW::ECC::GetRootPublicKey())) {
+-        LOG_ERROR(HW, "CTCert failed verification");
+-    //    otp.Invalidate();
+-    //    ct_cert.Invalidate();
+-    //    return SecureDataLoadStatus::IOError;
++        LOG_ERROR(HW, "CTCert failed verification: the eShop and other Nintendo servers will "
++                      "refuse this console (IAS \"Device cert does not verify\", error 005-5928)");
++        //    otp.Invalidate();
++        //    ct_cert.Invalidate();
++        //    return SecureDataLoadStatus::IOError;
+     }
+ 
+     return SecureDataLoadStatus::Loaded;
+@@ -284,8 +294,12 @@ SecureDataLoadStatus LoadMovable() {
+     std::string file_path = GetMovablePath();
+     if (!FileUtil::Exists(file_path)) {
+         if(Settings::values.enable_required_online_lle_modules.GetValue()){
+-        	memcpy(&movable, dummy_movable, sizeof(dummy_movable));
+-		} else return SecureDataLoadStatus::NotFound;
++            LOG_WARNING(HW,
++                        "{} not found, using a placeholder ({}): Nintendo's servers "
++                        "reject placeholder console data. Link your console to fix this.",
++                        file_path, "movable.sed");
++            memcpy(&movable, dummy_movable, sizeof(dummy_movable));
++        } else return SecureDataLoadStatus::NotFound;
+     } else {
+ 		FileUtil::IOFile file(file_path, "rb");
+ 		if (!file.IsOpen()) {
+-- 
+2.43.0
+
