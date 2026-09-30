@@ -1,0 +1,189 @@
+From 0b99443d6222e7351463ae1be238d8aafec27ddd Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 20:31:18 +0200
+Subject: [PATCH] cecd: Drop StreetPass boxes without MBoxInfo from the
+ MBoxList
+
+System Settings showed an extra, empty StreetPass icon: the MBoxList
+named a box whose folder had no MBoxInfo____ (or no longer existed after
+a box was deleted or StreetPass data was cleared).
+
+- Only box folders with a MBoxInfo____ go into the list, including the
+  title writing it.
+- The list is cleaned when CECD starts, when a title opens or reads it
+  and after a box (or its MBoxInfo) is deleted, like the real module.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cecd/cecd.cpp | 102 ++++++++++++++++++++++++-----
+ src/core/hle/service/cecd/cecd.h   |   7 ++
+ 2 files changed, 92 insertions(+), 17 deletions(-)
+
+diff --git a/src/core/hle/service/cecd/cecd.cpp b/src/core/hle/service/cecd/cecd.cpp
+index 72c1497..0b7c733 100644
+--- a/src/core/hle/service/cecd/cecd.cpp
++++ b/src/core/hle/service/cecd/cecd.cpp
+@@ -66,6 +66,10 @@ void Module::Interface::Open(Kernel::HLERequestContext& ctx) {
+     mode.write_flag.Assign(1);
+     mode.create_flag.Assign(1);
+ 
++    if (path_type == CecDataPathType::MboxList) {
++        cecd->RefreshMBoxList();
++    }
++
+     SessionData* session_data = GetSessionData(ctx.Session());
+     session_data->ncch_program_id = ncch_program_id;
+     session_data->open_mode.raw = open_mode.raw;
+@@ -603,6 +607,11 @@ void Module::Interface::Delete(Kernel::HLERequestContext& ctx) {
+         }
+     }
+ 
++    if (path_type == CecDataPathType::MboxDir || path_type == CecDataPathType::MboxInfo) {
++        // The real module takes a deleted box out of the list as well.
++        cecd->RefreshMBoxList();
++    }
++
+     rb.PushMappedBuffer(message_id_buffer);
+ 
+     LOG_DEBUG(Service_CECD,
+@@ -820,6 +829,10 @@ void Module::Interface::OpenAndRead(Kernel::HLERequestContext& ctx) {
+     rp.PopPID();
+     auto& write_buffer = rp.PopMappedBuffer();
+ 
++    if (path_type == CecDataPathType::MboxList) {
++        cecd->RefreshMBoxList();
++    }
++
+     FileSys::Path path(cecd->GetCecDataPathTypeAsString(path_type, ncch_program_id).data());
+     FileSys::Mode mode;
+     mode.read_flag.Assign(1);
+@@ -1031,24 +1044,14 @@ void Module::CheckAndUpdateFile(const CecDataPathType path_type, const u32 ncch_
+             listed.emplace_back(box.begin(), end);
+         }
+ 
+-        std::vector<std::string> box_dirs;
+-        FileSys::Path root_path(GetCecDataPathTypeAsString(CecDataPathType::RootDir, 0).data());
+-        auto dir_result = cecd_system_save_data_archive->OpenDirectory(root_path);
+-        if (dir_result.Succeeded()) {
+-            auto root_dir = std::move(dir_result).Unwrap();
+-            std::vector<FileSys::Entry> entries(64);
+-            const u32 entry_count =
+-                root_dir->Read(static_cast<u32>(entries.size()), entries.data());
+-            root_dir->Close();
+-            for (u32 i = 0; i < entry_count; i++) {
+-                if (entries[i].is_directory) {
+-                    box_dirs.push_back(Common::UTF16ToUTF8(std::u16string(entries[i].filename)));
+-                }
+-            }
+-        }
+-
+-        const std::string add_box =
++        // Only boxes with a MBoxInfo____ count: a folder without one (left behind, or a title
++        // that isn't finished creating its box) shows up as an empty icon in System Settings.
++        const std::vector<std::string> box_dirs = GetValidBoxNames();
++        std::string add_box =
+             ncch_program_id != 0 ? fmt::format("{:08x}", ncch_program_id) : std::string{};
++        if (std::find(box_dirs.begin(), box_dirs.end(), add_box) == box_dirs.end()) {
++            add_box.clear();
++        }
+         const auto boxes = MergeMBoxList(listed, box_dirs, add_box, max_num_boxes);
+ 
+         mbox_list_header.num_boxes = static_cast<u16>(boxes.size());
+@@ -1538,10 +1541,75 @@ Module::Module(Core::System& system) : system(system) {
+         mboxlist->Write(0, mboxlist_size, true, false, mboxlist_buffer.data());
+         mboxlist->Close();
+     }
++
++    // Boxes can disappear while the emulator is off (Clear StreetPass data, files removed by
++    // hand), so drop them from the list before System Settings reads it.
++    RefreshMBoxList();
+ }
+ 
+ Module::~Module() = default;
+ 
++std::vector<std::string> Module::GetValidBoxNames() const {
++    std::vector<std::string> boxes;
++    FileSys::Path root_path(GetCecDataPathTypeAsString(CecDataPathType::RootDir, 0).data());
++    auto dir_result = cecd_system_save_data_archive->OpenDirectory(root_path);
++    if (dir_result.Failed()) {
++        return boxes;
++    }
++    auto root_dir = std::move(dir_result).Unwrap();
++    std::vector<FileSys::Entry> entries(64);
++    const u32 entry_count = root_dir->Read(static_cast<u32>(entries.size()), entries.data());
++    root_dir->Close();
++
++    FileSys::Mode read_mode;
++    read_mode.read_flag.Assign(1);
++    for (u32 i = 0; i < entry_count; i++) {
++        if (!entries[i].is_directory) {
++            continue;
++        }
++        std::string name = Common::UTF16ToUTF8(std::u16string(entries[i].filename));
++        std::transform(name.begin(), name.end(), name.begin(),
++                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++        const FileSys::Path info_path(fmt::format("/CEC/{}/MBoxInfo____", name).c_str());
++        auto info = cecd_system_save_data_archive->OpenFile(info_path, read_mode);
++        if (info.Failed()) {
++            LOG_DEBUG(Service_CECD, "Box {} has no MBoxInfo____, not listed", name);
++            continue;
++        }
++        std::move(info).Unwrap()->Close();
++        boxes.push_back(std::move(name));
++    }
++    return boxes;
++}
++
++void Module::RefreshMBoxList() {
++    const FileSys::Path list_path(GetCecDataPathTypeAsString(CecDataPathType::MboxList, 0).data());
++    FileSys::Mode mode;
++    mode.read_flag.Assign(1);
++    mode.write_flag.Assign(1);
++    auto file_result = cecd_system_save_data_archive->OpenFile(list_path, mode);
++    if (file_result.Failed()) {
++        return;
++    }
++    auto file = std::move(file_result).Unwrap();
++    if (file->GetSize() != sizeof(CecMBoxListHeader)) {
++        file->Close();
++        return;
++    }
++    std::vector<u8> original(sizeof(CecMBoxListHeader));
++    if (file->Read(0, original.size(), original.data()).Failed()) {
++        file->Close();
++        return;
++    }
++    std::vector<u8> updated = original;
++    CheckAndUpdateFile(CecDataPathType::MboxList, 0, updated);
++    if (updated != original) {
++        LOG_INFO(Service_CECD, "Removed deleted StreetPass boxes from MBoxList____");
++        file->Write(0, updated.size(), true, false, updated.data());
++    }
++    file->Close();
++}
++
+ std::vector<std::string> MergeMBoxList(const std::vector<std::string>& listed,
+                                        const std::vector<std::string>& box_dirs,
+                                        std::string_view add_box, std::size_t max_boxes) {
+diff --git a/src/core/hle/service/cecd/cecd.h b/src/core/hle/service/cecd/cecd.h
+index 6be3045..02afb35 100644
+--- a/src/core/hle/service/cecd/cecd.h
++++ b/src/core/hle/service/cecd/cecd.h
+@@ -641,6 +641,13 @@ private:
+ 
+     std::string GetCecCommandAsString(const CecCommand command) const;
+ 
++    /// Box folders in /CEC that hold a MBoxInfo____, i.e. StreetPass boxes that really exist.
++    std::vector<std::string> GetValidBoxNames() const;
++
++    /// Rewrites /CEC/MBoxList____ without boxes whose folder or MBoxInfo____ is gone (deleted
++    /// boxes, cleared StreetPass data), so System Settings doesn't show empty entries.
++    void RefreshMBoxList();
++
+     void CheckAndUpdateFile(const CecDataPathType path_type, const u32 ncch_program_id,
+                             std::vector<u8>& file_buffer);
+ 
+-- 
+2.43.0
+
