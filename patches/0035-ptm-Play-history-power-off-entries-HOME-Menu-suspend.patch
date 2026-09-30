@@ -1,0 +1,336 @@
+From 4488b77cf45fc132648388418e3e0c38a1f8038b Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 19:53:31 +0200
+Subject: [PATCH] ptm: Play history power off entries, HOME Menu suspend/resume
+
+The Activity Log counted 13 hours of Activity Log play time: the session of
+2026-09-29 ended with "HOME Menu closed" and the next entry came the next day, so the
+Activity Log treated the last application as running all night. A console never
+logs the HOME Menu as closed at power off; it writes the special entry "3DS services
+stopped" (title FFFFFFFFFFFFFFFF, event 1010), which the Activity Log takes as "all
+titles closed".
+
+Following the console's patterns (https://www.3dbrew.org/wiki/PTM_Savegame):
+- Emulation stopping: applications still running are logged as closed, then
+  "3DS services stopped". The HOME Menu is not logged as closed.
+- A session that ended without that entry (crash, killed emulator) is ended at its
+  last entry when emulation starts again.
+- Starting an application while the HOME Menu runs logs "HOME Menu suspended" first;
+  closing it logs "HOME Menu resumed".
+- A title started again without exiting is logged as closed first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ptm/ptm.cpp              | 35 +++++----
+ src/core/hle/service/ptm/ptm.h                | 12 ++-
+ src/core/hle/service/ptm/ptm_play_history.cpp | 76 +++++++++++++++++++
+ src/core/hle/service/ptm/ptm_play_history.h   | 29 +++++++
+ .../core/hle/service/ptm_play_history.cpp     | 48 ++++++++++++
+ 5 files changed, 175 insertions(+), 25 deletions(-)
+
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index ffec2c6..0fa5ef8 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -397,6 +397,12 @@ Module::Module(Core::System& system_) : system(system_) {
+     }
+ 
+     LoadPlayHistory();
++    // A session that ended without a power off entry (crash, killed emulator) is closed at its
++    // last entry, so the Activity Log doesn't count the time since as play time.
++    play_history.EndUnfinishedSession();
++    SavePlayHistory();
++    clock_anchor_ms = system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
++    clock_anchor_host = std::chrono::steady_clock::now();
+ }
+ 
+ namespace {
+@@ -413,36 +419,29 @@ void Module::OnProcessEvent(u64 program_id, bool started) {
+         return;
+     }
+     const u64 now = system.Kernel().GetSharedPageHandler().GetSystemTimeSince2000();
+-    const u8 applet = PlayHistory::IsApplet(program_id) ? PlayHistory::Applet : 0;
++    clock_anchor_ms = now;
++    clock_anchor_host = std::chrono::steady_clock::now();
+     if (started) {
+-        running_titles[program_id] = {now, std::chrono::steady_clock::now()};
+-        play_history.Add(program_id, applet, now);
++        play_history.LogLaunch(program_id, now);
+         LOG_INFO(Service_PTM, "Play history: {:016X} launched", program_id);
+     } else {
+-        running_titles.erase(program_id);
+-        play_history.Add(program_id, PlayHistory::Close | applet, now);
++        play_history.LogClose(program_id, now);
+         LOG_INFO(Service_PTM, "Play history: {:016X} closed", program_id);
+     }
+     SavePlayHistory();
+ }
+ 
+ Module::~Module() {
+-    if (running_titles.empty()) {
++    if (clock_anchor_ms == 0) {
+         return;
+     }
+-    // The kernel may already be gone here; the close time is the launch time plus the time
+-    // that has passed since.
+-    const auto host_now = std::chrono::steady_clock::now();
+-    for (const auto& [program_id, title] : running_titles) {
+-        const auto played = std::chrono::duration_cast<std::chrono::milliseconds>(
+-            host_now - title.launch_host_time);
+-        const u8 applet = PlayHistory::IsApplet(program_id) ? PlayHistory::Applet : 0;
+-        play_history.Add(program_id, PlayHistory::Close | applet,
+-                         title.launch_ms_since_2000 + static_cast<u64>(played.count()));
+-        LOG_INFO(Service_PTM, "Play history: {:016X} closed after {} min", program_id,
+-                 played.count() / 60000);
+-    }
++    // The kernel may already be gone here: the stop time is the last known emulated time plus
++    // the time that has passed since.
++    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now() - clock_anchor_host);
++    play_history.LogSystemStop(clock_anchor_ms + static_cast<u64>(elapsed.count()));
+     SavePlayHistory();
++    LOG_INFO(Service_PTM, "Play history: system stopped");
+ }
+ 
+ namespace {
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index 46a8eaf..af43ed9 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -62,7 +62,7 @@ public:
+ 
+     /// Hour-by-hour steps of the virtual walk, as GetStepHistory reports them.
+     static std::vector<u16> VirtualStepHistory(u64 start_ms, u32 hours, u64 now_ms);
+-    /// Logs the titles still running as closed in the play history.
++    /// Logs a power off in the play history.
+     ~Module();
+ 
+     /// Play history: a title (application or applet) started (true) or exited (false).
+@@ -248,15 +248,13 @@ private:
+ 
+     /// Play history (/PlayHistory.dat in the PTM system save data 0x00010022). Applications and
+     /// applets are logged when their process starts and exits (the kernel tells PTM, see
+-    /// InstallInterfaces); titles still running when emulation stops are logged as closed then.
++    /// InstallInterfaces); when emulation stops, a power off entry is written.
+     void LoadPlayHistory();
+     void SavePlayHistory() const;
+     PlayHistory play_history;
+-    struct RunningTitle {
+-        u64 launch_ms_since_2000 = 0;
+-        std::chrono::steady_clock::time_point launch_host_time;
+-    };
+-    std::map<u64, RunningTitle> running_titles;
++    /// Last known emulated time and the host time it was taken at (for the stop entry).
++    u64 clock_anchor_ms = 0;
++    std::chrono::steady_clock::time_point clock_anchor_host;
+ 
+     template <class Archive>
+     void serialize(Archive& ar, const unsigned int);
+diff --git a/src/core/hle/service/ptm/ptm_play_history.cpp b/src/core/hle/service/ptm/ptm_play_history.cpp
+index 5d8b2c3..949f276 100644
+--- a/src/core/hle/service/ptm/ptm_play_history.cpp
++++ b/src/core/hle/service/ptm/ptm_play_history.cpp
+@@ -56,6 +56,82 @@ void PlayHistory::Add(u64 title_id, u8 event, u64 ms_since_2000) {
+     entries.push_back(MakeEntry(title_id, event, ms_since_2000));
+ }
+ 
++bool PlayHistory::IsHomeMenu(u64 title_id) {
++    switch (title_id) {
++    case 0x0004003000008202: // JPN
++    case 0x0004003000008F02: // USA
++    case 0x0004003000009802: // EUR
++    case 0x000400300000A102: // CHN
++    case 0x000400300000A902: // KOR
++    case 0x000400300000B102: // TWN
++        return true;
++    default:
++        return false;
++    }
++}
++
++void PlayHistory::LogLaunch(u64 title_id, u64 ms_since_2000) {
++    if (running.contains(title_id)) {
++        LogClose(title_id, ms_since_2000);
++    }
++    const bool applet = IsApplet(title_id);
++    if (!applet) {
++        // Starting an application suspends the HOME Menu.
++        for (const auto& [id, is_running] : running) {
++            if (IsHomeMenu(id) && !home_suspended) {
++                Add(id, Close | Applet | ResumeSuspend, ms_since_2000);
++                home_suspended = true;
++            }
++        }
++    } else if (IsHomeMenu(title_id)) {
++        home_suspended = false;
++    }
++    Add(title_id, applet ? Applet : 0, ms_since_2000);
++    running[title_id] = true;
++}
++
++void PlayHistory::LogClose(u64 title_id, u64 ms_since_2000) {
++    const bool applet = IsApplet(title_id);
++    Add(title_id, Close | (applet ? Applet : 0), ms_since_2000);
++    running.erase(title_id);
++    if (IsHomeMenu(title_id)) {
++        home_suspended = false;
++        return;
++    }
++    if (!applet && home_suspended) {
++        // Back to the HOME Menu.
++        for (const auto& [id, is_running] : running) {
++            if (IsHomeMenu(id)) {
++                Add(id, Applet | ResumeSuspend, ms_since_2000);
++            }
++        }
++        home_suspended = false;
++    }
++}
++
++void PlayHistory::LogSystemStop(u64 ms_since_2000) {
++    // Applications still running are logged as closed; the HOME Menu never is.
++    for (const auto& [id, is_running] : running) {
++        if (!IsHomeMenu(id)) {
++            Add(id, Close | (IsApplet(id) ? Applet : 0), ms_since_2000);
++        }
++    }
++    running.clear();
++    home_suspended = false;
++    Add(SpecialTitleId, SpecialSystemStopped, ms_since_2000);
++}
++
++void PlayHistory::EndUnfinishedSession() {
++    if (entries.empty()) {
++        return;
++    }
++    const Entry& last = entries.back();
++    if (last.TitleId() == SpecialTitleId && last.Event() == SpecialSystemStopped) {
++        return;
++    }
++    Add(SpecialTitleId, SpecialSystemStopped, static_cast<u64>(last.Minutes()) * 60000);
++}
++
+ bool PlayHistory::IsApplet(u64 title_id) {
+     return (title_id >> 32) == 0x00040030;
+ }
+diff --git a/src/core/hle/service/ptm/ptm_play_history.h b/src/core/hle/service/ptm/ptm_play_history.h
+index ba00842..5dfea0a 100644
+--- a/src/core/hle/service/ptm/ptm_play_history.h
++++ b/src/core/hle/service/ptm/ptm_play_history.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <map>
+ #include <span>
+ #include <vector>
+ #include "common/common_types.h"
+@@ -54,6 +55,31 @@ public:
+     /// Adds an entry; the oldest entry is dropped when the log is full.
+     void Add(u64 title_id, u8 event, u64 ms_since_2000);
+ 
++    /// Title ID of special (system-wide) entries; their event is a number, not flags.
++    static constexpr u64 SpecialTitleId = 0xFFFFFFFFFFFFFFFF;
++    /// Special event: 3DS services stopped (power off). The Activity Log treats every title
++    /// as closed at this point.
++    static constexpr u8 SpecialSystemStopped = 0b1010;
++
++    /**
++     * Logs a title starting, the way the console does: an application started while the HOME
++     * Menu runs is preceded by "HOME Menu suspended"; a title that is already running is logged
++     * as closed first.
++     */
++    void LogLaunch(u64 title_id, u64 ms_since_2000);
++    /// Logs a title exiting; the HOME Menu is logged as resumed after an application closes.
++    void LogClose(u64 title_id, u64 ms_since_2000);
++    /// Logs a power off: open applications closed, then "3DS services stopped".
++    void LogSystemStop(u64 ms_since_2000);
++    /**
++     * Ends a session that stopped without a power off entry (e.g. the emulator was closed
++     * unexpectedly): adds "3DS services stopped" at the time of the last entry, so the Activity
++     * Log doesn't count the time since as play time.
++     */
++    void EndUnfinishedSession();
++    /// HOME Menu title IDs (all regions).
++    static bool IsHomeMenu(u64 title_id);
++
+     static Entry MakeEntry(u64 title_id, u8 event, u64 ms_since_2000);
+     /// Whether a title is logged as an applet (HOME Menu, Activity Log, ...) rather than an
+     /// application: system applets have title ID high 0x00040030.
+@@ -65,6 +91,9 @@ public:
+ 
+ private:
+     std::vector<Entry> entries; // oldest first
++    /// Titles running now (not saved), and whether the HOME Menu is suspended.
++    std::map<u64, bool> running;
++    bool home_suspended = false;
+ };
+ 
+ } // namespace Service::PTM
+diff --git a/src/tests/core/hle/service/ptm_play_history.cpp b/src/tests/core/hle/service/ptm_play_history.cpp
+index c838c98..664d440 100644
+--- a/src/tests/core/hle/service/ptm_play_history.cpp
++++ b/src/tests/core/hle/service/ptm_play_history.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the license.txt file included.
+ 
+ #include <cstring>
++#include <utility>
+ #include <vector>
+ #include <catch2/catch_test_macros.hpp>
+ #include "core/hle/service/ptm/ptm_play_history.h"
+@@ -63,3 +64,50 @@ TEST_CASE("Play history is saved oldest first and loaded from a ring buffer", "[
+     CHECK_FALSE(loaded.Load(std::vector<u8>{1, 2, 3}));
+     CHECK(loaded.Entries().empty());
+ }
++
++TEST_CASE("Play history follows the console's launch and power off pattern", "[service][ptm]") {
++    constexpr u64 Home = 0x0004003000009802;
++    constexpr u64 ActivityLog = 0x0004001000022200;
++    constexpr u64 Min = 60'000;
++    PlayHistory history;
++    history.LogLaunch(Home, 1 * Min);
++    history.LogLaunch(ActivityLog, 2 * Min);
++    history.LogClose(ActivityLog, 5 * Min);
++    history.LogLaunch(ActivityLog, 6 * Min);
++    history.LogSystemStop(9 * Min);
++
++    std::vector<std::pair<u64, u8>> got;
++    for (const auto& e : history.Entries()) {
++        got.emplace_back(e.TitleId(), e.Event());
++    }
++    const std::vector<std::pair<u64, u8>> expected{
++        {Home, 0b0010},        // HOME Menu launched
++        {Home, 0b0111},        // HOME Menu suspended
++        {ActivityLog, 0b0000}, // application launched
++        {ActivityLog, 0b0001}, // application closed
++        {Home, 0b0110},        // HOME Menu resumed
++        {Home, 0b0111},
++        {ActivityLog, 0b0000},
++        {ActivityLog, 0b0001}, // closed at power off
++        {PlayHistory::SpecialTitleId, PlayHistory::SpecialSystemStopped},
++    };
++    CHECK(got == expected);
++    CHECK(history.Entries().back().Minutes() == 9);
++
++    // A session without a power off entry is ended at its last entry.
++    PlayHistory unfinished;
++    unfinished.Add(ActivityLog, 0, 30 * Min);
++    unfinished.EndUnfinishedSession();
++    REQUIRE(unfinished.Entries().size() == 2);
++    CHECK(unfinished.Entries()[1].TitleId() == PlayHistory::SpecialTitleId);
++    CHECK(unfinished.Entries()[1].Minutes() == 30);
++    unfinished.EndUnfinishedSession(); // already ended: nothing added
++    CHECK(unfinished.Entries().size() == 2);
++
++    // The same title started again without an exit in between is closed first.
++    PlayHistory twice;
++    twice.LogLaunch(0x000400000F717100, 1 * Min);
++    twice.LogLaunch(0x000400000F717100, 2 * Min);
++    REQUIRE(twice.Entries().size() == 3);
++    CHECK(twice.Entries()[1].Event() == PlayHistory::Close);
++}
+-- 
+2.43.0
+
