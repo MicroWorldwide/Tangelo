@@ -1,0 +1,139 @@
+From 089871ada687ffc173c9ccefa54beb62b089f9b3 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 23:41:36 +0200
+Subject: [PATCH] frd, boss: Logout; play report tasks aren't downloaded
+
+Seen with Mario & Sonic at the Rio 2016 Olympic Games after 0042 (the
+login now ends in the game's normal 002-0110 message):
+
+- frd:u/frd:a Logout (0x0004) was unimplemented; it now ends the
+  session like Login started it.
+- The game's "preport" SpotPass task sends play reports to
+  npvk.app.nintendo.net/reports. It was run as a download and failed
+  with "Could not establish connection"; it's now treated like other
+  upload tasks (reported as failed without a request).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/frd/frd.cpp                 | 10 ++++++++++
+ src/core/hle/service/frd/frd.h                   |  7 +++++++
+ src/core/hle/service/frd/frd_a.cpp               |  2 +-
+ src/core/hle/service/frd/frd_u.cpp               |  2 +-
+ src/core/hle/service/http/spotpass_redirect.cpp  |  5 +++++
+ src/core/hle/service/http/spotpass_redirect.h    |  4 ++--
+ src/tests/core/hle/service/spotpass_redirect.cpp |  2 ++
+ 7 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/hle/service/frd/frd.cpp b/src/core/hle/service/frd/frd.cpp
+index c33caa7..bfea921 100644
+--- a/src/core/hle/service/frd/frd.cpp
++++ b/src/core/hle/service/frd/frd.cpp
+@@ -312,6 +312,16 @@ void Module::Interface::Login(Kernel::HLERequestContext& ctx) {
+     rb.Push(ResultSuccess);
+ }
+ 
++void Module::Interface::Logout(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    frd->logged_in = false;
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_FRD, "called");
++}
++
+ void Module::Interface::GetLastResponseResult(Kernel::HLERequestContext& ctx) {
+     LOG_WARNING(Service_FRD, "(STUBBED) called");
+ 
+diff --git a/src/core/hle/service/frd/frd.h b/src/core/hle/service/frd/frd.h
+index fb609c7..da2ada6 100644
+--- a/src/core/hle/service/frd/frd.h
++++ b/src/core/hle/service/frd/frd.h
+@@ -287,6 +287,13 @@ public:
+          */
+         void GetLastResponseResult(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * FRD::Logout service function
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void Logout(Kernel::HLERequestContext& ctx);
++
+         /**
+          * FRD::RequestGameAuthentication service function. Logs in at the game server login
+          * (NASC) for the game's server id; the answer is read with GetGameAuthenticationData.
+diff --git a/src/core/hle/service/frd/frd_a.cpp b/src/core/hle/service/frd/frd_a.cpp
+index ca39c5c..cb4a24c 100644
+--- a/src/core/hle/service/frd/frd_a.cpp
++++ b/src/core/hle/service/frd/frd_a.cpp
+@@ -14,7 +14,7 @@ FRD_A::FRD_A(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x0001, &FRD_A::HasLoggedIn, "HasLoggedIn"},
+         {0x0002, &FRD_A::IsOnline, "IsOnline"},
+         {0x0003, &FRD_A::Login, "Login"},
+-        {0x0004, nullptr, "Logout"},
++        {0x0004, &FRD_A::Logout, "Logout"},
+         {0x0005, &FRD_A::GetMyFriendKey, "GetMyFriendKey"},
+         {0x0006, &FRD_A::GetMyPreference, "GetMyPreference"},
+         {0x0007, &FRD_A::GetMyProfile, "GetMyProfile"},
+diff --git a/src/core/hle/service/frd/frd_u.cpp b/src/core/hle/service/frd/frd_u.cpp
+index f7b4cda..216927b 100644
+--- a/src/core/hle/service/frd/frd_u.cpp
++++ b/src/core/hle/service/frd/frd_u.cpp
+@@ -14,7 +14,7 @@ FRD_U::FRD_U(std::shared_ptr<Module> frd) : Module::Interface(std::move(frd), "f
+         {0x0001, &FRD_U::HasLoggedIn, "HasLoggedIn"},
+         {0x0002, &FRD_U::IsOnline, "IsOnline"},
+         {0x0003, &FRD_U::Login, "Login"},
+-        {0x0004, nullptr, "Logout"},
++        {0x0004, &FRD_U::Logout, "Logout"},
+         {0x0005, &FRD_U::GetMyFriendKey, "GetMyFriendKey"},
+         {0x0006, &FRD_U::GetMyPreference, "GetMyPreference"},
+         {0x0007, &FRD_U::GetMyProfile, "GetMyProfile"},
+diff --git a/src/core/hle/service/http/spotpass_redirect.cpp b/src/core/hle/service/http/spotpass_redirect.cpp
+index 54e0c49..7502f55 100644
+--- a/src/core/hle/service/http/spotpass_redirect.cpp
++++ b/src/core/hle/service/http/spotpass_redirect.cpp
+@@ -130,6 +130,11 @@ bool IsSpotPassUrl(std::string_view url) {
+ }
+ 
+ bool IsSpotPassUploadUrl(std::string_view url) {
++    // Play reports ("preport" tasks) are sent to the npvk hosts.
++    const std::string host = GetUrlHost(url);
++    if (host == "npvk.app.nintendo.net" || host == "npvk.app.nintendowifi.net") {
++        return true;
++    }
+     if (!IsSpotPassUrl(url)) {
+         return false;
+     }
+diff --git a/src/core/hle/service/http/spotpass_redirect.h b/src/core/hle/service/http/spotpass_redirect.h
+index c0b98c7..2d7a1cf 100644
+--- a/src/core/hle/service/http/spotpass_redirect.h
++++ b/src/core/hle/service/http/spotpass_redirect.h
+@@ -22,8 +22,8 @@ std::string GetSpotPassHost(std::string_view url);
+ /// on NetPass's SpotPass mirror (api.netpass.cafe), which NetPass puts in place of Nintendo's URLs.
+ bool IsSpotPassUrl(std::string_view url);
+ 
+-/// Returns true if `url` is a SpotPass upload (npul host or a /p01/recv/ path). Upload tasks send
+-/// data to the server instead of downloading.
++/// Returns true if `url` is a SpotPass upload (npul host or a /p01/recv/ path) or a play report
++/// (npvk host). Such tasks send data to the server instead of downloading.
+ bool IsSpotPassUploadUrl(std::string_view url);
+ 
+ /**
+diff --git a/src/tests/core/hle/service/spotpass_redirect.cpp b/src/tests/core/hle/service/spotpass_redirect.cpp
+index 91d5ede..b005470 100644
+--- a/src/tests/core/hle/service/spotpass_redirect.cpp
++++ b/src/tests/core/hle/service/spotpass_redirect.cpp
+@@ -95,6 +95,8 @@ TEST_CASE("SpotPass upload URLs are recognised", "[service][http][spotpass]") {
+         "https://a248.e.akamai.net/f/1/2/3/npdl.c.app.nintendowifi.net/p01/recv/abc/task"));
+     CHECK_FALSE(IsSpotPassUploadUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/abc/task/file"));
+     CHECK_FALSE(IsSpotPassUploadUrl("https://example.com/p01/recv/abc"));
++    // Play reports (Mario & Sonic's "preport" task).
++    CHECK(IsSpotPassUploadUrl("https://npvk.app.nintendo.net/reports"));
+ }
+ 
+ TEST_CASE("Nintendo services are redirected to the stand-in server", "[service][http][spotpass]") {
+-- 
+2.43.0
+
