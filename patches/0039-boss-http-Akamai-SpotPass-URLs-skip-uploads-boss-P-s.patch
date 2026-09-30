@@ -1,0 +1,552 @@
+From 2f437340d2929408a14509530a8e462198bb9caf Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 30 Sep 2026 20:57:19 +0200
+Subject: [PATCH] boss, http: Akamai SpotPass URLs, skip uploads, boss:P
+ sessions
+
+- SpotPass URLs wrapped by Akamai
+  (https://a248.e.akamai.net/f/248/103046/10m/npdl.c.app.nintendowifi.net/p01/...,
+  used by the eShop's BGM tasks) are recognised and redirected to the
+  custom SpotPass server like the direct Nintendo addresses.
+  X-Tangelo-Original-Host carries the wrapped Nintendo host.
+- Upload tasks (npul, /p01/recv/, e.g. Miiverse) are no longer
+  downloaded with GET: they're reported as failed without a request,
+  and not started at session start.
+- boss:P InitializeSessionPrivileged creates the session like
+  InitializeSession, so the HOME Menu's task and property calls after
+  it work instead of failing with "uninitialized BOSS session".
+- boss:P GetOptoutFlagPrivileged (0x0407) and GetStorageInfoPrivileged
+  (0x044D) read the title's opt-out flag and storage size from BOSS_A.db.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/boss/boss.cpp            | 45 ++++++++++--
+ src/core/hle/service/boss/boss.h              | 26 +++++++
+ src/core/hle/service/boss/boss_download.cpp   |  2 +-
+ src/core/hle/service/boss/boss_p.cpp          |  2 +
+ src/core/hle/service/boss/boss_storage.cpp    |  9 +++
+ src/core/hle/service/boss/boss_storage.h      |  3 +
+ src/core/hle/service/boss/online_service.cpp  | 29 +++++++-
+ src/core/hle/service/boss/online_service.h    |  6 +-
+ src/core/hle/service/http/http_c.cpp          |  2 +-
+ .../hle/service/http/spotpass_redirect.cpp    | 70 ++++++++++++++++++-
+ src/core/hle/service/http/spotpass_redirect.h | 10 +++
+ src/tests/core/hle/service/boss_storage.cpp   | 14 ++++
+ .../core/hle/service/spotpass_redirect.cpp    | 32 +++++++++
+ 13 files changed, 237 insertions(+), 13 deletions(-)
+
+diff --git a/src/core/hle/service/boss/boss.cpp b/src/core/hle/service/boss/boss.cpp
+index bfeeadb..2f70e4d 100644
+--- a/src/core/hle/service/boss/boss.cpp
++++ b/src/core/hle/service/boss/boss.cpp
+@@ -54,6 +54,13 @@ void Module::Interface::InitializeSession(Kernel::HLERequestContext& ctx) {
+     const u64 program_id = rp.Pop<u64>();
+     rp.PopPID();
+ 
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(StartSession(ctx, program_id));
++
++    LOG_DEBUG(Service_BOSS, "called, program_id={:#018x}", program_id);
++}
++
++Result Module::Interface::StartSession(Kernel::HLERequestContext& ctx, u64 program_id) {
+     const auto session_data = GetSessionData(ctx.Session());
+     if (session_data->online_service == nullptr) {
+         u64 curr_program_id;
+@@ -69,11 +76,7 @@ void Module::Interface::InitializeSession(Kernel::HLERequestContext& ctx) {
+     if (result.IsSuccess()) {
+         session_data->online_service->RunTasksAtStart(boss->spotpass_state);
+     }
+-
+-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+-    rb.Push(result);
+-
+-    LOG_DEBUG(Service_BOSS, "called, program_id={:#018x}", program_id);
++    return result;
+ }
+ 
+ void Module::Interface::SetStorageInfo(Kernel::HLERequestContext& ctx) {
+@@ -1002,10 +1005,40 @@ void Module::Interface::InitializeSessionPrivileged(Kernel::HLERequestContext& c
+     const u64 programID = rp.Pop<u64>();
+     rp.PopPID();
+ 
++    // The HOME Menu and system applets use boss:P with program ID 0 (their own tasks) and then
++    // the regular task and property commands, which need a session like InitializeSession.
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(StartSession(ctx, programID));
++
++    LOG_DEBUG(Service_BOSS, "called, programID={:#018x}", programID);
++}
++
++void Module::Interface::GetOptoutFlagPrivileged(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u64 programID = rp.Pop<u64>();
++
++    const bool optout = OnlineService::GetTitleOptout(programID);
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
++    rb.Push<u8>(optout ? 1 : 0);
+ 
+-    LOG_WARNING(Service_BOSS, "(STUBBED) programID={:#018x}", programID);
++    LOG_DEBUG(Service_BOSS, "called, programID={:#018x}, optout={}", programID, optout);
++}
++
++void Module::Interface::GetStorageInfoPrivileged(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u64 programID = rp.Pop<u64>();
++
++    const auto storage = OnlineService::GetTitleStorage(programID);
++    const u32 storage_size = storage ? storage->size : 0;
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(storage_size);
++
++    LOG_DEBUG(Service_BOSS, "called, programID={:#018x}, storage_size={:#x}", programID,
++              storage_size);
+ }
+ 
+ void Module::Interface::GetAppNewFlag(Kernel::HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/boss/boss.h b/src/core/hle/service/boss/boss.h
+index 01a4801..7295377 100644
+--- a/src/core/hle/service/boss/boss.h
++++ b/src/core/hle/service/boss/boss.h
+@@ -53,6 +53,10 @@ public:
+          */
+         void InitializeSession(Kernel::HLERequestContext& ctx);
+ 
++        /// Creates the session's OnlineService (if needed) and initializes it for `program_id`
++        /// (0 = the calling title). Shared by InitializeSession and InitializeSessionPrivileged.
++        Result StartSession(Kernel::HLERequestContext& ctx, u64 program_id);
++
+         /**
+          * BOSS::RegisterStorage service function
+          *  Inputs:
+@@ -843,6 +847,28 @@ public:
+          */
+         void GetAppNewFlag(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * BOSS_P::GetOptoutFlagPrivileged service function
++         *  Inputs:
++         *      0 : Header Code[0x04070080]
++         *    1-2 : u64 ProgramID
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2 : u8 opt-out flag of that title
++         */
++        void GetOptoutFlagPrivileged(Kernel::HLERequestContext& ctx);
++
++        /**
++         * BOSS_P::GetStorageInfoPrivileged service function
++         *  Inputs:
++         *      0 : Header Code[0x044D0080]
++         *    1-2 : u64 ProgramID
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2 : u32 SpotPass storage size registered by that title, 0 if none
++         */
++        void GetStorageInfoPrivileged(Kernel::HLERequestContext& ctx);
++
+         /**
+          * BOSS_P::GetNsDataIdListPrivileged service function
+          *  Inputs:
+diff --git a/src/core/hle/service/boss/boss_download.cpp b/src/core/hle/service/boss/boss_download.cpp
+index f9942a9..53ee6ac 100644
+--- a/src/core/hle/service/boss/boss_download.cpp
++++ b/src/core/hle/service/boss/boss_download.cpp
+@@ -29,7 +29,7 @@ TaskDownload DownloadTaskFile(const std::string& url, const std::string& if_modi
+     if (Settings::values.use_custom_spotpass_server.GetValue()) {
+         if (auto redirected =
+                 HTTP::RedirectSpotPassUrl(url, Settings::values.spotpass_server_url.GetValue())) {
+-            original_host = HTTP::GetUrlHost(url);
++            original_host = HTTP::GetSpotPassHost(url);
+             request_url = std::move(*redirected);
+         }
+     }
+diff --git a/src/core/hle/service/boss/boss_p.cpp b/src/core/hle/service/boss/boss_p.cpp
+index b9109f7..dc67b4b 100644
+--- a/src/core/hle/service/boss/boss_p.cpp
++++ b/src/core/hle/service/boss/boss_p.cpp
+@@ -70,6 +70,7 @@ BOSS_P::BOSS_P(std::shared_ptr<Module> boss)
+         // boss:p
+         {0x0401, &BOSS_P::InitializeSessionPrivileged, "InitializeSessionPrivileged"},
+         {0x0404, &BOSS_P::GetAppNewFlag, "GetAppNewFlag"},
++        {0x0407, &BOSS_P::GetOptoutFlagPrivileged, "GetOptoutFlagPrivileged"},
+         {0x040D, &BOSS_P::GetNsDataIdListPrivileged, "GetNsDataIdListPrivileged"},
+         {0x040E, &BOSS_P::GetNsDataIdListPrivileged1, "GetNsDataIdListPrivileged1"},
+         {0x0413, &BOSS_P::SendPropertyPrivileged, "SendPropertyPrivileged"},
+@@ -78,6 +79,7 @@ BOSS_P::BOSS_P(std::shared_ptr<Module> boss)
+         {0x0417, &BOSS_P::ReadNsDataPrivileged, "ReadNsDataPrivileged"},
+         {0x041A, &BOSS_P::SetNsDataNewFlagPrivileged, "SetNsDataNewFlagPrivileged"},
+         {0x041B, &BOSS_P::GetNsDataNewFlagPrivileged, "GetNsDataNewFlagPrivileged"},
++        {0x044D, &BOSS_P::GetStorageInfoPrivileged, "GetStorageInfoPrivileged"},
+         // clang-format on
+     };
+ 
+diff --git a/src/core/hle/service/boss/boss_storage.cpp b/src/core/hle/service/boss/boss_storage.cpp
+index b5c4d8d..92b4dae 100644
+--- a/src/core/hle/service/boss/boss_storage.cpp
++++ b/src/core/hle/service/boss/boss_storage.cpp
+@@ -18,6 +18,7 @@ constexpr u8 LatestVersion = 3;
+ constexpr std::size_t TitleInfo = 0x10;
+ constexpr std::size_t TitleProgramId = TitleInfo + 0x0;
+ constexpr std::size_t TitleSessionMaker = TitleInfo + 0x8;
++constexpr std::size_t TitleOptout = TitleInfo + 0x9;
+ constexpr u8 SessionMakerUser = 1;
+ // StorageEntry
+ constexpr std::size_t Storage = TitleInfo + 0x10;
+@@ -74,6 +75,14 @@ std::optional<StorageInfo> FindStorage(std::span<const u8> db, u64 program_id) {
+     };
+ }
+ 
++bool FindOptout(std::span<const u8> db, u64 program_id) {
++    if (!IsWellFormed(db)) {
++        return false;
++    }
++    const auto offset = FindEntry(db, program_id);
++    return offset && db[*offset + TitleOptout] != 0;
++}
++
+ bool SetStorage(std::vector<u8>& db, u64 program_id, const std::optional<StorageInfo>& storage) {
+     if (!IsWellFormed(db)) {
+         if (!storage) {
+diff --git a/src/core/hle/service/boss/boss_storage.h b/src/core/hle/service/boss/boss_storage.h
+index 38cfcd2..784ebb1 100644
+--- a/src/core/hle/service/boss/boss_storage.h
++++ b/src/core/hle/service/boss/boss_storage.h
+@@ -44,6 +44,9 @@ constexpr std::size_t EntrySize = 0x800;
+ /// The storage registered for `program_id`, if the database has a valid entry with one.
+ std::optional<StorageInfo> FindStorage(std::span<const u8> db, u64 program_id);
+ 
++/// The title's SpotPass opt-out flag (the user turned SpotPass off for it); false if unknown.
++bool FindOptout(std::span<const u8> db, u64 program_id);
++
+ /**
+  * Registers (`storage` set) or unregisters (`storage` empty) the storage of `program_id`.
+  * Updates the title's entry, or appends a new one; an empty or malformed database is recreated.
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index d16d166..a53fb5c 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -22,6 +22,7 @@
+ #include "core/hle/kernel/hle_ipc.h"
+ #include "core/hle/service/boss/boss_download.h"
+ #include "core/hle/service/boss/online_service.h"
++#include "core/hle/service/http/spotpass_redirect.h"
+ #include "core/hw/aes/key.h"
+ 
+ namespace Service::BOSS {
+@@ -239,6 +240,22 @@ std::vector<u8> ReadWholeFile(FileSys::ArchiveBackend& archive, std::string_view
+ }
+ } // namespace
+ 
++std::optional<StorageInfo> OnlineService::GetTitleStorage(u64 title_program_id) {
++    const auto archive = OpenBossSystemSaveData();
++    if (!archive) {
++        return std::nullopt;
++    }
++    return BossA::FindStorage(ReadWholeFile(*archive, BossADbPath), title_program_id);
++}
++
++bool OnlineService::GetTitleOptout(u64 title_program_id) {
++    const auto archive = OpenBossSystemSaveData();
++    if (!archive) {
++        return false;
++    }
++    return BossA::FindOptout(ReadWholeFile(*archive, BossADbPath), title_program_id);
++}
++
+ void OnlineService::LoadStorageInfo(FileSys::ArchiveBackend& archive) {
+     const std::vector<u8> db = ReadWholeFile(archive, BossADbPath);
+     storage = BossA::FindStorage(db, session_program_id);
+@@ -768,6 +785,14 @@ bool OnlineService::StartTask(const std::string& task_id,
+             LOG_WARNING(Service_BOSS, "SpotPass task '{}' has no URL; not run", task_id);
+             return true;
+         }
++        if (HTTP::IsSpotPassUploadUrl(url)) {
++            // Uploads (e.g. Miiverse, npul /p01/recv/) aren't supported; downloading the
++            // address would only fetch an error page. Report it as failed so the title moves on.
++            LOG_INFO(Service_BOSS, "SpotPass task '{}' is an upload ({}); not run", task_id, url);
++            properties[TaskStateProperty] = static_cast<u8>(TaskState::Failed);
++            properties[TaskHttpStatusProperty] = u32{0};
++            return true;
++        }
+         last_modified = PropertyString(properties[TaskLastModifiedProperty]);
+         properties[TaskStateProperty] = static_cast<u8>(TaskState::Running);
+         running_tasks.insert(task_id);
+@@ -877,8 +902,8 @@ void OnlineService::RunTasksAtStart(const std::shared_ptr<SpotPassState>& state,
+     {
+         std::scoped_lock lock(mutex);
+         for (auto& [id, task] : task_id_list) {
+-            if ((!task_id || *task_id == id) &&
+-                !PropertyString(task.properties[PropertyID::Url]).empty()) {
++            const std::string url = PropertyString(task.properties[PropertyID::Url]);
++            if ((!task_id || *task_id == id) && !url.empty() && !HTTP::IsSpotPassUploadUrl(url)) {
+                 task_ids.push_back(id);
+             }
+         }
+diff --git a/src/core/hle/service/boss/online_service.h b/src/core/hle/service/boss/online_service.h
+index dd107cb..6e470df 100644
+--- a/src/core/hle/service/boss/online_service.h
++++ b/src/core/hle/service/boss/online_service.h
+@@ -242,6 +242,10 @@ public:
+     Result UnregisterStorage();
+     /// The registered storage size, or 0 if the title has none (GetStorageInfo).
+     u32 GetStorageSize() const;
++    /// The SpotPass storage another title registered (boss:P GetStorageInfoPrivileged).
++    static std::optional<StorageInfo> GetTitleStorage(u64 title_program_id);
++    /// Another title's SpotPass opt-out flag (boss:P GetOptoutFlagPrivileged).
++    static bool GetTitleOptout(u64 title_program_id);
+     /// Deletes the downloaded SpotPass file with this NsData ID from the storage.
+     Result DeleteNsData(u32 ns_data_id);
+ 
+@@ -278,7 +282,7 @@ private:
+     void FinishTask(const std::string& task_id, TaskState state, u32 http_status,
+                     const std::string& last_modified);
+ 
+-    std::unique_ptr<FileSys::ArchiveBackend> OpenBossSystemSaveData();
++    static std::unique_ptr<FileSys::ArchiveBackend> OpenBossSystemSaveData();
+     void LoadStorageInfo(FileSys::ArchiveBackend& archive);
+     bool SaveStorageInfo();
+ 
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 6269d15..ee4ae40 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -254,7 +254,7 @@ void Context::MakeRequest() {
+         if (auto redirected =
+                 RedirectSpotPassUrl(url, Settings::values.spotpass_server_url.GetValue())) {
+             LOG_INFO(Service_HTTP, "SpotPass request redirected: {} -> {}", url, *redirected);
+-            spotpass_host = GetUrlHost(url);
++            spotpass_host = GetSpotPassHost(url);
+             request_url = std::move(*redirected);
+         } else if (IsSpotPassUrl(url)) {
+             LOG_WARNING(Service_HTTP,
+diff --git a/src/core/hle/service/http/spotpass_redirect.cpp b/src/core/hle/service/http/spotpass_redirect.cpp
+index 2d156c1..00baf18 100644
+--- a/src/core/hle/service/http/spotpass_redirect.cpp
++++ b/src/core/hle/service/http/spotpass_redirect.cpp
+@@ -11,8 +11,9 @@ namespace Service::HTTP {
+ 
+ namespace {
+ 
+-constexpr std::array<std::string_view, 3> SpotPassHosts{
++constexpr std::array<std::string_view, 4> SpotPassHosts{
+     "npdl.cdn.nintendowifi.net",   // SpotPass content (/p01/nsa/<boss code>/<task>/<file>)
++    "npdl.c.app.nintendowifi.net", // SpotPass content origin, used behind Akamai (see below)
+     "nppl.c.app.nintendowifi.net", // Policy list (/p01/policylist/...)
+     "npul.c.app.nintendowifi.net", // SpotPass uploads (/p01/recv/...)
+ };
+@@ -22,6 +23,11 @@ constexpr std::array<std::string_view, 3> SpotPassHosts{
+ constexpr std::string_view NetPassHost = "api.netpass.cafe";
+ constexpr std::string_view NetPassSpotPassPrefix = "/npdl";
+ 
++// Some titles (e.g. the eShop's BGM tasks) use Akamai URLs that wrap the Nintendo address:
++// https://a248.e.akamai.net/f/248/103046/10m/npdl.c.app.nintendowifi.net/p01/nsa/...
++// The path is /f/<number>/<number>/<cache time>/<origin host>/<origin path>.
++constexpr std::string_view AkamaiHost = "a248.e.akamai.net";
++
+ std::string ToLower(std::string_view text) {
+     std::string result(text);
+     std::transform(result.begin(), result.end(), result.begin(),
+@@ -52,8 +58,45 @@ std::pair<std::string_view, std::string_view> SplitAuthority(std::string_view ur
+     return {url.substr(0, rest_start), url.substr(rest_start)};
+ }
+ 
++/// For an Akamai-wrapped URL, returns the wrapped host and its path ("/p01/..."), else nullopt.
++std::optional<std::pair<std::string, std::string_view>> UnwrapAkamai(std::string_view url) {
++    const auto [authority, rest_with_query] = SplitAuthority(url);
++    std::string_view host = authority;
++    if (const auto colon = host.find(':'); colon != std::string_view::npos) {
++        host = host.substr(0, colon);
++    }
++    if (ToLower(host) != AkamaiHost) {
++        return std::nullopt;
++    }
++    std::string_view rest = rest_with_query;
++    // Skip "/f", two numbers and the cache time: four path segments.
++    for (int i = 0; i < 4; i++) {
++        if (rest.empty() || rest.front() != '/') {
++            return std::nullopt;
++        }
++        const auto next = rest.find('/', 1);
++        if (next == std::string_view::npos || next == 1) {
++            return std::nullopt;
++        }
++        rest.remove_prefix(next);
++    }
++    // Now "/<origin host>/<origin path>".
++    const auto path_start = rest.find('/', 1);
++    if (path_start == std::string_view::npos || path_start == 1) {
++        return std::nullopt;
++    }
++    return std::make_pair(ToLower(rest.substr(1, path_start - 1)), rest.substr(path_start));
++}
++
+ } // namespace
+ 
++std::string GetSpotPassHost(std::string_view url) {
++    if (const auto wrapped = UnwrapAkamai(url)) {
++        return wrapped->first;
++    }
++    return GetUrlHost(url);
++}
++
+ std::string GetUrlHost(std::string_view url) {
+     std::string_view authority = SplitAuthority(url).first;
+     const auto at = authority.rfind('@');
+@@ -73,6 +116,9 @@ bool IsSpotPassHost(std::string_view host) {
+ }
+ 
+ bool IsSpotPassUrl(std::string_view url) {
++    if (const auto wrapped = UnwrapAkamai(url)) {
++        return IsSpotPassHost(wrapped->first);
++    }
+     const std::string host = GetUrlHost(url);
+     if (host == NetPassHost) {
+         const std::string_view rest = SplitAuthority(url).second;
+@@ -83,6 +129,25 @@ bool IsSpotPassUrl(std::string_view url) {
+     return IsSpotPassHost(host);
+ }
+ 
++bool IsSpotPassUploadUrl(std::string_view url) {
++    if (!IsSpotPassUrl(url)) {
++        return false;
++    }
++    if (GetSpotPassHost(url) == "npul.c.app.nintendowifi.net") {
++        return true;
++    }
++    std::string_view path;
++    if (const auto wrapped = UnwrapAkamai(url)) {
++        path = wrapped->second;
++    } else {
++        path = SplitAuthority(url).second;
++        if (GetUrlHost(url) == NetPassHost) {
++            path.remove_prefix(NetPassSpotPassPrefix.size());
++        }
++    }
++    return path.starts_with("/p01/recv/");
++}
++
+ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server) {
+     server = Trim(server);
+     if (server.empty() || !IsSpotPassUrl(url)) {
+@@ -102,7 +167,8 @@ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string
+         base.pop_back();
+     }
+ 
+-    std::string rest(SplitAuthority(url).second);
++    const auto wrapped = UnwrapAkamai(url);
++    std::string rest(wrapped ? wrapped->second : SplitAuthority(url).second);
+     if (rest.empty() || rest.front() != '/') {
+         rest.insert(rest.begin(), '/');
+     }
+diff --git a/src/core/hle/service/http/spotpass_redirect.h b/src/core/hle/service/http/spotpass_redirect.h
+index 031f33a..d922e83 100644
+--- a/src/core/hle/service/http/spotpass_redirect.h
++++ b/src/core/hle/service/http/spotpass_redirect.h
+@@ -14,10 +14,18 @@ namespace Service::HTTP {
+ /// content downloads, the policy list and SpotPass uploads.
+ bool IsSpotPassHost(std::string_view host);
+ 
++/// The SpotPass host a URL is for: the Nintendo host inside an Akamai-wrapped URL, otherwise the
++/// URL's own host (lower case, without port).
++std::string GetSpotPassHost(std::string_view url);
++
+ /// Returns true if `url` is a SpotPass request: one of Nintendo's SpotPass hosts, or a /npdl/ path
+ /// on NetPass's SpotPass mirror (api.netpass.cafe), which NetPass puts in place of Nintendo's URLs.
+ bool IsSpotPassUrl(std::string_view url);
+ 
++/// Returns true if `url` is a SpotPass upload (npul host or a /p01/recv/ path). Upload tasks send
++/// data to the server instead of downloading.
++bool IsSpotPassUploadUrl(std::string_view url);
++
+ /**
+  * Rewrites a SpotPass URL so it points at a custom server.
+  * `server` is "[scheme://]host[:port][/base/path]"; without a scheme, https is assumed.
+@@ -25,6 +33,8 @@ bool IsSpotPassUrl(std::string_view url);
+  * "https://npdl.cdn.nintendowifi.net/p01/nsa/abc/task/file" with server "http://my.host:8080/sp"
+  * becomes "http://my.host:8080/sp/p01/nsa/abc/task/file". For NetPass's mirror the "/npdl" prefix
+  * is dropped, so "https://api.netpass.cafe/npdl/p01/nsa/abc/task/file" maps to the same address.
++ * Akamai-wrapped URLs ("https://a248.e.akamai.net/f/248/103046/10m/npdl.c.app.nintendowifi.net/p01/
++ * nsa/...") map to "<server>/p01/nsa/...".
+  * Returns nullopt if `url` isn't a SpotPass URL (see IsSpotPassUrl) or `server` is empty.
+  */
+ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server);
+diff --git a/src/tests/core/hle/service/boss_storage.cpp b/src/tests/core/hle/service/boss_storage.cpp
+index 4cf8b2b..4f7fc3a 100644
+--- a/src/tests/core/hle/service/boss_storage.cpp
++++ b/src/tests/core/hle/service/boss_storage.cpp
+@@ -85,3 +85,17 @@ TEST_CASE("BOSS_A.db: invalid entries and malformed files", "[service][boss]") {
+     CHECK(bad.size() == BossA::HeaderSize + BossA::EntrySize);
+     CHECK(BossA::FindStorage(bad, Dmw1)->size == 0x1000);
+ }
++
++TEST_CASE("BOSS_A.db: opt-out flag", "[service][boss]") {
++    std::vector<u8> db;
++    CHECK_FALSE(BossA::FindOptout(db, Dmw1));
++    REQUIRE(BossA::SetStorage(db, Dmw1, StorageInfo{.extdata_id = 0xEA9, .size = 0x1000}));
++    CHECK_FALSE(BossA::FindOptout(db, Dmw1));
++
++    db[BossA::HeaderSize + 0x19] = 1; // title info +0x9: opt-out
++    CHECK(BossA::FindOptout(db, Dmw1));
++    CHECK_FALSE(BossA::FindOptout(db, Other));
++
++    db[BossA::HeaderSize + 0x8] = 0; // entry no longer valid
++    CHECK_FALSE(BossA::FindOptout(db, Dmw1));
++}
+diff --git a/src/tests/core/hle/service/spotpass_redirect.cpp b/src/tests/core/hle/service/spotpass_redirect.cpp
+index 2995936..07d59af 100644
+--- a/src/tests/core/hle/service/spotpass_redirect.cpp
++++ b/src/tests/core/hle/service/spotpass_redirect.cpp
+@@ -5,8 +5,10 @@
+ #include <catch2/catch_test_macros.hpp>
+ #include "core/hle/service/http/spotpass_redirect.h"
+ 
++using Service::HTTP::GetSpotPassHost;
+ using Service::HTTP::GetUrlHost;
+ using Service::HTTP::IsSpotPassHost;
++using Service::HTTP::IsSpotPassUploadUrl;
+ using Service::HTTP::IsSpotPassUrl;
+ using Service::HTTP::RedirectSpotPassUrl;
+ 
+@@ -64,3 +66,33 @@ TEST_CASE("NetPass SpotPass mirror URLs are redirected too", "[service][http][sp
+     CHECK(IsSpotPassUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c"));
+     CHECK_FALSE(IsSpotPassUrl("https://nasc.nintendowifi.net/ac"));
+ }
++
++TEST_CASE("Akamai-wrapped SpotPass URLs are redirected", "[service][http][spotpass]") {
++    constexpr std::string_view bgm = "https://a248.e.akamai.net/f/248/103046/10m/"
++                                     "npdl.c.app.nintendowifi.net/p01/nsa/AH3oZwrEbne6qHCO/BGM1/"
++                                     "EU_BGM1";
++    CHECK(IsSpotPassUrl(bgm));
++    CHECK(GetSpotPassHost(bgm) == "npdl.c.app.nintendowifi.net");
++    CHECK(RedirectSpotPassUrl(bgm, "http://192.168.1.10:8080") ==
++          "http://192.168.1.10:8080/p01/nsa/AH3oZwrEbne6qHCO/BGM1/EU_BGM1");
++    CHECK(RedirectSpotPassUrl("HTTPS://A248.E.AKAMAI.NET/f/1/2/3/NPDL.CDN.nintendowifi.net/p01/"
++                              "nsa/x/t/f?a=1",
++                              "my.host") == "https://my.host/p01/nsa/x/t/f?a=1");
++
++    // Other Akamai content, and malformed paths, are not SpotPass.
++    CHECK_FALSE(IsSpotPassUrl("https://a248.e.akamai.net/f/248/103046/10m/example.com/p01/x"));
++    CHECK_FALSE(IsSpotPassUrl("https://a248.e.akamai.net/f/248/103046/10m"));
++    CHECK_FALSE(
++        IsSpotPassUrl("https://a248.e.akamai.net/f//103046/10m/npdl.c.app.nintendowifi.net/p"));
++    CHECK(GetSpotPassHost("https://npdl.cdn.nintendowifi.net/p01/nsa/a/b/c") ==
++          "npdl.cdn.nintendowifi.net");
++}
++
++TEST_CASE("SpotPass upload URLs are recognised", "[service][http][spotpass]") {
++    CHECK(IsSpotPassUploadUrl("https://npul.c.app.nintendowifi.net/p01/recv/abc/task"));
++    CHECK(IsSpotPassUploadUrl("https://api.netpass.cafe/npdl/p01/recv/abc/task"));
++    CHECK(IsSpotPassUploadUrl(
++        "https://a248.e.akamai.net/f/1/2/3/npdl.c.app.nintendowifi.net/p01/recv/abc/task"));
++    CHECK_FALSE(IsSpotPassUploadUrl("https://npdl.cdn.nintendowifi.net/p01/nsa/abc/task/file"));
++    CHECK_FALSE(IsSpotPassUploadUrl("https://example.com/p01/recv/abc"));
++}
+-- 
+2.43.0
+
