@@ -1,0 +1,114 @@
+From d0ce2dd983947f1ae08fea1f7392314ed6dbee65 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 1 Oct 2026 22:26:58 +0200
+Subject: [PATCH] cfg: shared system titles see the console's region
+
+The Error/EULA display (000400300000C502) is one title for Japan, USA,
+Europe and Australia. The region lookup from patch 0010 took the first
+region it is listed for, so on a European console the error display was
+told it runs in Japan and showed its text in Japanese.
+
+A title shared by several regions now sees the console's region when that
+is one of them, and the first region otherwise. The European software
+keyboard still sees Europe when a USA game runs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cfg/cfg.cpp |  5 +++--
+ src/core/system_titles.cpp       |  9 ++++++++-
+ src/core/system_titles.h         | 10 ++++++++--
+ src/tests/core/system_titles.cpp | 10 ++++++++++
+ 4 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/hle/service/cfg/cfg.cpp b/src/core/hle/service/cfg/cfg.cpp
+index 88da5df..9c6c14f 100644
+--- a/src/core/hle/service/cfg/cfg.cpp
++++ b/src/core/hle/service/cfg/cfg.cpp
+@@ -425,13 +425,14 @@ u32 Module::GetRegionValueFor(u64 caller_title_id, bool from_secure_info) {
+     // region, so it always sees that region. The game keeps its region override. Without this, a
+     // EUR applet started for a USA game (region-free, EUR system files) was told the console is
+     // USA, which never happens on hardware; the EUR software keyboard then crashed.
+-    if (const auto own_region = Core::GetSystemTitleRegion(caller_title_id)) {
++    const u32 console_region = GetRegionValue(from_secure_info);
++    if (const auto own_region = Core::GetSystemTitleRegion(caller_title_id, console_region)) {
+         const u32 region = *own_region;
+         LOG_DEBUG(Service_CFG, "System title {:016X} sees its own region {}", caller_title_id,
+                   region);
+         return region;
+     }
+-    return GetRegionValue(from_secure_info);
++    return console_region;
+ }
+ 
+ bool Module::UseGameRegion() {
+diff --git a/src/core/system_titles.cpp b/src/core/system_titles.cpp
+index 37f4c57..b75fc3e 100644
+--- a/src/core/system_titles.cpp
++++ b/src/core/system_titles.cpp
+@@ -1189,7 +1189,7 @@ std::string GetHomeMenuNcchPath(u32 region) {
+                                             GetHomeMenuTitleId(region));
+ }
+ 
+-std::optional<u32> GetSystemTitleRegion(u64 title_id) {
++std::optional<u32> GetSystemTitleRegion(u64 title_id, std::optional<u32> console_region) {
+     const auto title_id_high = static_cast<u32>(title_id >> 32);
+     const auto category = std::find_if(system_titles.begin(), system_titles.end(),
+                                        [title_id_high](const SystemTitleCategory& category) {
+@@ -1213,6 +1213,13 @@ std::optional<u32> GetSystemTitleRegion(u64 title_id) {
+         if (same_in_all_regions) {
+             return std::nullopt;
+         }
++        // A title shared by several regions (the Error/EULA display: one title for Japan, USA,
++        // Europe and Australia) runs on consoles of all of them. Taking the first one told the
++        // error display on a European console that it was Japanese, so it showed Japanese text.
++        if (console_region && *console_region < lows.size() &&
++            lows[*console_region] == title_id_low) {
++            return *console_region;
++        }
+         return static_cast<u32>(std::distance(lows.begin(), match));
+     }
+ 
+diff --git a/src/core/system_titles.h b/src/core/system_titles.h
+index 819372f..adead86 100644
+--- a/src/core/system_titles.h
++++ b/src/core/system_titles.h
+@@ -24,8 +24,14 @@ u64 GetHomeMenuTitleId(u32 region);
+ /// Gets the home menu NCCH path for a specific region.
+ std::string GetHomeMenuNcchPath(u32 region);
+ 
+-/// Returns the region of a system title, if it can be determined.
+-std::optional<u32> GetSystemTitleRegion(u64 title_id);
++/**
++ * Returns the region of a system title, if it can be determined.
++ * Some titles are shared by several regions (the Error/EULA display is one title for Japan, USA,
++ * Europe and Australia). For those, `console_region` is returned when it is one of them;
++ * otherwise the first region the title belongs to.
++ */
++std::optional<u32> GetSystemTitleRegion(u64 title_id,
++                                        std::optional<u32> console_region = std::nullopt);
+ 
+ /// Determines if all system titles are installed for o3ds and n3ds.
+ std::pair<bool, bool> AreSystemTitlesInstalled();
+diff --git a/src/tests/core/system_titles.cpp b/src/tests/core/system_titles.cpp
+index 07630cf..3b54d59 100644
+--- a/src/tests/core/system_titles.cpp
++++ b/src/tests/core/system_titles.cpp
+@@ -24,4 +24,14 @@ TEST_CASE("GetSystemTitleRegion maps applet titles to their region", "[core]") {
+     // Games and unknown titles have no system region.
+     CHECK_FALSE(Core::GetSystemTitleRegion(0x00040000000EA900).has_value());
+     CHECK_FALSE(Core::GetSystemTitleRegion(0x0004003000FFFF02).has_value());
++
++    // Titles shared by several regions see the console's region when it is one of them.
++    // Error/EULA display: C502 for Japan, USA, Europe and Australia, CF02 for the others.
++    CHECK(Core::GetSystemTitleRegion(0x000400300000C502, 2u) == 2u); // European console
++    CHECK(Core::GetSystemTitleRegion(0x000400300000C502, 1u) == 1u); // USA console
++    CHECK(Core::GetSystemTitleRegion(0x000400300000C502, 5u) == 0u); // not one of its regions
++    CHECK(Core::GetSystemTitleRegion(0x000400300000C502) == 0u);     // console region unknown
++    // A USA game on a European console must keep the EUR keyboard in its own region.
++    CHECK(Core::GetSystemTitleRegion(0x000400300000D002, 1u) == 2u);
++    CHECK(Core::GetSystemTitleRegion(0x000400300000D002, 3u) == 3u); // Australia shares it
+ }
+-- 
+2.43.0
+
