@@ -1,0 +1,738 @@
+From 13aa61fc7c73762d4216af8f1249e45b7ba62865 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 1 Oct 2026 21:10:51 +0200
+Subject: [PATCH] http/qt: One "Nintendo services" server for everything
+ Nintendo
+
+Replaces the separate SpotPass server and Nintendo services settings
+(and the per-service switches) with one choice on Configure > General >
+Network > Nintendo services: "Nintendo's servers" or "Custom server".
+
+With a custom server, every http:C request (and every built-in SpotPass
+download) meant for Nintendo goes to that address, keeping path and
+query: any host under nintendo.net, nintendowifi.net or nintendo.com,
+SpotPass addresses wrapped by Akamai and SpotPass on NetPass's mirror.
+X-Tangelo-Original-Host names the Nintendo host, so one server or proxy
+(nginx in Tangelo's server package) routes everything. Without a scheme
+the address is http. The HLE game server login (frd) uses the same
+server. The Nintendo Zone checkbox moves into this group.
+
+Settings: use_custom_nintendo_server and nintendo_server_url replace
+use_custom_spotpass_server, spotpass_server_url,
+use_nintendo_services_server, nintendo_services_server_url and the
+nintendo_services_conntest/nasc/nus switches (also on Android).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ CMakeModules/GenerateSettingKeys.cmake        |   9 +-
+ src/android/app/src/main/jni/config.cpp       |   9 +-
+ src/android/app/src/main/jni/default_ini.h    |  23 +---
+ src/citra_qt/configuration/config.cpp         |  18 +--
+ .../configuration/configure_network.cpp       |  55 +++------
+ .../configuration/configure_network.h         |   3 +-
+ .../configuration/configure_network.ui        | 115 +++---------------
+ src/common/settings.h                         |  19 +--
+ src/core/hle/service/boss/boss_download.cpp   |   8 +-
+ src/core/hle/service/boss/online_service.cpp  |   2 +-
+ src/core/hle/service/frd/frd.cpp              |  15 ++-
+ src/core/hle/service/http/http_c.cpp          |  40 ++----
+ .../hle/service/http/spotpass_redirect.cpp    |  34 ++++++
+ src/core/hle/service/http/spotpass_redirect.h |  17 +++
+ src/tests/core/hle/service/boss_download.cpp  |  12 +-
+ .../core/hle/service/spotpass_redirect.cpp    |  41 +++++++
+ 16 files changed, 168 insertions(+), 252 deletions(-)
+
+diff --git a/CMakeModules/GenerateSettingKeys.cmake b/CMakeModules/GenerateSettingKeys.cmake
+index fadb5d6..849c199 100644
+--- a/CMakeModules/GenerateSettingKeys.cmake
++++ b/CMakeModules/GenerateSettingKeys.cmake
+@@ -148,13 +148,8 @@ foreach(KEY IN ITEMS
+     "language" # FIXME: DUPLICATE KEY (libretro equivalent: language_value)
+     "web_api_url"
+     "network_token"
+-    "use_custom_spotpass_server"
+-    "spotpass_server_url"
+-    "use_nintendo_services_server"
+-    "nintendo_services_server_url"
+-    "nintendo_services_conntest"
+-    "nintendo_services_nasc"
+-    "nintendo_services_nus"
++    "use_custom_nintendo_server"
++    "nintendo_server_url"
+     "ac_connecting_location"
+     "nintendo_zone_mode"
+     "check_for_update_on_start"
+diff --git a/src/android/app/src/main/jni/config.cpp b/src/android/app/src/main/jni/config.cpp
+index c73539f..8d2949d 100644
+--- a/src/android/app/src/main/jni/config.cpp
++++ b/src/android/app/src/main/jni/config.cpp
+@@ -331,13 +331,8 @@ void Config::ReadValues() {
+     // Web Service
+     ReadSetting("WebService", Settings::values.web_api_url);
+     ReadSetting("WebService", Settings::values.network_token);
+-    ReadSetting("WebService", Settings::values.use_custom_spotpass_server);
+-    ReadSetting("WebService", Settings::values.spotpass_server_url);
+-    ReadSetting("WebService", Settings::values.use_nintendo_services_server);
+-    ReadSetting("WebService", Settings::values.nintendo_services_server_url);
+-    ReadSetting("WebService", Settings::values.nintendo_services_conntest);
+-    ReadSetting("WebService", Settings::values.nintendo_services_nasc);
+-    ReadSetting("WebService", Settings::values.nintendo_services_nus);
++    ReadSetting("WebService", Settings::values.use_custom_nintendo_server);
++    ReadSetting("WebService", Settings::values.nintendo_server_url);
+     ReadSetting("WebService", Settings::values.ac_connecting_location);
+     ReadSetting("WebService", Settings::values.nintendo_zone_mode);
+ }
+diff --git a/src/android/app/src/main/jni/default_ini.h b/src/android/app/src/main/jni/default_ini.h
+index cdb0112..404006f 100644
+--- a/src/android/app/src/main/jni/default_ini.h
++++ b/src/android/app/src/main/jni/default_ini.h
+@@ -591,23 +591,12 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
+ )") DECLARE_KEY(web_api_url) BOOST_HANA_STRING(R"(
+ # Token for Web Service
+ )") DECLARE_KEY(network_token) BOOST_HANA_STRING(R"(
+-# Send SpotPass traffic meant for Nintendo's servers to your own server
+-# 0: Nintendo SpotPass (default), 1: Custom server
+-)") DECLARE_KEY(use_custom_spotpass_server) BOOST_HANA_STRING(R"(
+-# Custom SpotPass server address, e.g. https://spotpass.example.local:8443
+-)") DECLARE_KEY(spotpass_server_url) BOOST_HANA_STRING(R"(
+-# Send requests for Nintendo's other 3DS services to a stand-in server
+-# 0: Nintendo (default), 1: Custom server
+-)") DECLARE_KEY(use_nintendo_services_server) BOOST_HANA_STRING(R"(
+-# Stand-in server address, e.g. http://localhost:8080
+-)") DECLARE_KEY(nintendo_services_server_url) BOOST_HANA_STRING(R"(
+-# Which services go to the stand-in server (0: Nintendo, 1: stand-in server, default)
+-# Connection test
+-)") DECLARE_KEY(nintendo_services_conntest) BOOST_HANA_STRING(R"(
+-# Game server login (NASC)
+-)") DECLARE_KEY(nintendo_services_nasc) BOOST_HANA_STRING(R"(
+-# System update check (NUS)
+-)") DECLARE_KEY(nintendo_services_nus) BOOST_HANA_STRING("\n")
++# Send all requests meant for Nintendo's servers (SpotPass, game server login, system update,
++# accounts, eShop) to one server of your own, which routes them by the X-Tangelo-Original-Host header
++# 0: Nintendo's servers (default), 1: Custom server
++)") DECLARE_KEY(use_custom_nintendo_server) BOOST_HANA_STRING(R"(
++# Custom server address, e.g. http://localhost:8080 (http when no scheme is given)
++)") DECLARE_KEY(nintendo_server_url) BOOST_HANA_STRING("\n")
+ 
+ ).c_str();
+ 
+diff --git a/src/citra_qt/configuration/config.cpp b/src/citra_qt/configuration/config.cpp
+index 8e416bb..5095ff2 100644
+--- a/src/citra_qt/configuration/config.cpp
++++ b/src/citra_qt/configuration/config.cpp
+@@ -920,13 +920,8 @@ void QtConfig::ReadWebServiceValues() {
+ 
+     ReadBasicSetting(Settings::values.web_api_url);
+     ReadBasicSetting(Settings::values.network_token);
+-    ReadBasicSetting(Settings::values.use_custom_spotpass_server);
+-    ReadBasicSetting(Settings::values.spotpass_server_url);
+-    ReadBasicSetting(Settings::values.use_nintendo_services_server);
+-    ReadBasicSetting(Settings::values.nintendo_services_server_url);
+-    ReadBasicSetting(Settings::values.nintendo_services_conntest);
+-    ReadBasicSetting(Settings::values.nintendo_services_nasc);
+-    ReadBasicSetting(Settings::values.nintendo_services_nus);
++    ReadBasicSetting(Settings::values.use_custom_nintendo_server);
++    ReadBasicSetting(Settings::values.nintendo_server_url);
+     ReadBasicSetting(Settings::values.ac_connecting_location);
+     ReadBasicSetting(Settings::values.nintendo_zone_mode);
+ 
+@@ -1462,13 +1457,8 @@ void QtConfig::SaveWebServiceValues() {
+ 
+     WriteBasicSetting(Settings::values.web_api_url);
+     WriteBasicSetting(Settings::values.network_token);
+-    WriteBasicSetting(Settings::values.use_custom_spotpass_server);
+-    WriteBasicSetting(Settings::values.spotpass_server_url);
+-    WriteBasicSetting(Settings::values.use_nintendo_services_server);
+-    WriteBasicSetting(Settings::values.nintendo_services_server_url);
+-    WriteBasicSetting(Settings::values.nintendo_services_conntest);
+-    WriteBasicSetting(Settings::values.nintendo_services_nasc);
+-    WriteBasicSetting(Settings::values.nintendo_services_nus);
++    WriteBasicSetting(Settings::values.use_custom_nintendo_server);
++    WriteBasicSetting(Settings::values.nintendo_server_url);
+     WriteBasicSetting(Settings::values.ac_connecting_location);
+     WriteBasicSetting(Settings::values.nintendo_zone_mode);
+ 
+diff --git a/src/citra_qt/configuration/configure_network.cpp b/src/citra_qt/configuration/configure_network.cpp
+index 5fa4ff7..1c88972 100644
+--- a/src/citra_qt/configuration/configure_network.cpp
++++ b/src/citra_qt/configuration/configure_network.cpp
+@@ -20,10 +20,8 @@ ConfigureWeb::ConfigureWeb(QWidget* parent)
+     ui->web_api_url_lineedit->setEnabled(false);
+     ui->token_lineedit->setEnabled(false);
+ #endif
+-    connect(ui->spotpass_custom_radio, &QRadioButton::toggled, this,
+-            [this](bool checked) { UpdateSpotPassFields(checked); });
+-    connect(ui->services_custom_radio, &QRadioButton::toggled, this,
+-            [this](bool checked) { UpdateServicesFields(checked); });
++    connect(ui->nintendo_custom_radio, &QRadioButton::toggled, this,
++            [this](bool checked) { UpdateNintendoFields(checked); });
+     SetConfiguration();
+ }
+ 
+@@ -35,25 +33,14 @@ void ConfigureWeb::SetConfiguration() {
+         QString::fromStdString(Settings::values.web_api_url.GetValue()));
+     ui->token_lineedit->setText(QString::fromStdString(Settings::values.network_token.GetValue()));
+ 
+-    const bool custom_spotpass = Settings::values.use_custom_spotpass_server.GetValue();
+-    ui->spotpass_nintendo_radio->setChecked(!custom_spotpass);
+-    ui->spotpass_custom_radio->setChecked(custom_spotpass);
+-    ui->spotpass_url_lineedit->setText(
+-        QString::fromStdString(Settings::values.spotpass_server_url.GetValue()));
+-    UpdateSpotPassFields(custom_spotpass);
++    const bool custom_server = Settings::values.use_custom_nintendo_server.GetValue();
++    ui->nintendo_servers_radio->setChecked(!custom_server);
++    ui->nintendo_custom_radio->setChecked(custom_server);
++    ui->nintendo_url_lineedit->setText(
++        QString::fromStdString(Settings::values.nintendo_server_url.GetValue()));
++    UpdateNintendoFields(custom_server);
+     ui->nintendo_zone_checkbox->setChecked(Settings::values.nintendo_zone_mode.GetValue());
+ 
+-    const bool custom_services = Settings::values.use_nintendo_services_server.GetValue();
+-    ui->services_nintendo_radio->setChecked(!custom_services);
+-    ui->services_custom_radio->setChecked(custom_services);
+-    ui->services_url_lineedit->setText(
+-        QString::fromStdString(Settings::values.nintendo_services_server_url.GetValue()));
+-    ui->services_conntest_checkbox->setChecked(
+-        Settings::values.nintendo_services_conntest.GetValue());
+-    ui->services_nasc_checkbox->setChecked(Settings::values.nintendo_services_nasc.GetValue());
+-    ui->services_nus_checkbox->setChecked(Settings::values.nintendo_services_nus.GetValue());
+-    UpdateServicesFields(custom_services);
+-
+ #ifdef USE_DISCORD_PRESENCE
+     ui->toggle_discordrpc->setChecked(UISettings::values.enable_discord_presence.GetValue());
+ #endif
+@@ -66,29 +53,15 @@ void ConfigureWeb::ApplyConfiguration() {
+ 
+     Settings::values.web_api_url = ui->web_api_url_lineedit->text().toStdString();
+     Settings::values.network_token = ui->token_lineedit->text().toStdString();
+-    Settings::values.use_custom_spotpass_server = ui->spotpass_custom_radio->isChecked();
+-    Settings::values.spotpass_server_url =
+-        ui->spotpass_url_lineedit->text().trimmed().toStdString();
++    Settings::values.use_custom_nintendo_server = ui->nintendo_custom_radio->isChecked();
++    Settings::values.nintendo_server_url =
++        ui->nintendo_url_lineedit->text().trimmed().toStdString();
+     Settings::values.nintendo_zone_mode = ui->nintendo_zone_checkbox->isChecked();
+-    Settings::values.use_nintendo_services_server = ui->services_custom_radio->isChecked();
+-    Settings::values.nintendo_services_server_url =
+-        ui->services_url_lineedit->text().trimmed().toStdString();
+-    Settings::values.nintendo_services_conntest = ui->services_conntest_checkbox->isChecked();
+-    Settings::values.nintendo_services_nasc = ui->services_nasc_checkbox->isChecked();
+-    Settings::values.nintendo_services_nus = ui->services_nus_checkbox->isChecked();
+-}
+-
+-void ConfigureWeb::UpdateSpotPassFields(bool custom) {
+-    ui->spotpass_url_label->setEnabled(custom);
+-    ui->spotpass_url_lineedit->setEnabled(custom);
+ }
+ 
+-void ConfigureWeb::UpdateServicesFields(bool custom) {
+-    ui->services_url_label->setEnabled(custom);
+-    ui->services_url_lineedit->setEnabled(custom);
+-    ui->services_conntest_checkbox->setEnabled(custom);
+-    ui->services_nasc_checkbox->setEnabled(custom);
+-    ui->services_nus_checkbox->setEnabled(custom);
++void ConfigureWeb::UpdateNintendoFields(bool custom) {
++    ui->nintendo_url_label->setEnabled(custom);
++    ui->nintendo_url_lineedit->setEnabled(custom);
+ }
+ 
+ void ConfigureWeb::RetranslateUI() {
+diff --git a/src/citra_qt/configuration/configure_network.h b/src/citra_qt/configuration/configure_network.h
+index b627c2c..2e27bcb 100644
+--- a/src/citra_qt/configuration/configure_network.h
++++ b/src/citra_qt/configuration/configure_network.h
+@@ -23,8 +23,7 @@ public:
+     void SetConfiguration();
+ 
+ private:
+-    void UpdateSpotPassFields(bool custom);
+-    void UpdateServicesFields(bool custom);
++    void UpdateNintendoFields(bool custom);
+ 
+     std::unique_ptr<Ui::ConfigureWeb> ui;
+ };
+diff --git a/src/citra_qt/configuration/configure_network.ui b/src/citra_qt/configuration/configure_network.ui
+index 678e49a..9a71dd4 100644
+--- a/src/citra_qt/configuration/configure_network.ui
++++ b/src/citra_qt/configuration/configure_network.ui
+@@ -57,73 +57,13 @@
+     </widget>
+    </item>
+    <item>
+-    <widget class="QGroupBox" name="spotpass_group">
+-     <property name="title">
+-      <string>SpotPass</string>
+-     </property>
+-     <layout class="QVBoxLayout" name="verticalLayout_23">
+-      <item>
+-       <widget class="QRadioButton" name="spotpass_nintendo_radio">
+-        <property name="text">
+-         <string>Nintendo SpotPass</string>
+-        </property>
+-        <property name="checked">
+-         <bool>true</bool>
+-        </property>
+-       </widget>
+-      </item>
+-      <item>
+-       <widget class="QRadioButton" name="spotpass_custom_radio">
+-        <property name="text">
+-         <string>Custom SpotPass server</string>
+-        </property>
+-       </widget>
+-      </item>
+-      <item>
+-       <widget class="QLabel" name="spotpass_url_label">
+-        <property name="text">
+-         <string>SpotPass server address:</string>
+-        </property>
+-       </widget>
+-      </item>
+-      <item>
+-       <widget class="QLineEdit" name="spotpass_url_lineedit">
+-        <property name="placeholderText">
+-         <string>https://spotpass.example.local:8443</string>
+-        </property>
+-       </widget>
+-      </item>
+-      <item>
+-       <widget class="QCheckBox" name="nintendo_zone_checkbox">
+-        <property name="text">
+-         <string>Connect as a Nintendo Zone hotspot</string>
+-        </property>
+-        <property name="toolTip">
+-         <string>Games see the virtual access point as a Nintendo Zone (network name NintendoSpotPass1), e.g. for gifts that were only handed out at Nintendo Zone hotspots.</string>
+-        </property>
+-       </widget>
+-      </item>
+-      <item>
+-       <widget class="QLabel" name="spotpass_hint_label">
+-        <property name="text">
+-         <string>With a custom server, SpotPass requests meant for Nintendo (content downloads, the policy list and uploads) go to this address instead, as do SpotPass downloads NetPass moved to its mirror. The original path is kept, e.g. /p01/nsa/…</string>
+-        </property>
+-        <property name="wordWrap">
+-         <bool>true</bool>
+-        </property>
+-       </widget>
+-      </item>
+-     </layout>
+-    </widget>
+-   </item>
+-   <item>
+-    <widget class="QGroupBox" name="services_group">
++    <widget class="QGroupBox" name="nintendo_group">
+      <property name="title">
+       <string>Nintendo services</string>
+      </property>
+-     <layout class="QVBoxLayout" name="verticalLayout_24">
++     <layout class="QVBoxLayout" name="verticalLayout_23">
+       <item>
+-       <widget class="QRadioButton" name="services_nintendo_radio">
++       <widget class="QRadioButton" name="nintendo_servers_radio">
+         <property name="text">
+          <string>Nintendo's servers</string>
+         </property>
+@@ -133,60 +73,43 @@
+        </widget>
+       </item>
+       <item>
+-       <widget class="QRadioButton" name="services_custom_radio">
++       <widget class="QRadioButton" name="nintendo_custom_radio">
+         <property name="text">
+          <string>Custom server</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+-       <widget class="QLabel" name="services_url_label">
++       <widget class="QLabel" name="nintendo_url_label">
+         <property name="text">
+          <string>Server address:</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+-       <widget class="QLineEdit" name="services_url_lineedit">
++       <widget class="QLineEdit" name="nintendo_url_lineedit">
+         <property name="placeholderText">
+          <string>http://localhost:8080</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+-       <widget class="QCheckBox" name="services_conntest_checkbox">
+-        <property name="text">
+-         <string>Connection test (conntest.nintendowifi.net)</string>
+-        </property>
+-       </widget>
+-      </item>
+-      <item>
+-       <widget class="QCheckBox" name="services_nasc_checkbox">
++       <widget class="QLabel" name="nintendo_hint_label">
+         <property name="text">
+-         <string>Game server login (nasc.nintendowifi.net)</string>
++         <string>With a custom server, every request meant for Nintendo (SpotPass, game server login, system update, accounts, eShop, …) goes to this address instead, also SpotPass that NetPass moved to its mirror. The path is kept and the X-Tangelo-Original-Host header names the Nintendo server, so one server or proxy (like nginx in Tangelo's server package) can route everything. Without a scheme, http is used.</string>
+         </property>
+-        <property name="toolTip">
+-         <string>Used by online games and the friends list to find their game server. The server in Tangelo's SpotPass server package answers "server no longer available" unless it has a game server for that game.</string>
++        <property name="wordWrap">
++         <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+-       <widget class="QCheckBox" name="services_nus_checkbox">
++       <widget class="QCheckBox" name="nintendo_zone_checkbox">
+         <property name="text">
+-         <string>System update check (nus.c.shop.nintendowifi.net)</string>
++         <string>Connect as a Nintendo Zone hotspot</string>
+         </property>
+         <property name="toolTip">
+-         <string>The server in Tangelo's SpotPass server package always answers "no update available".</string>
+-        </property>
+-       </widget>
+-      </item>
+-      <item>
+-       <widget class="QLabel" name="services_hint_label">
+-        <property name="text">
+-         <string>With a custom server, the checked services go to this address instead of Nintendo, for the system's own modules (also with online LLE modules) and for games. The original path is kept, e.g. /ac for the game server login. The same address as the SpotPass server works with Tangelo's SpotPass server package.</string>
+-        </property>
+-        <property name="wordWrap">
+-         <bool>true</bool>
++         <string>Games see the virtual access point as a Nintendo Zone (network name NintendoSpotPass1), e.g. for gifts that were only handed out at Nintendo Zone hotspots.</string>
+         </property>
+        </widget>
+       </item>
+@@ -212,16 +135,10 @@
+   <tabstop>toggle_discordrpc</tabstop>
+   <tabstop>web_api_url_lineedit</tabstop>
+   <tabstop>token_lineedit</tabstop>
+-  <tabstop>spotpass_nintendo_radio</tabstop>
+-  <tabstop>spotpass_custom_radio</tabstop>
+-  <tabstop>spotpass_url_lineedit</tabstop>
++  <tabstop>nintendo_servers_radio</tabstop>
++  <tabstop>nintendo_custom_radio</tabstop>
++  <tabstop>nintendo_url_lineedit</tabstop>
+   <tabstop>nintendo_zone_checkbox</tabstop>
+-  <tabstop>services_nintendo_radio</tabstop>
+-  <tabstop>services_custom_radio</tabstop>
+-  <tabstop>services_url_lineedit</tabstop>
+-  <tabstop>services_conntest_checkbox</tabstop>
+-  <tabstop>services_nasc_checkbox</tabstop>
+-  <tabstop>services_nus_checkbox</tabstop>
+  </tabstops>
+  <resources/>
+  <connections/>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 0db57c4..4c23dc4 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -660,20 +660,11 @@ struct Values {
+     // WebService
+     Setting<std::string> web_api_url{"http://88.198.47.46:5000", Keys::web_api_url};
+     Setting<std::string> network_token{"", Keys::network_token};
+-    /// Send SpotPass (BOSS) traffic for Nintendo's servers to spotpass_server_url instead.
+-    Setting<bool> use_custom_spotpass_server{false, Keys::use_custom_spotpass_server};
+-    Setting<std::string> spotpass_server_url{"", Keys::spotpass_server_url};
+-    /// Send requests for Nintendo's other 3DS services to nintendo_services_server_url instead
+-    /// (a stand-in server, e.g. the one in Tangelo's SpotPass server package). Each service
+-    /// can be switched off to keep it going to Nintendo.
+-    Setting<bool> use_nintendo_services_server{false, Keys::use_nintendo_services_server};
+-    Setting<std::string> nintendo_services_server_url{"", Keys::nintendo_services_server_url};
+-    /// Connection test (conntest.nintendowifi.net).
+-    Setting<bool> nintendo_services_conntest{true, Keys::nintendo_services_conntest};
+-    /// Game server login (nasc.nintendowifi.net), used by online games and the friends list.
+-    Setting<bool> nintendo_services_nasc{true, Keys::nintendo_services_nasc};
+-    /// System update check (nus.c.shop.nintendowifi.net).
+-    Setting<bool> nintendo_services_nus{true, Keys::nintendo_services_nus};
++    /// Send every request for Nintendo's servers (SpotPass, game server login, system update,
++    /// accounts, eShop, …) to nintendo_server_url instead: one stand-in server (or proxy) that
++    /// routes by the X-Tangelo-Original-Host header. Also SpotPass on NetPass's mirror.
++    Setting<bool> use_custom_nintendo_server{false, Keys::use_custom_nintendo_server};
++    Setting<std::string> nintendo_server_url{"", Keys::nintendo_server_url};
+     /// Experimental: value ac:u GetConnectingLocation reports (0 = normal access point).
+     /// Games use it to tell a Nintendo Zone from other access points; meaning of values unknown.
+     Setting<u32> ac_connecting_location{0, Keys::ac_connecting_location};
+diff --git a/src/core/hle/service/boss/boss_download.cpp b/src/core/hle/service/boss/boss_download.cpp
+index 53ee6ac..dd73a94 100644
+--- a/src/core/hle/service/boss/boss_download.cpp
++++ b/src/core/hle/service/boss/boss_download.cpp
+@@ -26,11 +26,11 @@ TaskDownload DownloadTaskFile(const std::string& url, const std::string& if_modi
+ 
+     std::string request_url = url;
+     std::optional<std::string> original_host;
+-    if (Settings::values.use_custom_spotpass_server.GetValue()) {
++    if (Settings::values.use_custom_nintendo_server.GetValue()) {
+         if (auto redirected =
+-                HTTP::RedirectSpotPassUrl(url, Settings::values.spotpass_server_url.GetValue())) {
+-            original_host = HTTP::GetSpotPassHost(url);
+-            request_url = std::move(*redirected);
++                HTTP::RedirectNintendoUrl(url, Settings::values.nintendo_server_url.GetValue())) {
++            original_host = std::move(redirected->original_host);
++            request_url = std::move(redirected->url);
+         }
+     }
+     if (request_url.rfind("http://", 0) != 0 && request_url.rfind("https://", 0) != 0) {
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index b63010e..b129a5f 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -895,7 +895,7 @@ void OnlineService::FinishTask(const std::string& task_id, TaskState state, u32
+ 
+ void OnlineService::RunTasksAtStart(const std::shared_ptr<SpotPassState>& state,
+                                     std::optional<std::string> task_id) {
+-    if (!Settings::values.use_custom_spotpass_server.GetValue()) {
++    if (!Settings::values.use_custom_nintendo_server.GetValue()) {
+         return;
+     }
+ 
+diff --git a/src/core/hle/service/frd/frd.cpp b/src/core/hle/service/frd/frd.cpp
+index bfea921..d567ac2 100644
+--- a/src/core/hle/service/frd/frd.cpp
++++ b/src/core/hle/service/frd/frd.cpp
+@@ -337,21 +337,20 @@ constexpr std::string_view NascUrl = "https://nasc.nintendowifi.net/ac";
+ /// Nintendo's own NASC isn't asked: its 3DS game servers are gone, so it answers 110 anyway.
+ GameAuthenticationData RequestNascLogin(u32 game_id, u64 title_id, u32 sdk_major, u32 sdk_minor,
+                                         const std::string& ingame_name) {
+-    if (!Settings::values.use_nintendo_services_server.GetValue() ||
+-        !Settings::values.nintendo_services_nasc.GetValue()) {
++    if (!Settings::values.use_custom_nintendo_server.GetValue()) {
+         LOG_INFO(Service_FRD,
+                  "Game server login for {:08X}: Nintendo's 3DS game servers are closed, "
+-                 "answering 110 (set a Nintendo services server to ask it instead)",
++                 "answering 110 (set a custom Nintendo server to ask it instead)",
+                  game_id);
+         return MakeFailedGameAuthentication(NascResultServerGone, 0);
+     }
+-    const auto url = HTTP::RedirectNintendoServiceUrl(
+-        NascUrl, Settings::values.nintendo_services_server_url.GetValue());
+-    if (!url) {
+-        LOG_WARNING(Service_FRD, "Nintendo services server address is empty or invalid");
++    const auto redirect =
++        HTTP::RedirectNintendoUrl(NascUrl, Settings::values.nintendo_server_url.GetValue());
++    if (!redirect) {
++        LOG_WARNING(Service_FRD, "Custom Nintendo server address is empty or invalid");
+         return MakeFailedGameAuthentication(NascResultServerGone, 0);
+     }
+-
++    const std::string* url = &redirect->url;
+     const std::string game_id_text = fmt::format("{:08X}", game_id);
+     const std::string body = MakeNascForm({
+         {"action", "LOGIN"},
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 2972ac1..5797522 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -250,50 +250,26 @@ void Context::MakeRequest() {
+ 
+     std::string request_url = url;
+     std::optional<std::string> original_host;
+-    if (Settings::values.use_custom_spotpass_server.GetValue()) {
++    if (Settings::values.use_custom_nintendo_server.GetValue()) {
+         if (auto redirected =
+-                RedirectSpotPassUrl(url, Settings::values.spotpass_server_url.GetValue())) {
+-            LOG_INFO(Service_HTTP, "SpotPass request redirected: {} -> {}", url, *redirected);
+-            original_host = GetSpotPassHost(url);
+-            request_url = std::move(*redirected);
+-        } else if (IsSpotPassUrl(url)) {
++                RedirectNintendoUrl(url, Settings::values.nintendo_server_url.GetValue())) {
++            LOG_INFO(Service_HTTP, "Nintendo request redirected: {} -> {}", url, redirected->url);
++            original_host = std::move(redirected->original_host);
++            request_url = std::move(redirected->url);
++        } else if (IsSpotPassUrl(url) || IsNintendoHost(GetUrlHost(url))) {
+             LOG_WARNING(Service_HTTP,
+-                        "Custom SpotPass server is enabled but its address is empty or invalid; "
++                        "Custom Nintendo server is enabled but its address is empty or invalid; "
+                         "sending {} to Nintendo",
+                         url);
+         }
+     }
+-    if (!original_host && Settings::values.use_nintendo_services_server.GetValue()) {
+-        const auto service = GetNintendoService(url);
+-        const bool enabled = service && ((*service == NintendoService::ConnectionTest &&
+-                                          Settings::values.nintendo_services_conntest.GetValue()) ||
+-                                         (*service == NintendoService::GameServerLogin &&
+-                                          Settings::values.nintendo_services_nasc.GetValue()) ||
+-                                         (*service == NintendoService::SystemUpdate &&
+-                                          Settings::values.nintendo_services_nus.GetValue()));
+-        if (enabled) {
+-            if (auto redirected = RedirectNintendoServiceUrl(
+-                    url, Settings::values.nintendo_services_server_url.GetValue())) {
+-                LOG_INFO(Service_HTTP, "Nintendo {} redirected: {} -> {}",
+-                         GetNintendoServiceName(*service), url, *redirected);
+-                original_host = GetUrlHost(url);
+-                request_url = std::move(*redirected);
+-            } else {
+-                LOG_WARNING(Service_HTTP,
+-                            "Nintendo services server is enabled but its address is empty or "
+-                            "invalid; sending {} to Nintendo",
+-                            url);
+-            }
+-        }
+-    }
+ 
+     Common::URLInfo url_info = Common::SplitUrl(request_url);
+ 
+     httplib::Request request;
+     std::vector<Context::RequestHeader> pending_headers;
+     if (original_host) {
+-        // Lets one server tell SpotPass content, policy list, uploads and the other Nintendo
+-        // services apart.
++        // Lets one server (or proxy) route by the Nintendo host the request was meant for.
+         pending_headers.push_back(
+             Context::RequestHeader("X-Tangelo-Original-Host", *original_host));
+     }
+diff --git a/src/core/hle/service/http/spotpass_redirect.cpp b/src/core/hle/service/http/spotpass_redirect.cpp
+index 7502f55..04b8982 100644
+--- a/src/core/hle/service/http/spotpass_redirect.cpp
++++ b/src/core/hle/service/http/spotpass_redirect.cpp
+@@ -193,6 +193,40 @@ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string
+     return JoinServer(server, std::move(rest), "https");
+ }
+ 
++bool IsNintendoHost(std::string_view host) {
++    const std::string name = GetUrlHost(host);
++    for (const std::string_view domain : {"nintendo.net", "nintendowifi.net", "nintendo.com"}) {
++        if (name == domain || (name.size() > domain.size() && name.ends_with(domain) &&
++                               name[name.size() - domain.size() - 1] == '.')) {
++            return true;
++        }
++    }
++    return false;
++}
++
++std::optional<NintendoRedirect> RedirectNintendoUrl(std::string_view url, std::string_view server) {
++    if (IsSpotPassUrl(url)) {
++        const auto wrapped = UnwrapAkamai(url);
++        std::string rest(wrapped ? wrapped->second : SplitAuthority(url).second);
++        if (!wrapped && GetUrlHost(url) == NetPassHost) {
++            rest.erase(0, NetPassSpotPassPrefix.size());
++        }
++        auto redirected = JoinServer(server, std::move(rest), "http");
++        if (!redirected) {
++            return std::nullopt;
++        }
++        return NintendoRedirect{std::move(*redirected), GetSpotPassHost(url)};
++    }
++    if (!IsNintendoHost(GetUrlHost(url))) {
++        return std::nullopt;
++    }
++    auto redirected = JoinServer(server, std::string(SplitAuthority(url).second), "http");
++    if (!redirected) {
++        return std::nullopt;
++    }
++    return NintendoRedirect{std::move(*redirected), GetUrlHost(url)};
++}
++
+ std::optional<NintendoService> GetNintendoService(std::string_view url) {
+     const std::string host = GetUrlHost(url);
+     if (host == "conntest.nintendowifi.net") {
+diff --git a/src/core/hle/service/http/spotpass_redirect.h b/src/core/hle/service/http/spotpass_redirect.h
+index 2d7a1cf..d332a71 100644
+--- a/src/core/hle/service/http/spotpass_redirect.h
++++ b/src/core/hle/service/http/spotpass_redirect.h
+@@ -64,4 +64,21 @@ std::string_view GetNintendoServiceName(NintendoService service);
+ std::optional<std::string> RedirectNintendoServiceUrl(std::string_view url,
+                                                       std::string_view server);
+ 
++/// Returns true if `host` belongs to Nintendo: nintendo.net, nintendowifi.net, nintendo.com or a
++/// subdomain of them (any port).
++bool IsNintendoHost(std::string_view host);
++
++struct NintendoRedirect {
++    std::string url;           ///< Address at the custom server
++    std::string original_host; ///< Nintendo host the request was meant for
++};
++
++/**
++ * Rewrites any request meant for Nintendo to the custom server `server` ("[scheme://]host[:port]
++ * [/base/path]", http when no scheme is given), keeping path and query. Covers Nintendo's own
++ * hosts, Akamai-wrapped SpotPass addresses and SpotPass on NetPass's mirror (see
++ * RedirectSpotPassUrl for those two). Returns nullopt for other addresses or an empty server.
++ */
++std::optional<NintendoRedirect> RedirectNintendoUrl(std::string_view url, std::string_view server);
++
+ } // namespace Service::HTTP
+diff --git a/src/tests/core/hle/service/boss_download.cpp b/src/tests/core/hle/service/boss_download.cpp
+index 62ea041..1b98adb 100644
+--- a/src/tests/core/hle/service/boss_download.cpp
++++ b/src/tests/core/hle/service/boss_download.cpp
+@@ -48,10 +48,10 @@ TEST_CASE("SpotPass task files are downloaded from the custom server", "[service
+     std::thread thread([&] { server.listen_after_bind(); });
+     server.wait_until_ready();
+ 
+-    const bool old_enabled = Settings::values.use_custom_spotpass_server.GetValue();
+-    const std::string old_url = Settings::values.spotpass_server_url.GetValue();
+-    Settings::values.use_custom_spotpass_server.SetValue(true);
+-    Settings::values.spotpass_server_url.SetValue("http://127.0.0.1:" + std::to_string(port));
++    const bool old_enabled = Settings::values.use_custom_nintendo_server.GetValue();
++    const std::string old_url = Settings::values.nintendo_server_url.GetValue();
++    Settings::values.use_custom_nintendo_server.SetValue(true);
++    Settings::values.nintendo_server_url.SetValue("http://127.0.0.1:" + std::to_string(port));
+ 
+     std::atomic<bool> cancel{false};
+     const auto ok = DownloadTaskFile(
+@@ -75,8 +75,8 @@ TEST_CASE("SpotPass task files are downloaded from the custom server", "[service
+ 
+     CHECK(DownloadTaskFile("", "", cancel).status == 0);
+ 
+-    Settings::values.use_custom_spotpass_server.SetValue(old_enabled);
+-    Settings::values.spotpass_server_url.SetValue(old_url);
++    Settings::values.use_custom_nintendo_server.SetValue(old_enabled);
++    Settings::values.nintendo_server_url.SetValue(old_url);
+     server.stop();
+     thread.join();
+ }
+diff --git a/src/tests/core/hle/service/spotpass_redirect.cpp b/src/tests/core/hle/service/spotpass_redirect.cpp
+index b005470..80d7c2b 100644
+--- a/src/tests/core/hle/service/spotpass_redirect.cpp
++++ b/src/tests/core/hle/service/spotpass_redirect.cpp
+@@ -125,3 +125,44 @@ TEST_CASE("Nintendo services are redirected to the stand-in server", "[service][
+     CHECK_FALSE(RedirectNintendoServiceUrl("https://nasc.nintendowifi.net/ac", "  "));
+     CHECK_FALSE(RedirectNintendoServiceUrl("https://example.com/ac", "localhost:8080"));
+ }
++
++TEST_CASE("Everything meant for Nintendo goes to the custom server", "[service][http][spotpass]") {
++    using Service::HTTP::IsNintendoHost;
++    using Service::HTTP::RedirectNintendoUrl;
++
++    CHECK(IsNintendoHost("nasc.nintendowifi.net"));
++    CHECK(IsNintendoHost("account.nintendo.net:443"));
++    CHECK(IsNintendoHost("samurai-ctr.cdn.nintendo.net"));
++    CHECK(IsNintendoHost("nintendo.com"));
++    CHECK_FALSE(IsNintendoHost("notnintendo.net"));
++    CHECK_FALSE(IsNintendoHost("nintendo.net.example.com"));
++    CHECK_FALSE(IsNintendoHost("api.netpass.cafe"));
++
++    const auto login = RedirectNintendoUrl("https://nasc.nintendowifi.net/ac", "localhost:8080");
++    REQUIRE(login);
++    CHECK(login->url == "http://localhost:8080/ac");
++    CHECK(login->original_host == "nasc.nintendowifi.net");
++
++    const auto catalogue = RedirectNintendoUrl(
++        "https://samurai-ctr.cdn.nintendo.net/samurai/ws/NL/news?lang=en", "http://srv:9000/n/");
++    REQUIRE(catalogue);
++    CHECK(catalogue->url == "http://srv:9000/n/samurai/ws/NL/news?lang=en");
++
++    // SpotPass: Akamai and the NetPass mirror keep working, with the Nintendo host as origin.
++    const auto akamai = RedirectNintendoUrl(
++        "https://a248.e.akamai.net/f/248/103046/10m/npdl.c.app.nintendowifi.net/p01/nsa/a/b/c",
++        "localhost:8080");
++    REQUIRE(akamai);
++    CHECK(akamai->url == "http://localhost:8080/p01/nsa/a/b/c");
++    CHECK(akamai->original_host == "npdl.c.app.nintendowifi.net");
++    const auto mirror =
++        RedirectNintendoUrl("https://api.netpass.cafe/npdl/p01/nsa/a/b/c?tm=4", "localhost:8080");
++    REQUIRE(mirror);
++    CHECK(mirror->url == "http://localhost:8080/p01/nsa/a/b/c?tm=4");
++    CHECK(mirror->original_host == "api.netpass.cafe");
++
++    // NetPass's own API and other sites are left alone.
++    CHECK_FALSE(RedirectNintendoUrl("https://api.netpass.cafe/api/inbox", "localhost:8080"));
++    CHECK_FALSE(RedirectNintendoUrl("https://example.com/", "localhost:8080"));
++    CHECK_FALSE(RedirectNintendoUrl("https://nasc.nintendowifi.net/ac", ""));
++}
+-- 
+2.43.0
+
