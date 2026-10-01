@@ -1,0 +1,206 @@
+From 29b50792bc2159b70ce1f81b13818e884674855f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 2 Oct 2026 01:25:24 +0200
+Subject: [PATCH] ir, cam: ClearReceiveBuffer/ClearSendBuffer and SetPhotoMode
+
+ir:USER ClearReceiveBuffer (0x0003) drops every packet in the receive
+buffer; ClearSendBuffer (0x0004) has nothing to drop, because packets
+are handed to the device as soon as they are sent. Kid Icarus: Uprising
+calls both when it looks for the Circle Pad Pro.
+
+cam:u/cam:c/cam:s SetPhotoMode (0x0021) is accepted without effect: the
+photo mode only tunes a real camera's image processing. Angler's Club:
+Ultimate Bass Fishing 3D (portrait mode on both outer cameras) and
+Miitopia call it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cam/cam.cpp    | 20 +++++++++++++++++++
+ src/core/hle/service/cam/cam.h      | 13 +++++++++++++
+ src/core/hle/service/cam/cam_c.cpp  |  2 +-
+ src/core/hle/service/cam/cam_s.cpp  |  2 +-
+ src/core/hle/service/cam/cam_u.cpp  |  2 +-
+ src/core/hle/service/ir/ir_user.cpp | 30 +++++++++++++++++++++++++++--
+ src/core/hle/service/ir/ir_user.h   | 16 +++++++++++++++
+ 7 files changed, 80 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/hle/service/cam/cam.cpp b/src/core/hle/service/cam/cam.cpp
+index 37f7ba3..d951e9d 100644
+--- a/src/core/hle/service/cam/cam.cpp
++++ b/src/core/hle/service/cam/cam.cpp
+@@ -1018,6 +1018,26 @@ void Module::Interface::SetFrameRate(Kernel::HLERequestContext& ctx) {
+                 camera_select.m_val, frame_rate);
+ }
+ 
++void Module::Interface::SetPhotoMode(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const CameraSet camera_select(rp.Pop<u8>());
++    const u8 photo_mode = rp.Pop<u8>();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    // The photo mode (normal, portrait, landscape, night view, letter) only tunes the real
++    // camera's image processing; the emulated cameras have nothing to tune.
++    if (camera_select.IsValid() && photo_mode <= 4) {
++        rb.Push(ResultSuccess);
++    } else {
++        LOG_ERROR(Service_CAM, "invalid camera_select={}, photo_mode={}", camera_select.m_val,
++                  photo_mode);
++        rb.Push(ResultInvalidEnumValue);
++    }
++
++    LOG_DEBUG(Service_CAM, "called, camera_select={}, photo_mode={}", camera_select.m_val,
++              photo_mode);
++}
++
+ void Module::Interface::SetEffect(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const CameraSet camera_select(rp.Pop<u8>());
+diff --git a/src/core/hle/service/cam/cam.h b/src/core/hle/service/cam/cam.h
+index 6f4d990..2de3780 100644
+--- a/src/core/hle/service/cam/cam.h
++++ b/src/core/hle/service/cam/cam.h
+@@ -574,6 +574,19 @@ public:
+          */
+         void SetFrameRate(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * Sets the photo mode (image tuning) of cameras; accepted without effect, the emulated
++         * cameras have no image processing to tune.
++         *  Inputs:
++         *      0: 0x00210080
++         *      1: u8 selected camera
++         *      2: u8 photo mode (0 normal, 1 portrait, 2 landscape, 3 night view, 4 letter)
++         *  Outputs:
++         *      0: 0x00210040
++         *      1: Result
++         */
++        void SetPhotoMode(Kernel::HLERequestContext& ctx);
++
+         /**
+          * Sets effect on the output image
+          *  Inputs:
+diff --git a/src/core/hle/service/cam/cam_c.cpp b/src/core/hle/service/cam/cam_c.cpp
+index 150cfca..3f66a4a 100644
+--- a/src/core/hle/service/cam/cam_c.cpp
++++ b/src/core/hle/service/cam/cam_c.cpp
+@@ -43,7 +43,7 @@ CAM_C::CAM_C(std::shared_ptr<Module> cam) : Module::Interface(std::move(cam), "c
+         {0x001E, &CAM_C::SetDetailSize, "SetDetailSize"},
+         {0x001F, &CAM_C::SetSize, "SetSize"},
+         {0x0020, &CAM_C::SetFrameRate, "SetFrameRate"},
+-        {0x0021, nullptr, "SetPhotoMode"},
++        {0x0021, &CAM_C::SetPhotoMode, "SetPhotoMode"},
+         {0x0022, &CAM_C::SetEffect, "SetEffect"},
+         {0x0023, nullptr, "SetContrast"},
+         {0x0024, nullptr, "SetLensCorrection"},
+diff --git a/src/core/hle/service/cam/cam_s.cpp b/src/core/hle/service/cam/cam_s.cpp
+index ba35924..a143541 100644
+--- a/src/core/hle/service/cam/cam_s.cpp
++++ b/src/core/hle/service/cam/cam_s.cpp
+@@ -43,7 +43,7 @@ CAM_S::CAM_S(std::shared_ptr<Module> cam) : Module::Interface(std::move(cam), "c
+         {0x001E, &CAM_S::SetDetailSize, "SetDetailSize"},
+         {0x001F, &CAM_S::SetSize, "SetSize"},
+         {0x0020, &CAM_S::SetFrameRate, "SetFrameRate"},
+-        {0x0021, nullptr, "SetPhotoMode"},
++        {0x0021, &CAM_S::SetPhotoMode, "SetPhotoMode"},
+         {0x0022, &CAM_S::SetEffect, "SetEffect"},
+         {0x0023, nullptr, "SetContrast"},
+         {0x0024, nullptr, "SetLensCorrection"},
+diff --git a/src/core/hle/service/cam/cam_u.cpp b/src/core/hle/service/cam/cam_u.cpp
+index 1786318..99c2bee 100644
+--- a/src/core/hle/service/cam/cam_u.cpp
++++ b/src/core/hle/service/cam/cam_u.cpp
+@@ -43,7 +43,7 @@ CAM_U::CAM_U(std::shared_ptr<Module> cam) : Module::Interface(std::move(cam), "c
+         {0x001E, &CAM_U::SetDetailSize, "SetDetailSize"},
+         {0x001F, &CAM_U::SetSize, "SetSize"},
+         {0x0020, &CAM_U::SetFrameRate, "SetFrameRate"},
+-        {0x0021, nullptr, "SetPhotoMode"},
++        {0x0021, &CAM_U::SetPhotoMode, "SetPhotoMode"},
+         {0x0022, &CAM_U::SetEffect, "SetEffect"},
+         {0x0023, nullptr, "SetContrast"},
+         {0x0024, nullptr, "SetLensCorrection"},
+diff --git a/src/core/hle/service/ir/ir_user.cpp b/src/core/hle/service/ir/ir_user.cpp
+index b78b0b1..a9ed8a4 100644
+--- a/src/core/hle/service/ir/ir_user.cpp
++++ b/src/core/hle/service/ir/ir_user.cpp
+@@ -144,6 +144,13 @@ public:
+      * @params count Numbers of packets to release.
+      * @returns whether the operation is successful.
+      */
++    /// Drops every packet in the buffer.
++    void Clear() {
++        info.packet_count = 0;
++        info.begin_index = info.end_index;
++        UpdateBufferInfo();
++    }
++
+     bool Release(u32 count) {
+         if (info.packet_count < count)
+             return false;
+@@ -410,6 +417,25 @@ void IR_USER::SendIrNop(Kernel::HLERequestContext& ctx) {
+     LOG_TRACE(Service_IR, "called, data={}", fmt::format("{:02x}", fmt::join(buffer, " ")));
+ }
+ 
++void IR_USER::ClearReceiveBuffer(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    if (receive_buffer) {
++        receive_buffer->Clear();
++    }
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++    LOG_DEBUG(Service_IR, "called");
++}
++
++void IR_USER::ClearSendBuffer(Kernel::HLERequestContext& ctx) {
++    // Packets are handed to the device as soon as they are sent (SendIrNop), so there is
++    // never anything waiting in a send buffer.
++    IPC::RequestParser rp(ctx);
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++    LOG_DEBUG(Service_IR, "called");
++}
++
+ void IR_USER::ReleaseReceivedData(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     u32 count = rp.Pop<u32>();
+@@ -432,8 +458,8 @@ IR_USER::IR_USER(Core::System& system) : ServiceFramework("ir:USER", 1) {
+         // clang-format off
+         {0x0001, nullptr, "InitializeIrNop"},
+         {0x0002, &IR_USER::FinalizeIrNop, "FinalizeIrNop"},
+-        {0x0003, nullptr, "ClearReceiveBuffer"},
+-        {0x0004, nullptr, "ClearSendBuffer"},
++        {0x0003, &IR_USER::ClearReceiveBuffer, "ClearReceiveBuffer"},
++        {0x0004, &IR_USER::ClearSendBuffer, "ClearSendBuffer"},
+         {0x0005, nullptr, "WaitConnection"},
+         {0x0006, &IR_USER::RequireConnection, "RequireConnection"},
+         {0x0007, nullptr, "AutoConnection"},
+diff --git a/src/core/hle/service/ir/ir_user.h b/src/core/hle/service/ir/ir_user.h
+index a68111c..476db2c 100644
+--- a/src/core/hle/service/ir/ir_user.h
++++ b/src/core/hle/service/ir/ir_user.h
+@@ -155,6 +155,22 @@ private:
+      */
+     void SendIrNop(Kernel::HLERequestContext& ctx);
+ 
++    /**
++     * ClearReceiveBuffer function
++     * Drops every packet in the receive buffer.
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     */
++    void ClearReceiveBuffer(Kernel::HLERequestContext& ctx);
++
++    /**
++     * ClearSendBuffer function
++     * Drops packets waiting to be sent.
++     *  Outputs:
++     *      1 : Result of function, 0 on success, otherwise error code
++     */
++    void ClearSendBuffer(Kernel::HLERequestContext& ctx);
++
+     /**
+      * ReleaseReceivedData function
+      * Release a specified amount of packet from the receive buffer. This is called after the
+-- 
+2.43.0
+
