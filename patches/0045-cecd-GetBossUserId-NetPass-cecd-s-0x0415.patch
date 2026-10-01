@@ -1,0 +1,130 @@
+From 4e2d10b7b91d6c89d8310f26fa8b85b97b3df326 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 1 Oct 2026 20:46:12 +0200
+Subject: [PATCH] cecd: GetBossUserId (NetPass, cecd:s 0x0415)
+
+The NetPass app asks the CECD module for a "BOSS user ID" with command
+0x0415 and sends it to its server (3ds-boss-userid) to tell consoles
+apart. The command only exists in NetPass's CECD patch, so with online
+LLE off Tangelo's HLE CECD answered it as an unimplemented call, and
+NetPass read whatever was left in the command buffer: a different ID
+each run (one even negative on a LocalPass server).
+
+cecd:s 0x0415 now returns an ID derived from the console's MAC address
+(sysdata/mac.txt): fixed for an install, different between installs,
+always positive.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/cecd/cecd.cpp          | 25 +++++++++++++++++++++
+ src/core/hle/service/cecd/cecd.h            | 13 +++++++++++
+ src/core/hle/service/cecd/cecd_s.cpp        |  2 ++
+ src/tests/core/hle/service/cecd_message.cpp |  7 ++++++
+ 4 files changed, 47 insertions(+)
+
+diff --git a/src/core/hle/service/cecd/cecd.cpp b/src/core/hle/service/cecd/cecd.cpp
+index 0b7c733..df97dd7 100644
+--- a/src/core/hle/service/cecd/cecd.cpp
++++ b/src/core/hle/service/cecd/cecd.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstring>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/unique_ptr.hpp>
+ #include <cryptopp/base64.h>
+@@ -876,6 +877,30 @@ void Module::Interface::OpenAndRead(Kernel::HLERequestContext& ctx) {
+               open_mode.create.Value(), open_mode.check.Value());
+ }
+ 
++u64 MakeBossUserId(std::string_view mac_address) {
++    static constexpr std::string_view Salt = "Tangelo BOSS user ID ";
++    std::array<u8, CryptoPP::SHA256::DIGESTSIZE> digest;
++    CryptoPP::SHA256 sha;
++    sha.Update(reinterpret_cast<const u8*>(Salt.data()), Salt.size());
++    sha.Update(reinterpret_cast<const u8*>(mac_address.data()), mac_address.size());
++    sha.Final(digest.data());
++    u64 id;
++    std::memcpy(&id, digest.data(), sizeof(id));
++    // Keep it positive: the NetPass server stores it as a signed 64-bit number.
++    return id & 0x7FFFFFFFFFFFFFFFULL;
++}
++
++void Module::Interface::GetBossUserId(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u64 id = MakeBossUserId(CFG::GetModule(cecd->system)->GetMacAddress());
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(3, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u64>(id);
++
++    LOG_DEBUG(Service_CECD, "called, boss_user_id={:016X}", id);
++}
++
+ void Module::Interface::GetCecInfoEventHandleSys(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     rp.PopPID();
+diff --git a/src/core/hle/service/cecd/cecd.h b/src/core/hle/service/cecd/cecd.h
+index 02afb35..56c960b 100644
+--- a/src/core/hle/service/cecd/cecd.h
++++ b/src/core/hle/service/cecd/cecd.h
+@@ -624,6 +624,15 @@ public:
+          */
+         void GetCecInfoEventHandleSys(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * GetBossUserId (cecd:s 0x0415). Not in Nintendo's CECD module: added by NetPass's CECD
++         * patch, and read by the NetPass app (3ds-boss-userid header) to tell consoles apart.
++         *  Outputs:
++         *      1: Result
++         *    2-3: u64 BOSS user ID
++         */
++        void GetBossUserId(Kernel::HLERequestContext& ctx);
++
+     protected:
+         std::shared_ptr<Module> cecd;
+     };
+@@ -665,6 +674,10 @@ private:
+ };
+ 
+ /// Initialize CECD service(s)
++/// The BOSS user ID this emulated console reports (GetBossUserId): derived from its MAC address,
++/// so it stays the same for an install and differs between installs.
++u64 MakeBossUserId(std::string_view mac_address);
++
+ void InstallInterfaces(Core::System& system);
+ 
+ /**
+diff --git a/src/core/hle/service/cecd/cecd_s.cpp b/src/core/hle/service/cecd/cecd_s.cpp
+index 3b76c73..cb45a2c 100644
+--- a/src/core/hle/service/cecd/cecd_s.cpp
++++ b/src/core/hle/service/cecd/cecd_s.cpp
+@@ -36,6 +36,8 @@ CECD_S::CECD_S(std::shared_ptr<Module> cecd)
+         {0x001F, nullptr, "GetEventLogStart"},
+         // cecd:s commands
+         {0x0402, &CECD_S::GetCecInfoEventHandleSys, "GetCecInfoEventHandleSys"},
++        // Added by NetPass's CECD patch
++        {0x0415, &CECD_S::GetBossUserId, "GetBossUserId"},
+         // clang-format on
+     };
+ 
+diff --git a/src/tests/core/hle/service/cecd_message.cpp b/src/tests/core/hle/service/cecd_message.cpp
+index f1ccd8b..4ea97ff 100644
+--- a/src/tests/core/hle/service/cecd_message.cpp
++++ b/src/tests/core/hle/service/cecd_message.cpp
+@@ -103,3 +103,10 @@ TEST_CASE("MBoxList keeps every activated StreetPass box", "[service][cecd]") {
+     }
+     CHECK(MergeMBoxList({}, many, "").size() == 24);
+ }
++
++TEST_CASE("BOSS user ID follows the MAC address", "[service][cecd]") {
++    const u64 a = Service::CECD::MakeBossUserId("34:2F:BD:8E:E5:15");
++    CHECK(a == Service::CECD::MakeBossUserId("34:2F:BD:8E:E5:15"));
++    CHECK(a != Service::CECD::MakeBossUserId("34:2F:BD:00:00:01"));
++    CHECK((a >> 63) == 0);
++}
+-- 
+2.43.0
+
