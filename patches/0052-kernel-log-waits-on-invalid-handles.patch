@@ -1,0 +1,118 @@
+From 19f56cbe793aac03347e43f9c73ee97a33d7e32e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 2 Oct 2026 03:22:55 +0200
+Subject: [PATCH] kernel: explain waits on an invalid handle in the log
+
+A software that waits on a handle it no longer has gets 0xD8E007F7 and
+usually throws a fatal error, with nothing in the log about which handle it
+was. WaitSynchronization1/N now log the waiting thread (process, thread,
+priority, core, pc, lr), every handle in the wait list, and the handles that
+process closed recently (the last 32, with who closed them and how long ago),
+marking the one it waited on.
+
+Found while closing the 3DS lid on the nintendogs + cats walk screen.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/kernel/svc.cpp | 68 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 67 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 7d99082..d2b3917 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -723,9 +723,69 @@ Result SVC::OpenThread(Handle* out_handle, Handle process_handle, u32 thread_id)
+ }
+ 
+ /// Close a handle
++namespace {
++/// The last handles closed, kept to explain a later wait on a closed handle (invalid handle).
++struct ClosedHandle {
++    u32 process_id;
++    Handle handle;
++    std::string object;
++    u32 thread_id;
++    u32 core;
++    u64 ticks;
++};
++std::array<ClosedHandle, 32> closed_handles{};
++std::size_t closed_handles_next = 0;
++} // namespace
++
+ Result SVC::CloseHandle(Handle handle) {
+     LOG_TRACE(Kernel_SVC, "Closing handle 0x{:08X}", handle);
+-    return kernel.GetCurrentProcess()->handle_table.Close(handle);
++    const auto process = kernel.GetCurrentProcess();
++    if (const auto object = process->handle_table.GetGeneric(handle)) {
++        const Thread* thread = kernel.GetCurrentThreadManager().GetCurrentThread();
++        closed_handles[closed_handles_next++ % closed_handles.size()] = {
++            process->process_id,
++            handle,
++            fmt::format("{}:{}", object->GetTypeName(), object->GetName()),
++            thread ? thread->thread_id : 0,
++            thread ? static_cast<u32>(thread->processor_id) : 0,
++            static_cast<u64>(kernel.timing.GetGlobalTicks())};
++    }
++    return process->handle_table.Close(handle);
++}
++
++/// Logs what a wait on an invalid handle was about: the waiting thread and, if the handle was
++/// closed shortly before, who closed it and what it was.
++static void LogInvalidWaitHandle(Core::System& system, Handle handle, VAddr handles_address,
++                                 s32 handle_count) {
++    auto& kernel = system.Kernel();
++    auto& memory = system.Memory();
++    auto& core = system.GetRunningCore();
++    const auto process = kernel.GetCurrentProcess();
++    const Thread* thread = kernel.GetCurrentThreadManager().GetCurrentThread();
++    LOG_ERROR(Kernel_SVC,
++              "Wait on invalid handle 0x{:08X}: process {}, thread {} (priority {}, core {}, "
++              "pc 0x{:08X}, lr 0x{:08X})",
++              handle, process->process_id, thread ? thread->thread_id : 0,
++              thread ? thread->current_priority : 0, thread ? thread->processor_id : 0,
++              core.GetPC(), core.GetReg(14));
++    for (s32 i = 0; i < handle_count; ++i) {
++        const Handle other = memory.Read32(handles_address + i * sizeof(Handle));
++        const auto object = process->handle_table.GetGeneric(other);
++        LOG_ERROR(Kernel_SVC, "  waits on [{}] 0x{:08X} {}", i, other,
++                  object ? fmt::format("{}:{}", object->GetTypeName(), object->GetName())
++                         : "(invalid)");
++    }
++    const u64 now = static_cast<u64>(kernel.timing.GetGlobalTicks());
++    for (std::size_t i = 0; i < closed_handles.size(); ++i) {
++        const auto& closed = closed_handles[(closed_handles_next + i) % closed_handles.size()];
++        if (closed.object.empty() || closed.process_id != process->process_id) {
++            continue;
++        }
++        LOG_ERROR(Kernel_SVC, "  closed {:.3f} ms ago: 0x{:08X} {} by thread {} (core {}){}",
++                  static_cast<double>(now - closed.ticks) * 1000.0 / BASE_CLOCK_RATE_ARM11,
++                  closed.handle, closed.object, closed.thread_id, closed.core,
++                  closed.handle == handle ? "  <-- this handle" : "");
++    }
+ }
+ 
+ static Result ReceiveIPCRequest(Kernel::KernelSystem& kernel, Memory::MemorySystem& memory,
+@@ -802,6 +862,9 @@ private:
+ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
+     auto object = kernel.GetCurrentProcess()->handle_table.Get<WaitObject>(handle);
+     Thread* thread = kernel.GetCurrentThreadManager().GetCurrentThread();
++    if (!object) {
++        LogInvalidWaitHandle(system, handle, 0, 0);
++    }
+     R_UNLESS(object, ResultInvalidHandle);
+ 
+     LOG_TRACE(Kernel_SVC, "called handle=0x{:08X}({}:{}), nanoseconds={}", handle,
+@@ -851,6 +914,9 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
+     for (int i = 0; i < handle_count; ++i) {
+         Handle handle = memory.Read32(handles_address + i * sizeof(Handle));
+         auto object = kernel.GetCurrentProcess()->handle_table.Get<WaitObject>(handle);
++        if (!object) {
++            LogInvalidWaitHandle(system, handle, handles_address, handle_count);
++        }
+         R_UNLESS(object, ResultInvalidHandle);
+         objects[i] = object;
+     }
+-- 
+2.43.0
+

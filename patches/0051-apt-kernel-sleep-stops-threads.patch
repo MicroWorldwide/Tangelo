@@ -1,0 +1,170 @@
+From e41003b490551c61d39e36c0d5a7fa118a6ad2ba Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 2 Oct 2026 03:06:55 +0200
+Subject: [PATCH] apt, kernel: stop the software's threads while the 3DS sleeps
+
+After a lid close the software prepares for sleep (it unloads the DSP and
+closes handles) and ends with ReplySleepNotificationComplete. A real 3DS
+stops its CPU from there until the lid opens. Tangelo kept running the
+software's threads, so a thread could wait on a handle that had just been
+closed: nintendogs + cats on the walk screen threw a fatal error
+(WaitSynchronizationN, 0xD8E007F7 invalid handle) and the emulator stopped.
+
+ReplySleepNotificationComplete now unschedules the calling process's threads
+(new UnscheduleMode::SLEEP); opening the lid schedules them again before
+SleepAwake is sent. The clock and the virtual pedometer keep going.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/kernel/process.h               |  1 +
+ src/core/hle/service/apt/applet_manager.cpp | 44 +++++++++++++++++++++
+ src/core/hle/service/apt/applet_manager.h   | 16 ++++++++
+ src/core/hle/service/apt/apt.cpp            |  5 ++-
+ 4 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/hle/kernel/process.h b/src/core/hle/kernel/process.h
+index 0ea2563..e6c6892 100644
+--- a/src/core/hle/kernel/process.h
++++ b/src/core/hle/kernel/process.h
+@@ -56,6 +56,7 @@ enum class UnscheduleMode : u32 {
+     SVC = (1 << 0),
+     GDB = (1 << 1),
+     FRONTEND = (1 << 2),
++    SLEEP = (1 << 3), ///< The 3DS is asleep (lid closed): the software's threads don't run
+ };
+ DECLARE_ENUM_FLAG_OPERATORS(UnscheduleMode);
+ 
+diff --git a/src/core/hle/service/apt/applet_manager.cpp b/src/core/hle/service/apt/applet_manager.cpp
+index 432a0fe..9352052 100644
+--- a/src/core/hle/service/apt/applet_manager.cpp
++++ b/src/core/hle/service/apt/applet_manager.cpp
+@@ -7,6 +7,8 @@
+ #include "common/settings.h"
+ #include "core/core.h"
+ #include "core/frontend/input.h"
++#include "core/hle/kernel/process.h"
++#include "core/hle/kernel/thread.h"
+ #include "core/hle/applets/applet.h"
+ #include "core/hle/applets/erreula.h"
+ #include "core/hle/applets/mii_selector.h"
+@@ -1787,6 +1789,7 @@ void AppletManager::ApplyShellState(bool closed) {
+         return;
+     }
+ 
++    WakeSleepingProcesses();
+     if (sleeping) {
+         LOG_INFO(Service_APT, "3DS lid opened: waking up");
+         SendNotificationToAll(Notification::SleepAwake);
+@@ -1829,6 +1832,47 @@ void AppletManager::ReplySleepQuery(AppletId from_applet_id, SleepQueryReply rep
+     }
+ }
+ 
++void AppletManager::SleepNotificationComplete(AppletId from_applet_id,
++                                              std::shared_ptr<Kernel::Process> process) {
++    if (!shell_closed || !sleeping || !process) {
++        return; // not asleep (the lid was opened again in between)
++    }
++    for (const auto& weak : sleeping_processes) {
++        if (weak.lock() == process) {
++            return;
++        }
++    }
++    LOG_INFO(Service_APT, "{:03X} is ready for sleep: stopping process {} until the lid opens",
++             from_applet_id, process->process_id);
++    // Only the thread flags here: this runs inside the software's own IPC call, so the switch to
++    // other threads is left to the next reschedule.
++    SetProcessAsleep(*process, true);
++    sleeping_processes.push_back(process);
++}
++
++void AppletManager::SetProcessAsleep(Kernel::Process& process, bool asleep) {
++    for (const auto& thread : process.GetThreadList()) {
++        if (asleep) {
++            thread->SetUnscheduleMode(Kernel::UnscheduleMode::SLEEP);
++        } else {
++            thread->ClearUnscheduleMode(Kernel::UnscheduleMode::SLEEP);
++        }
++    }
++    for (u32 core = 0; core < system.GetNumCores(); ++core) {
++        system.GetCore(core).PrepareReschedule();
++    }
++}
++
++void AppletManager::WakeSleepingProcesses() {
++    for (const auto& weak : sleeping_processes) {
++        if (const auto process = weak.lock()) {
++            LOG_INFO(Service_APT, "Waking process {}", process->process_id);
++            SetProcessAsleep(*process, false);
++        }
++    }
++    sleeping_processes.clear();
++}
++
+ void AppletManager::ButtonUpdateEvent(std::uintptr_t user_data, s64 cycles_late) {
+     if (is_device_reload_pending.exchange(false)) {
+         LoadInputDevices();
+diff --git a/src/core/hle/service/apt/applet_manager.h b/src/core/hle/service/apt/applet_manager.h
+index c88f8bb..6d777a0 100644
+--- a/src/core/hle/service/apt/applet_manager.h
++++ b/src/core/hle/service/apt/applet_manager.h
+@@ -23,6 +23,10 @@ namespace Core {
+ class System;
+ }
+ 
++namespace Kernel {
++class Process;
++}
++
+ namespace HLE::Applets {
+ class Applet;
+ }
+@@ -291,6 +295,14 @@ public:
+     /// A reply to SleepQuery (APT ReplySleepQuery).
+     void ReplySleepQuery(AppletId from_applet_id, SleepQueryReply reply);
+ 
++    /**
++     * The software finished getting ready for sleep (APT ReplySleepNotificationComplete). A real
++     * 3DS stops its CPU from here until the lid opens, so the process's threads are unscheduled;
++     * left running, threads of the sleeping software wait on handles it has just closed.
++     */
++    void SleepNotificationComplete(AppletId from_applet_id,
++                                   std::shared_ptr<Kernel::Process> process);
++
+     /**
+      * Clears any existing parameter and places a new one. This function is currently only used by
+      * HLE Applets and should be likely removed in the future
+@@ -547,7 +559,11 @@ private:
+     bool shell_closed = false;
+     bool sleep_query_pending = false;
+     bool sleeping = false;
++    /// Processes stopped for sleep, scheduled again when the lid opens.
++    std::vector<std::weak_ptr<Kernel::Process>> sleeping_processes;
+     void ApplyShellState(bool closed);
++    void WakeSleepingProcesses();
++    void SetProcessAsleep(Kernel::Process& process, bool asleep);
+     std::unique_ptr<Input::ButtonDevice> home_button;
+     std::unique_ptr<Input::ButtonDevice> power_button;
+     bool last_home_button_state = false;
+diff --git a/src/core/hle/service/apt/apt.cpp b/src/core/hle/service/apt/apt.cpp
+index b25b72d..17fd296 100644
+--- a/src/core/hle/service/apt/apt.cpp
++++ b/src/core/hle/service/apt/apt.cpp
+@@ -1080,10 +1080,13 @@ void Module::APTInterface::ReplySleepNotificationComplete(Kernel::HLERequestCont
+     IPC::RequestParser rp(ctx);
+     const auto from_app_id = rp.PopEnum<AppletId>();
+ 
+-    LOG_WARNING(Service_APT, "(STUBBED) called, from_app_id={:08X}", from_app_id);
++    LOG_DEBUG(Service_APT, "called, from_app_id={:08X}", from_app_id);
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(ResultSuccess);
++
++    apt->applet_manager->SleepNotificationComplete(from_app_id,
++                                                   ctx.ClientThread()->owner_process.lock());
+ }
+ 
+ void Module::APTInterface::PrepareToJumpToHomeMenu(Kernel::HLERequestContext& ctx) {
+-- 
+2.43.0
+

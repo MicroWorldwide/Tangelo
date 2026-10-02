@@ -1,0 +1,167 @@
+From efcbfcbb7e6b338237a9eae42a0d33484dffcf51 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 2 Oct 2026 03:47:17 +0200
+Subject: [PATCH] apt, kernel: no core 1 time limit while the software sleeps
+ or wakes up
+
+Closing the lid on the nintendogs + cats walk screen sometimes threw a fatal
+error. The 0052 logging showed the order: the sleep command to the DSP wakes
+the game's sound thread (core 1, priority 24); the 25ms single-mode core 1
+slice then holds that thread back (up to ~19ms), and meanwhile the main thread
+on core 0 unregisters and closes the DSP events and clears the handle. When
+the sound thread finally runs, it waits on handle 0 and gets 0xD8E007F7.
+
+APT now pauses the core 1 application time limit from the lid close until
+3 seconds after the software is awake again (kept paused while it sleeps), so
+the sound thread reaches its wait before its handles are closed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/kernel/thread.cpp              | 14 +++++++++++++-
+ src/core/hle/kernel/thread.h                | 14 ++++++++++++++
+ src/core/hle/service/apt/applet_manager.cpp | 19 +++++++++++++++++++
+ src/core/hle/service/apt/applet_manager.h   |  4 ++++
+ 4 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/hle/kernel/thread.cpp b/src/core/hle/kernel/thread.cpp
+index 82b2af2..36f209c 100644
+--- a/src/core/hle/kernel/thread.cpp
++++ b/src/core/hle/kernel/thread.cpp
+@@ -692,8 +692,15 @@ void CpuLimiterMulti::UpdateAppCpuLimit() {
+     }
+ }
+ 
++void CpuLimiterMulti::SetPaused(bool paused_) {
++    paused = paused_;
++    if (paused) {
++        WakeupSleepingThreads();
++    }
++}
++
+ bool CpuLimiterMulti::DoTimeLimit(Thread* thread) {
+-    if (!ready || !active) {
++    if (!ready || !active || paused) {
+         // Preemption is not active, don't do anything.
+         return false;
+     }
+@@ -816,6 +823,11 @@ void ThreadManager::UpdateAppCpuLimit() {
+     GetCpuLimiter()->UpdateAppCpuLimit();
+ }
+ 
++void ThreadManager::SetCpuLimitPaused(bool paused) {
++    single_time_limiter.SetPaused(paused);
++    multi_time_limiter.SetPaused(paused);
++}
++
+ std::shared_ptr<Thread> KernelSystem::GetThreadByID(u32 thread_id) const {
+     for (u32 core_id = 0; core_id < Core::System::GetInstance().GetNumCores(); core_id++) {
+         auto ret = GetThreadManager(core_id).GetThreadByID(thread_id);
+diff --git a/src/core/hle/kernel/thread.h b/src/core/hle/kernel/thread.h
+index 2ea6884..6d802d2 100644
+--- a/src/core/hle/kernel/thread.h
++++ b/src/core/hle/kernel/thread.h
+@@ -94,6 +94,9 @@ public:
+     virtual void UpdateAppCpuLimit() = 0;
+ 
+     virtual bool DoTimeLimit(Thread* thread) = 0;
++
++    /// Lets every thread run without time limits while paused (see ThreadManager).
++    virtual void SetPaused(bool paused) = 0;
+ };
+ 
+ /**
+@@ -124,6 +127,8 @@ public:
+ 
+     bool DoTimeLimit(Thread* thread) override;
+ 
++    void SetPaused(bool paused) override;
++
+     /// Whether an application CPU time value turns preemption on. Only 1..89 does: 0 disables
+     /// preemption and 10000 (and above) means the application is exempted from it.
+     static bool IsPreemptiveCpuTime(s32 cpu_time);
+@@ -150,6 +155,7 @@ private:
+     bool is_single = false;
+     bool ready = false;
+     bool active = false;
++    bool paused = false; ///< Not saved in save states: set again by APT when needed
+     Core1CpuTime app_cpu_time = Core1CpuTime::PREEMPTION_DISABLED;
+     SchedState curr_state{};
+     std::queue<u32> sleeping_thread_ids;
+@@ -217,6 +223,14 @@ public:
+ 
+     void UpdateAppCpuLimit();
+ 
++    /**
++     * Pauses (or resumes) the core 1 time limit for the application. Used by APT while the
++     * software goes to sleep or wakes up: there a high priority thread on core 1 has to get to its
++     * next wait before the main thread on core 0 closes the handles it waits on, and a 25ms
++     * single-mode slice can hold it back for up to ~19ms.
++     */
++    void SetCpuLimitPaused(bool paused);
++
+     CpuLimiter* GetCpuLimiter() {
+         return (current_schedule_mode == Core1ScheduleMode::Single) ? &single_time_limiter
+                                                                     : &multi_time_limiter;
+diff --git a/src/core/hle/service/apt/applet_manager.cpp b/src/core/hle/service/apt/applet_manager.cpp
+index 9352052..a169451 100644
+--- a/src/core/hle/service/apt/applet_manager.cpp
++++ b/src/core/hle/service/apt/applet_manager.cpp
+@@ -1782,6 +1782,9 @@ void AppletManager::ApplyShellState(bool closed) {
+         ptm->SetShellOpen(!closed);
+     }
+ 
++    // The software's own threads must keep their order while it prepares for sleep or wakes up.
++    PauseCpuLimit();
++
+     if (closed) {
+         LOG_INFO(Service_APT, "3DS lid closed: asking the software to sleep");
+         sleep_query_pending = true;
+@@ -1863,6 +1866,16 @@ void AppletManager::SetProcessAsleep(Kernel::Process& process, bool asleep) {
+     }
+ }
+ 
++void AppletManager::PauseCpuLimit() {
++    // Long enough for the software to finish its sleep or wake handling.
++    constexpr int transition_ms = 3000;
++    cpu_limit_resume_ticks = system.CoreTiming().GetGlobalTicks() + msToCycles(transition_ms);
++    if (!cpu_limit_paused) {
++        cpu_limit_paused = true;
++        system.Kernel().GetThreadManager(1).SetCpuLimitPaused(true);
++    }
++}
++
+ void AppletManager::WakeSleepingProcesses() {
+     for (const auto& weak : sleeping_processes) {
+         if (const auto process = weak.lock()) {
+@@ -1881,6 +1894,12 @@ void AppletManager::ButtonUpdateEvent(std::uintptr_t user_data, s64 cycles_late)
+     if (const int lid = requested_shell_state.exchange(-1); lid >= 0) {
+         ApplyShellState(lid == 1);
+     }
++    // Stays paused while the software is asleep; resumed a while after it woke up.
++    if (cpu_limit_paused && !sleeping && !sleep_query_pending &&
++        system.CoreTiming().GetGlobalTicks() >= cpu_limit_resume_ticks) {
++        cpu_limit_paused = false;
++        system.Kernel().GetThreadManager(1).SetCpuLimitPaused(false);
++    }
+ 
+     // NOTE: We technically do support loading and jumping to home menu even if it isn't
+     // initially registered. However since the home menu suspend is not bug-free, we don't
+diff --git a/src/core/hle/service/apt/applet_manager.h b/src/core/hle/service/apt/applet_manager.h
+index 6d777a0..ee85b11 100644
+--- a/src/core/hle/service/apt/applet_manager.h
++++ b/src/core/hle/service/apt/applet_manager.h
+@@ -563,6 +563,10 @@ private:
+     std::vector<std::weak_ptr<Kernel::Process>> sleeping_processes;
+     void ApplyShellState(bool closed);
+     void WakeSleepingProcesses();
++    /// Core 1 time limit paused for a sleep or wake transition; resumed once it is over.
++    bool cpu_limit_paused = false;
++    s64 cpu_limit_resume_ticks = 0;
++    void PauseCpuLimit();
+     void SetProcessAsleep(Kernel::Process& process, bool asleep);
+     std::unique_ptr<Input::ButtonDevice> home_button;
+     std::unique_ptr<Input::ButtonDevice> power_button;
+-- 
+2.43.0
+

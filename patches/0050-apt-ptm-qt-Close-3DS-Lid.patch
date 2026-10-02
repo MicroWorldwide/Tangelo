@@ -1,0 +1,360 @@
+From babb6a4b5d14a480c01d94e1697ddfe27627f6de Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 2 Oct 2026 02:38:24 +0200
+Subject: [PATCH] apt, ptm, qt: Close 3DS Lid
+
+Emulation > Close 3DS Lid (hotkey Ctrl+D, checkable) closes and opens the
+emulated 3DS lid. Some games only do something while the 3DS is closed:
+nintendogs + cats counts its walk while the lid is shut and never asks for
+steps while it is open.
+
+Closing sets PTM's shell state (GetShellState) and sends SleepQuery to the
+running software. When it accepts (ReplySleepQuery, until now a stub) it
+gets SleepAccepted. Opening sends SleepAwake, or SleepCancelledByOpen when
+the sleep wasn't accepted yet. The request from the frontend is applied on
+the emulation thread (the APT button update event). Emulation keeps
+running meanwhile, so the clock and the virtual pedometer (Steps per hour)
+go on as on a sleeping 3DS. A new game starts with the lid open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/citra_qt/citra_qt.cpp                   | 23 +++++++
+ src/citra_qt/citra_qt.h                     |  2 +
+ src/citra_qt/configuration/config.cpp       |  1 +
+ src/citra_qt/main.ui                        | 15 +++++
+ src/core/hle/service/apt/applet_manager.cpp | 67 +++++++++++++++++++++
+ src/core/hle/service/apt/applet_manager.h   | 19 ++++++
+ src/core/hle/service/apt/apt.cpp            |  5 +-
+ src/core/hle/service/ptm/ptm.cpp            |  5 ++
+ src/core/hle/service/ptm/ptm.h              | 17 ++++++
+ 9 files changed, 152 insertions(+), 2 deletions(-)
+
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index ddd5d97..9645f00 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -106,6 +106,8 @@
+ #include "core/file_sys/archive_source_sd_savedata.h"
+ #include "core/frontend/applets/default_applets.h"
+ #include "core/hle/service/am/am.h"
++#include "core/hle/service/apt/applet_manager.h"
++#include "core/hle/service/apt/apt.h"
+ #include "core/hle/service/fs/archive.h"
+ #include "core/hle/service/nfc/nfc.h"
+ #include "core/loader/loader.h"
+@@ -2082,6 +2084,7 @@ void GMainWindow::InitializeHotkeys() {
+     link_action_shortcut(ui->action_Exit, QStringLiteral("Exit Tangelo"));
+     link_action_shortcut(ui->action_Restart, QStringLiteral("Restart Emulation"));
+     link_action_shortcut(ui->action_Pause, QStringLiteral("Continue/Pause Emulation"));
++    link_action_shortcut(ui->action_Close_Lid, QStringLiteral("Close/Open 3DS Lid"));
+     link_action_shortcut(ui->action_Stop, QStringLiteral("Stop Emulation"));
+     link_action_shortcut(ui->action_Show_Filter_Bar, QStringLiteral("Toggle Filter Bar"));
+     link_action_shortcut(ui->action_Show_Status_Bar, QStringLiteral("Toggle Status Bar"));
+@@ -2346,6 +2349,10 @@ void GMainWindow::ConnectMenuEvents() {
+ 
+     // Emulation
+     connect_menu(ui->action_Pause, &GMainWindow::OnPauseContinueGame);
++    // Toggled (not triggered): the hotkey and the menu both flip the check mark.
++    connect(ui->action_Close_Lid, &QAction::toggled, this, &GMainWindow::OnToggleLid);
++    addAction(ui->action_Close_Lid);
++    render_window->addAction(ui->action_Close_Lid);
+     connect_menu(ui->action_Stop, &GMainWindow::OnStopGame);
+     connect_menu(ui->action_Restart, [this] { BootGame(QString(game_path)); });
+     connect_menu(ui->action_Report_Compatibility, []() {
+@@ -2457,6 +2464,7 @@ void GMainWindow::UpdateMenuState() {
+         ui->action_Remove_Amiibo,
+         ui->action_Pause,
+         ui->action_Advance_Frame,
++        ui->action_Close_Lid,
+     };
+ 
+     for (QAction* action : running_actions) {
+@@ -2850,6 +2858,12 @@ void GMainWindow::ShutdownGame() {
+         return;
+     }
+ 
++    {
++        // A new game starts with the lid open.
++        const QSignalBlocker blocker(ui->action_Close_Lid);
++        ui->action_Close_Lid->setChecked(false);
++    }
++
+     if (ui->action_Fullscreen->isChecked()) {
+         HideFullscreen();
+     }
+@@ -4063,6 +4077,15 @@ void GMainWindow::OnPauseContinueGame() {
+     }
+ }
+ 
++void GMainWindow::OnToggleLid(bool closed) {
++    if (!emulation_running) {
++        return;
++    }
++    if (const auto apt = Service::APT::GetModule(system)) {
++        apt->GetAppletManager()->RequestShellState(closed);
++    }
++}
++
+ void GMainWindow::OnStopGame() {
+     SetTurboEnabled(false);
+ 
+diff --git a/src/citra_qt/citra_qt.h b/src/citra_qt/citra_qt.h
+index df5a437..b9a5e00 100644
+--- a/src/citra_qt/citra_qt.h
++++ b/src/citra_qt/citra_qt.h
+@@ -238,6 +238,8 @@ private slots:
+     void OnRestartGame();
+     void OnPauseGame();
+     void OnPauseContinueGame();
++    /// Closes (true) or opens the emulated 3DS lid.
++    void OnToggleLid(bool closed);
+     void OnStopGame();
+     void OnSaveState();
+     void OnLoadState();
+diff --git a/src/citra_qt/configuration/config.cpp b/src/citra_qt/configuration/config.cpp
+index 5095ff2..80a9901 100644
+--- a/src/citra_qt/configuration/config.cpp
++++ b/src/citra_qt/configuration/config.cpp
+@@ -62,6 +62,7 @@ const std::vector<UISettings::Shortcut> QtConfig::default_hotkeys{ {
+      {QStringLiteral("Audio Volume Down"),        QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
+      {QStringLiteral("Audio Volume Up"),          QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
+      {QStringLiteral("Capture Screenshot"),       QStringLiteral("Main Window"), {QStringLiteral("Ctrl+P"), QStringLiteral(""), Qt::ApplicationShortcut}},
++     {QStringLiteral("Close/Open 3DS Lid"),       QStringLiteral("Main Window"), {QStringLiteral("Ctrl+D"), QStringLiteral(""), Qt::ApplicationShortcut}},
+      {QStringLiteral("Continue/Pause Emulation"), QStringLiteral("Main Window"), {QStringLiteral("F4"),     QStringLiteral(""), Qt::ApplicationShortcut}},
+      {QStringLiteral("Debug Pause"),              QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
+      {QStringLiteral("Debug Resume"),             QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
+diff --git a/src/citra_qt/main.ui b/src/citra_qt/main.ui
+index 2059e1c..3be58dd 100644
+--- a/src/citra_qt/main.ui
++++ b/src/citra_qt/main.ui
+@@ -190,6 +190,7 @@
+     <addaction name="action_Pause"/>
+     <addaction name="action_Stop"/>
+     <addaction name="action_Restart"/>
++    <addaction name="action_Close_Lid"/>
+     <addaction name="separator"/>
+     <addaction name="menu_Load_State"/>
+     <addaction name="menu_Save_State"/>
+@@ -433,6 +434,20 @@
+     <string>Pause</string>
+    </property>
+   </action>
++  <action name="action_Close_Lid">
++   <property name="checkable">
++    <bool>true</bool>
++   </property>
++   <property name="enabled">
++    <bool>false</bool>
++   </property>
++   <property name="text">
++    <string>Close 3DS Lid</string>
++   </property>
++   <property name="toolTip">
++    <string>Close the 3DS lid: the game goes to sleep (pedometer walks, sleep-mode features); uncheck to open it again</string>
++   </property>
++  </action>
+   <action name="action_Stop">
+    <property name="enabled">
+     <bool>false</bool>
+diff --git a/src/core/hle/service/apt/applet_manager.cpp b/src/core/hle/service/apt/applet_manager.cpp
+index 7e9befd..432a0fe 100644
+--- a/src/core/hle/service/apt/applet_manager.cpp
++++ b/src/core/hle/service/apt/applet_manager.cpp
+@@ -18,6 +18,7 @@
+ #include "core/hle/service/apt/ns.h"
+ #include "core/hle/service/cfg/cfg.h"
+ #include "core/hle/service/gsp/gsp_gpu.h"
++#include "core/hle/service/ptm/ptm.h"
+ #include "video_core/utils.h"
+ 
+ SERVICE_CONSTRUCT_IMPL(Service::APT::AppletManager)
+@@ -1766,11 +1767,77 @@ void AppletManager::HLEAppletUpdateEvent(std::uintptr_t user_data, s64 cycles_la
+     }
+ }
+ 
++void AppletManager::RequestShellState(bool closed) {
++    requested_shell_state.store(closed ? 1 : 0);
++}
++
++void AppletManager::ApplyShellState(bool closed) {
++    if (closed == shell_closed) {
++        return;
++    }
++    shell_closed = closed;
++    if (const auto ptm = Service::PTM::GetModule(system)) {
++        ptm->SetShellOpen(!closed);
++    }
++
++    if (closed) {
++        LOG_INFO(Service_APT, "3DS lid closed: asking the software to sleep");
++        sleep_query_pending = true;
++        SendNotificationToAll(Notification::SleepQuery);
++        return;
++    }
++
++    if (sleeping) {
++        LOG_INFO(Service_APT, "3DS lid opened: waking up");
++        SendNotificationToAll(Notification::SleepAwake);
++    } else if (sleep_query_pending) {
++        LOG_INFO(Service_APT, "3DS lid opened before the software accepted sleep");
++        SendNotificationToAll(Notification::SleepCancelledByOpen);
++    } else {
++        LOG_INFO(Service_APT, "3DS lid opened");
++    }
++    sleeping = false;
++    sleep_query_pending = false;
++}
++
++void AppletManager::ReplySleepQuery(AppletId from_applet_id, SleepQueryReply reply) {
++    if (!shell_closed || !sleep_query_pending) {
++        return; // a reply without a lid close (or after opening it again)
++    }
++    switch (reply) {
++    case SleepQueryReply::Accept: {
++        LOG_INFO(Service_APT, "{:03X} accepts sleep", from_applet_id);
++        sleep_query_pending = false;
++        sleeping = true;
++        const auto slot = GetAppletSlotFromId(from_applet_id);
++        if (slot != AppletSlot::Error) {
++            const auto slot_data = GetAppletSlot(slot);
++            if (slot_data->registered) {
++                slot_data->notification = Notification::SleepAccepted;
++                slot_data->notification_event->Signal();
++            }
++        }
++        break;
++    }
++    case SleepQueryReply::Reject:
++        LOG_INFO(Service_APT, "{:03X} doesn't want to sleep now", from_applet_id);
++        sleep_query_pending = false;
++        break;
++    case SleepQueryReply::Later:
++    default:
++        break; // it replies again when it's ready
++    }
++}
++
+ void AppletManager::ButtonUpdateEvent(std::uintptr_t user_data, s64 cycles_late) {
+     if (is_device_reload_pending.exchange(false)) {
+         LoadInputDevices();
+     }
+ 
++    if (const int lid = requested_shell_state.exchange(-1); lid >= 0) {
++        ApplyShellState(lid == 1);
++    }
++
+     // NOTE: We technically do support loading and jumping to home menu even if it isn't
+     // initially registered. However since the home menu suspend is not bug-free, we don't
+     // want normal users who didn't launch the home menu accidentally pressing the home
+diff --git a/src/core/hle/service/apt/applet_manager.h b/src/core/hle/service/apt/applet_manager.h
+index f93318b..c88f8bb 100644
+--- a/src/core/hle/service/apt/applet_manager.h
++++ b/src/core/hle/service/apt/applet_manager.h
+@@ -279,6 +279,18 @@ public:
+ 
+     void ReloadInputDevices();
+ 
++    /**
++     * Closes or opens the 3DS lid (frontend action, any thread). Applied on the emulation thread:
++     * closing asks the running software to sleep (SleepQuery); when it accepts (ReplySleepQuery),
++     * it is told the sleep is on (SleepAccepted). Opening wakes it (SleepAwake), or cancels a
++     * sleep it didn't accept yet (SleepCancelledByOpen). Emulation keeps running meanwhile, so
++     * the clock and the virtual pedometer go on as on a sleeping 3DS.
++     */
++    void RequestShellState(bool closed);
++
++    /// A reply to SleepQuery (APT ReplySleepQuery).
++    void ReplySleepQuery(AppletId from_applet_id, SleepQueryReply reply);
++
+     /**
+      * Clears any existing parameter and places a new one. This function is currently only used by
+      * HLE Applets and should be likely removed in the future
+@@ -529,6 +541,13 @@ private:
+ 
+     Core::TimingEventType* button_update_event;
+     std::atomic<bool> is_device_reload_pending{true};
++
++    /// Lid state asked for by the frontend: -1 nothing new, 0 open, 1 closed.
++    std::atomic<int> requested_shell_state{-1};
++    bool shell_closed = false;
++    bool sleep_query_pending = false;
++    bool sleeping = false;
++    void ApplyShellState(bool closed);
+     std::unique_ptr<Input::ButtonDevice> home_button;
+     std::unique_ptr<Input::ButtonDevice> power_button;
+     bool last_home_button_state = false;
+diff --git a/src/core/hle/service/apt/apt.cpp b/src/core/hle/service/apt/apt.cpp
+index 65210e8..b25b72d 100644
+--- a/src/core/hle/service/apt/apt.cpp
++++ b/src/core/hle/service/apt/apt.cpp
+@@ -1068,8 +1068,9 @@ void Module::APTInterface::ReplySleepQuery(Kernel::HLERequestContext& ctx) {
+     const auto from_app_id = rp.PopEnum<AppletId>();
+     const auto reply_value = rp.PopEnum<SleepQueryReply>();
+ 
+-    LOG_WARNING(Service_APT, "(STUBBED) called, from_app_id={:08X}, reply_value={:08X}",
+-                from_app_id, reply_value);
++    LOG_DEBUG(Service_APT, "called, from_app_id={:08X}, reply_value={:08X}", from_app_id,
++              reply_value);
++    apt->applet_manager->ReplySleepQuery(from_app_id, reply_value);
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(ResultSuccess);
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index 0fa5ef8..f3a6147 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -530,6 +530,11 @@ void Module::SetPlayCoins(u16 play_coins) {
+ Module::Interface::Interface(std::shared_ptr<Module> ptm, const char* name, u32 max_session)
+     : ServiceFramework(name, max_session), ptm(std::move(ptm)) {}
+ 
++std::shared_ptr<Module> GetModule(Core::System& system) {
++    const auto ptm = system.ServiceManager().GetService<Module::Interface>("ptm:u");
++    return ptm ? ptm->GetModule() : nullptr;
++}
++
+ void InstallInterfaces(Core::System& system) {
+     auto& service_manager = system.ServiceManager();
+     auto ptm = std::make_shared<Module>(system);
+diff --git a/src/core/hle/service/ptm/ptm.h b/src/core/hle/service/ptm/ptm.h
+index af43ed9..d768cfe 100644
+--- a/src/core/hle/service/ptm/ptm.h
++++ b/src/core/hle/service/ptm/ptm.h
+@@ -235,10 +235,24 @@ public:
+          */
+         void GetSystemTime(Kernel::HLERequestContext& ctx);
+ 
++    public:
++        std::shared_ptr<Module> GetModule() const {
++            return ptm;
++        }
++
+     protected:
+         std::shared_ptr<Module> ptm;
+     };
+ 
++    /// The 3DS lid ("shell"): closed with the frontend's Close lid action (see APT
++    /// AppletManager::RequestShellState). GetShellState reports it.
++    void SetShellOpen(bool open) {
++        shell_open = open;
++    }
++    bool IsShellOpen() const {
++        return shell_open;
++    }
++
+ private:
+     Core::System& system;
+ 
+@@ -261,6 +275,9 @@ private:
+     friend class boost::serialization::access;
+ };
+ 
++/// The PTM module of the running system, or nullptr.
++std::shared_ptr<Module> GetModule(Core::System& system);
++
+ void InstallInterfaces(Core::System& system);
+ 
+ } // namespace Service::PTM
+-- 
+2.43.0
+
