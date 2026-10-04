@@ -1,0 +1,49 @@
+From 532f29a30a30e60670cbf2bf604c37e54b81fa6d Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 3 Oct 2026 00:18:54 +0200
+Subject: [PATCH] loader: write a started title's code to dump/code/ when that
+ folder exists
+
+Tools that look into a game's own code (the server package's find_nex_key.py
+looks for a game's NEX access key) can't read encrypted game files without
+the console keys. Tangelo already has the code decrypted and decompressed when
+it starts a title, so it writes it to <user>/dump/code/<program id>.bin, but
+only when the user made that folder, and only once per title.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/loader/ncch.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/core/loader/ncch.cpp b/src/core/loader/ncch.cpp
+index 86f9709..335cd4c 100644
+--- a/src/core/loader/ncch.cpp
++++ b/src/core/loader/ncch.cpp
+@@ -146,6 +146,23 @@ ResultStatus AppLoader_NCCH::LoadExec(std::shared_ptr<Kernel::Process>& process)
+             return ResultStatus::ErrorGbaTitle;
+         }
+ 
++        // Decrypted, decompressed code of a started title, for tools that look into a game's
++        // own code (e.g. the server package's find_nex_key.py for a NEX access key). Only when
++        // the user made the folder <user>/dump/code/; written once per title.
++        const std::string code_dump_dir =
++            FileUtil::GetUserPath(FileUtil::UserPath::DumpDir) + "code/";
++        if (FileUtil::IsDirectory(code_dump_dir)) {
++            const std::string code_dump = fmt::format("{}{:016X}.bin", code_dump_dir, program_id);
++            if (!FileUtil::Exists(code_dump)) {
++                FileUtil::IOFile file(code_dump, "wb");
++                if (file.IsOpen() && file.WriteBytes(code.data(), code.size()) == code.size()) {
++                    LOG_INFO(Loader, "Code of {:016X} written to {}", program_id, code_dump);
++                } else {
++                    LOG_ERROR(Loader, "Could not write {}", code_dump);
++                }
++            }
++        }
++
+         std::string process_name = Common::StringFromFixedZeroTerminatedBuffer(
+             (const char*)overlay_ncch->exheader_header.codeset_info.name, 8);
+ 
+-- 
+2.43.0
+
