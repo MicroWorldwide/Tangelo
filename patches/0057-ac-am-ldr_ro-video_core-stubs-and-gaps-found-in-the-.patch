@@ -1,0 +1,361 @@
+From 72ffad8d1b2234b1d2d6ddbab395641becb5c29e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 5 Oct 2026 21:38:18 +0200
+Subject: [PATCH] ac, am, ldr_ro, video_core: stubs and gaps found in the game
+ library sweep
+
+- ac:u/ac:i: GetLastErrorCode and GetLastDetailErrorCode (0x000A/0x000B, error 0),
+  SetNetworkArea (0x0025, config handed back), GetConnectingSecurityMode (0x0033, open),
+  GetConnectingSsid / GetConnectingSsidLength (0x0034/0x0035, the same virtual access point
+  GetCurrentAPInfo reports).
+- am:app: IsDataTitleInUse (0x1009): no add-on title is ever busy.
+- ldr_ro: CRO relocations for ARM branches (R_ARM_CALL incl. BLX into Thumb, R_ARM_JUMP24),
+  Thumb BL/BLX (R_ARM_THM_CALL) and R_ARM_PREL31, which were unimplemented (Mario Sports
+  Superstars loading/unloading the uniform_core CRO). Clearing keeps branch instructions;
+  the reset batches point them at the unresolved-symbol handler.
+- video_core: texture types 5-7 no longer log a critical error / stop debug builds
+  (type 7 in Mario Sports Superstars); rendering unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp                | 67 +++++++++++++++++++
+ src/core/hle/service/ac/ac.h                  | 16 +++++
+ src/core/hle/service/ac/ac_i.cpp              |  7 +-
+ src/core/hle/service/ac/ac_u.cpp              |  7 +-
+ src/core/hle/service/am/am.cpp                | 13 ++++
+ src/core/hle/service/am/am.h                  |  7 ++
+ src/core/hle/service/am/am_app.cpp            |  2 +-
+ src/core/hle/service/ldr_ro/cro_helper.cpp    | 51 +++++++++++---
+ .../shader/generator/glsl_fs_shader_gen.cpp   |  7 +-
+ .../shader/generator/spv_fs_shader_gen.cpp    |  6 +-
+ 10 files changed, 166 insertions(+), 17 deletions(-)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index d98c961..9e0f432 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -233,6 +233,73 @@ void Module::Interface::GetConnectingProxyEnable(Kernel::HLERequestContext& ctx)
+     LOG_WARNING(Service_AC, "(STUBBED) called");
+ }
+ 
++void Module::Interface::GetLastErrorCode(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0); // no connection error
++
++    LOG_DEBUG(Service_AC, "called");
++}
++
++void Module::Interface::SetNetworkArea(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 area = rp.Pop<u32>();
++    const std::vector<u8>& ac_config = rp.PopStaticBuffer();
++
++    // Like SetFromApplication: only the real connection logic uses it; the config goes back.
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(ac_config), 0);
++
++    LOG_DEBUG(Service_AC, "called, area={}", area);
++}
++
++namespace {
++/// The SSID Tangelo's virtual access point has while connected (see GetCurrentAPInfo).
++std::string_view ConnectingSsid(bool connected) {
++    if (!connected) {
++        return {};
++    }
++    return IsNintendoZoneMode() ? NintendoZoneSSID : std::string_view{"Tangelo"};
++}
++} // namespace
++
++void Module::Interface::GetConnectingSecurityMode(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(0); // open network, like a Nintendo Zone hotspot
++
++    LOG_DEBUG(Service_AC, "called");
++}
++
++void Module::Interface::GetConnectingSsid(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    const std::string_view ssid = ConnectingSsid(ac->ac_connected);
++    std::vector<u8> buffer(0x20, 0);
++    std::memcpy(buffer.data(), ssid.data(), std::min(ssid.size(), buffer.size()));
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(buffer), 0);
++
++    LOG_DEBUG(Service_AC, "called, ssid={}", ssid);
++}
++
++void Module::Interface::GetConnectingSsidLength(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(static_cast<u32>(ConnectingSsid(ac->ac_connected).size()));
++
++    LOG_DEBUG(Service_AC, "called");
++}
++
+ void Module::Interface::GetCurrentAPInfo(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u32 size = rp.Pop<u32>();
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index 0e97c91..d17a78e 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -180,6 +180,22 @@ public:
+          */
+         void GetConnectingProxyEnable(Kernel::HLERequestContext& ctx);
+ 
++        /// AC::GetLastErrorCode (0x000A) / GetLastDetailErrorCode (0x000B): u32 error code, 0
++        /// because Tangelo's connection never fails.
++        void GetLastErrorCode(Kernel::HLERequestContext& ctx);
++
++        /// AC::SetNetworkArea (0x0025): u32 area + ACConfig in, ACConfig back.
++        void SetNetworkArea(Kernel::HLERequestContext& ctx);
++
++        /// AC::GetConnectingSecurityMode (0x0033): u32 security mode of the access point.
++        void GetConnectingSecurityMode(Kernel::HLERequestContext& ctx);
++
++        /// AC::GetConnectingSsid (0x0034): the access point's SSID in a 0x20-byte static buffer.
++        void GetConnectingSsid(Kernel::HLERequestContext& ctx);
++
++        /// AC::GetConnectingSsidLength (0x0035): u32 length of that SSID.
++        void GetConnectingSsidLength(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::IsConnected service function
+          *  Outputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index 5efcc55..1c4cf56 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -16,7 +16,8 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x0007, &AC_I::CancelConnectAsync, "CancelConnectAsync"},
+         {0x0008, &AC_I::CloseAsync, "CloseAsync"},
+         {0x0009, &AC_I::GetCloseResult, "GetCloseResult"},
+-        {0x000A, nullptr, "GetLastErrorCode"},
++        {0x000A, &AC_I::GetLastErrorCode, "GetLastErrorCode"},
++        {0x000B, &AC_I::GetLastErrorCode, "GetLastDetailErrorCode"},
+         {0x000C, &AC_I::GetStatus, "GetStatus"},
+         {0x000D, &AC_I::GetWifiStatus, "GetWifiStatus"},
+         {0x000E, &AC_I::GetCurrentAPInfo, "GetCurrentAPInfo"},
+@@ -26,11 +27,15 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x0014, &AC_I::GetConnectingLocation, "GetConnectingLocation"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
++        {0x0025, &AC_I::SetNetworkArea, "SetNetworkArea"},
+         {0x0027, &AC_I::GetInfraPriority, "GetInfraPriority"},
+         {0x002C, &AC_I::SetFromApplication, "SetFromApplication"},
+         {0x002D, &AC_I::SetRequestEulaVersion, "SetRequestEulaVersion"},
+         {0x002F, &AC_I::GetNZoneBeaconNotFoundEvent, "GetNZoneBeaconNotFoundEvent"},
+         {0x0030, &AC_I::RegisterDisconnectEvent, "RegisterDisconnectEvent"},
++        {0x0033, &AC_I::GetConnectingSecurityMode, "GetConnectingSecurityMode"},
++        {0x0034, &AC_I::GetConnectingSsid, "GetConnectingSsid"},
++        {0x0035, &AC_I::GetConnectingSsidLength, "GetConnectingSsidLength"},
+         {0x0036, &AC_I::GetConnectingProxyEnable, "GetConnectingProxyEnable"},
+         {0x003C, nullptr, "GetAPSSIDList"},
+         {0x003E, &AC_I::IsConnected, "IsConnected"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 9526b48..414b6ea 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -16,7 +16,8 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x0007, &AC_U::CancelConnectAsync, "CancelConnectAsync"},
+         {0x0008, &AC_U::CloseAsync, "CloseAsync"},
+         {0x0009, &AC_U::GetCloseResult, "GetCloseResult"},
+-        {0x000A, nullptr, "GetLastErrorCode"},
++        {0x000A, &AC_U::GetLastErrorCode, "GetLastErrorCode"},
++        {0x000B, &AC_U::GetLastErrorCode, "GetLastDetailErrorCode"},
+         {0x000C, &AC_U::GetStatus, "GetStatus"},
+         {0x000D, &AC_U::GetWifiStatus, "GetWifiStatus"},
+         {0x000E, &AC_U::GetCurrentAPInfo, "GetCurrentAPInfo"},
+@@ -26,11 +27,15 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x0014, &AC_U::GetConnectingLocation, "GetConnectingLocation"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
++        {0x0025, &AC_U::SetNetworkArea, "SetNetworkArea"},
+         {0x0027, &AC_U::GetInfraPriority, "GetInfraPriority"},
+         {0x002C, &AC_U::SetFromApplication, "SetFromApplication"},
+         {0x002D, &AC_U::SetRequestEulaVersion, "SetRequestEulaVersion"},
+         {0x002F, &AC_U::GetNZoneBeaconNotFoundEvent, "GetNZoneBeaconNotFoundEvent"},
+         {0x0030, &AC_U::RegisterDisconnectEvent, "RegisterDisconnectEvent"},
++        {0x0033, &AC_U::GetConnectingSecurityMode, "GetConnectingSecurityMode"},
++        {0x0034, &AC_U::GetConnectingSsid, "GetConnectingSsid"},
++        {0x0035, &AC_U::GetConnectingSsidLength, "GetConnectingSsidLength"},
+         {0x0036, &AC_U::GetConnectingProxyEnable, "GetConnectingProxyEnable"},
+         {0x003C, nullptr, "GetAPSSIDList"},
+         {0x003E, &AC_U::IsConnected, "IsConnected"},
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index b127e1f..4e59511 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -3254,6 +3254,19 @@ void Module::Interface::QueryAvailableTitleDatabase(Kernel::HLERequestContext& c
+     LOG_WARNING(Service_AM, "(STUBBED) media_type={}", media_type);
+ }
+ 
++void Module::Interface::IsDataTitleInUse(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const auto media_type = rp.Pop<u8>();
++    const u64 title_id = rp.Pop<u64>();
++
++    // Nothing in Tangelo installs or updates add-on content behind a running game's back.
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
++    rb.Push(ResultSuccess);
++    rb.Push(false);
++
++    LOG_DEBUG(Service_AM, "called, media_type={}, title_id={:016X}", media_type, title_id);
++}
++
+ void Module::Interface::IsExternalTitleDatabaseInitialized(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+diff --git a/src/core/hle/service/am/am.h b/src/core/hle/service/am/am.h
+index ba84239..3409c74 100644
+--- a/src/core/hle/service/am/am.h
++++ b/src/core/hle/service/am/am.h
+@@ -765,6 +765,13 @@ public:
+          */
+         void IsExternalTitleDatabaseInitialized(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AM::IsDataTitleInUse (am:app 0x1009, IsDLCTitleInUse on 3dbrew)
++         *  Inputs: 1 media type (u8), 2-3 title ID (u64)
++         *  Outputs: 1 result, 2 bool: whether the add-on title is being used (installed/updated)
++         */
++        void IsDataTitleInUse(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AM::GetPersonalizedTicketInfoList service function
+          *  Inputs:
+diff --git a/src/core/hle/service/am/am_app.cpp b/src/core/hle/service/am/am_app.cpp
+index 9054daa..774da0b 100644
+--- a/src/core/hle/service/am/am_app.cpp
++++ b/src/core/hle/service/am/am_app.cpp
+@@ -18,7 +18,7 @@ AM_APP::AM_APP(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x1006, nullptr, "GetNumDataTitleTickets"},
+         {0x1007, &AM_APP::ListDataTitleTicketInfos, "ListDataTitleTicketInfos"},
+         {0x1008, nullptr, "GetItemRights"},
+-        {0x1009, nullptr, "IsDataTitleInUse"},
++        {0x1009, &AM_APP::IsDataTitleInUse, "IsDataTitleInUse"},
+         {0x100A, &AM_APP::IsExternalTitleDatabaseInitialized, "IsExternalTitleDatabaseInitialized"},
+         {0x100B, nullptr, "GetNumExistingContentInfos"},
+         {0x100C, nullptr, "ListExistingContentInfos"},
+diff --git a/src/core/hle/service/ldr_ro/cro_helper.cpp b/src/core/hle/service/ldr_ro/cro_helper.cpp
+index ac0e9c1..19e6593 100644
+--- a/src/core/hle/service/ldr_ro/cro_helper.cpp
++++ b/src/core/hle/service/ldr_ro/cro_helper.cpp
+@@ -78,13 +78,48 @@ Result CROHelper::ApplyRelocation(VAddr target_address, RelocationType relocatio
+         system.Memory().Write32(target_address, symbol_address + addend - target_future_address);
+         system.InvalidateCacheRange(target_address, sizeof(u32));
+         break;
+-    case RelocationType::ThumbBranch:
+-    case RelocationType::ArmBranch:
+-    case RelocationType::ModifyArmBranch:
+-    case RelocationType::AlignedRelativeAddress:
+-        // TODO(wwylele): implement other types
+-        UNIMPLEMENTED();
++    case RelocationType::ArmBranch:       // R_ARM_CALL: BL/BLX imm24
++    case RelocationType::ModifyArmBranch: { // R_ARM_JUMP24: B/BL imm24
++        u32 instruction = system.Memory().Read32(target_address);
++        const bool to_thumb = (symbol_address & 1) != 0;
++        const s32 offset =
++            static_cast<s32>((symbol_address & ~1u) + addend - target_future_address);
++        if (relocation_type == RelocationType::ArmBranch && to_thumb) {
++            // A call into Thumb code becomes BLX (unconditional, H bit = halfword offset).
++            instruction = 0xFA000000 | ((static_cast<u32>(offset) & 2) << 23) |
++                          ((static_cast<u32>(offset) >> 2) & 0x00FFFFFF);
++        } else {
++            if (relocation_type == RelocationType::ArmBranch && (instruction >> 28) == 0xF) {
++                instruction = 0xEB000000; // a BLX into ARM code becomes BL again
++            }
++            instruction = (instruction & 0xFF000000) | ((static_cast<u32>(offset) >> 2) & 0x00FFFFFF);
++        }
++        system.Memory().Write32(target_address, instruction);
++        system.InvalidateCacheRange(target_address, sizeof(u32));
+         break;
++    }
++    case RelocationType::ThumbBranch: { // R_ARM_THM_CALL: Thumb BL/BLX pair
++        const bool to_arm = (symbol_address & 1) == 0;
++        // BLX into ARM code is relative to the word-aligned PC.
++        const u32 base = to_arm ? (target_future_address & ~3u) : target_future_address;
++        const u32 offset = (symbol_address & ~1u) + addend - base;
++        const u16 high = static_cast<u16>(0xF000 | ((offset >> 12) & 0x07FF));
++        u16 low = static_cast<u16>((to_arm ? 0xE800 : 0xF800) | ((offset >> 1) & 0x07FF));
++        if (to_arm) {
++            low &= ~1; // BLX targets must be word aligned
++        }
++        system.Memory().Write16(target_address, high);
++        system.Memory().Write16(target_address + 2, low);
++        system.InvalidateCacheRange(target_address, sizeof(u32));
++        break;
++    }
++    case RelocationType::AlignedRelativeAddress: { // R_ARM_PREL31
++        const u32 old_value = system.Memory().Read32(target_address);
++        const u32 value = (symbol_address + addend - target_future_address) & 0x7FFFFFFF;
++        system.Memory().Write32(target_address, (old_value & 0x80000000) | value);
++        system.InvalidateCacheRange(target_address, sizeof(u32));
++        break;
++    }
+     default:
+         return CROFormatError(0x22);
+     }
+@@ -105,8 +140,8 @@ Result CROHelper::ClearRelocation(VAddr target_address, RelocationType relocatio
+     case RelocationType::ArmBranch:
+     case RelocationType::ModifyArmBranch:
+     case RelocationType::AlignedRelativeAddress:
+-        // TODO(wwylele): implement other types
+-        UNIMPLEMENTED();
++        // Branches keep their instruction bits: an unloaded module's branches are pointed at the
++        // unresolved-symbol handler by the reset batches instead, so nothing is cleared here.
+         break;
+     default:
+         return CROFormatError(0x22);
+diff --git a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
+index 912a988..0488a5b 100644
+--- a/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
++++ b/src/video_core/shader/generator/glsl_fs_shader_gen.cpp
+@@ -1726,9 +1726,10 @@ void FragmentModule::DefineTexUnitSampler(u32 texture_unit) {
+             out += "return shadowTextureCube(texcoord0, texcoord0_w);";
+             break;
+         default:
+-            LOG_CRITICAL(HW_GPU, "Unhandled texture type {:x}",
+-                         config.texture.texture0_type.Value());
+-            UNIMPLEMENTED();
++            // Types 5-7 (disabled / undocumented, e.g. type 7 in Mario Sports Superstars): sample
++            // as a plain 2D texture, as before, without stopping debug builds.
++            LOG_DEBUG(HW_GPU, "Texture type {:x} sampled as 2D",
++                      config.texture.texture0_type.Value());
+             out += "return texture(tex0, texcoord0);";
+             break;
+         }
+diff --git a/src/video_core/shader/generator/spv_fs_shader_gen.cpp b/src/video_core/shader/generator/spv_fs_shader_gen.cpp
+index fed16ad..58a13a5 100644
+--- a/src/video_core/shader/generator/spv_fs_shader_gen.cpp
++++ b/src/video_core/shader/generator/spv_fs_shader_gen.cpp
+@@ -1021,9 +1021,9 @@ void FragmentModule::DefineTexSampler(u32 texture_unit) {
+             // return "shadowTextureCube(texcoord0, texcoord0_w)";
+             break;
+         default:
+-            LOG_CRITICAL(Render, "Unhandled texture type {:x}",
+-                         config.texture.texture0_type.Value());
+-            UNIMPLEMENTED();
++            // Types 5-7 (disabled / undocumented): no texture, without stopping debug builds.
++            LOG_DEBUG(Render, "Texture type {:x} sampled as zero",
++                      config.texture.texture0_type.Value());
+             ret_val = zero_vec;
+             break;
+         }
+-- 
+2.43.0
+
