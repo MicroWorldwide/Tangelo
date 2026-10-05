@@ -1,0 +1,104 @@
+From 30f0ff86f4dd307d2c1756ef1bae1d60833b701f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 5 Oct 2026 19:50:55 +0200
+Subject: [PATCH] http: save Nintendo's answers to dump/http/ when that folder
+ exists
+
+A stand-in for Nintendo's eShop servers has to answer what Nintendo's own
+servers answer, and some of those (ninja: country, service_hosts) are only
+reachable with the console's client certificate, which only Tangelo has.
+When Tangelo talks to Nintendo directly (Nintendo services = Nintendo's
+servers) and the user made <user>/dump/http/, every answer from a Nintendo
+host is saved there in the server package's eShop archive layout:
+<host>/<path>@<query> for GET (HTTP 200 only), and
+<host>/<path>@POST-<SOAP method>.xml for SOAP replies (to compare with).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/http/http_c.cpp | 56 ++++++++++++++++++++++++++++
+ src/core/hle/service/http/http_c.h   |  1 +
+ 2 files changed, 57 insertions(+)
+
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 5797522..b01413b 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -353,6 +353,62 @@ void Context::MakeRequest() {
+     }
+ 
+     LogSoapResult();
++    if (!original_host) {
++        RecordNintendoResponse(request.method);
++    }
++}
++
++void Context::RecordNintendoResponse(const std::string& request_method) const {
++    // Saves what Nintendo's own servers answer, so a server stand-in can serve the same thing
++    // later (the eShop's ninja and samurai pages, SOAP replies to compare with). Only when the
++    // user made the folder <user>/dump/http/, like the code dump. Layout as the server package's
++    // eShop archive: <host>/<path>@<query>; POST replies get "@POST-<SOAP method>.xml".
++    if (state != RequestState::ReceivingBody || response.body.empty()) {
++        return;
++    }
++    const std::string dump_dir = FileUtil::GetUserPath(FileUtil::UserPath::DumpDir) + "http/";
++    if (!FileUtil::IsDirectory(dump_dir)) {
++        return;
++    }
++    const Common::URLInfo info = Common::SplitUrl(url);
++    if (!IsNintendoHost(info.host)) {
++        return;
++    }
++    std::string path = info.path;
++    const auto query_start = path.find('?');
++    std::string query;
++    if (query_start != std::string::npos) {
++        query = path.substr(query_start + 1);
++        path = path.substr(0, query_start);
++    }
++    if (path.find("..") != std::string::npos || info.host.find("..") != std::string::npos) {
++        return;
++    }
++    std::string name = info.host + path;
++    if (request_method == "GET") {
++        if (response.status != 200) {
++            return;
++        }
++        if (!query.empty()) {
++            name += "@" + query;
++        }
++    } else {
++        const auto soap = ParseSoapResult(response.body);
++        name += fmt::format("@{}-{}.xml", request_method,
++                            soap && !soap->operation.empty() ? soap->operation : "response");
++    }
++    for (char& c : name) {
++        if (c == ':' || c == '*' || c == '"' || c == '<' || c == '>' || c == '|' || c == '\\') {
++            c = '_'; // not allowed in Windows file names
++        }
++    }
++    const std::string target = dump_dir + name;
++    FileUtil::CreateFullPath(target);
++    FileUtil::IOFile file(target, "wb");
++    if (file.IsOpen() &&
++        file.WriteBytes(response.body.data(), response.body.size()) == response.body.size()) {
++        LOG_INFO(Service_HTTP, "Nintendo's answer for {} saved as {}", url, target);
++    }
+ }
+ 
+ void Context::LogSoapResult() const {
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index 2f96e3c..9e04566 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -318,6 +318,7 @@ public:
+     void MakeRequest();
+     /// Logs the result of eShop/NUS SOAP replies (they fail with HTTP 200).
+     void LogSoapResult() const;
++    void RecordNintendoResponse(const std::string& request_method) const;
+     void MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo& url_info,
+                            std::vector<Context::RequestHeader>& pending_headers);
+     void MakeRequestSSL(httplib::Request& request, const Common::URLInfo& url_info,
+-- 
+2.43.0
+

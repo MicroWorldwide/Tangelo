@@ -1,0 +1,127 @@
+From e0854d52b9992b151b175a7e3b38bb90008c73a3 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 5 Oct 2026 20:36:11 +0200
+Subject: [PATCH] kernel: log IPC replies that carry a failure result
+
+Both HLE services and LLE system modules (nim, act, frd, ...) are covered,
+so a program that gives up after a failed system call (e.g. the eShop's
+own error 007-6509) shows which call failed: server and client process,
+command id and result (module, description). Each server/command/result
+combination is logged at most three times.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/kernel/hle_ipc.cpp |  7 +++++++
+ src/core/hle/kernel/ipc.cpp     | 26 ++++++++++++++++++++++++++
+ src/core/hle/kernel/ipc.h       |  8 ++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/src/core/hle/kernel/hle_ipc.cpp b/src/core/hle/kernel/hle_ipc.cpp
+index b2919c6..ddedb5c 100644
+--- a/src/core/hle/kernel/hle_ipc.cpp
++++ b/src/core/hle/kernel/hle_ipc.cpp
+@@ -15,6 +15,7 @@
+ #include "core/hle/kernel/event.h"
+ #include "core/hle/kernel/handle_table.h"
+ #include "core/hle/kernel/hle_ipc.h"
++#include "core/hle/kernel/ipc.h"
+ #include "core/hle/kernel/ipc_debugger/recorder.h"
+ #include "core/hle/kernel/kernel.h"
+ #include "core/hle/kernel/process.h"
+@@ -243,6 +244,12 @@ Result HLERequestContext::WriteToOutgoingCommandBuffer(u32_le* dst_cmdbuf,
+ 
+     std::size_t untranslated_size = 1u + header.normal_params_size;
+     std::size_t command_size = untranslated_size + header.translate_params_size;
++
++    // A reply from an HLE service with a failure result.
++    if (header.normal_params_size >= 1 && (cmd_buf[1] & 0x80000000) != 0) {
++        LogFailedReply(session ? session->GetName() : "HLE", dst_process.GetName(), header.raw,
++                       cmd_buf[1]);
++    }
+     ASSERT(command_size <= IPC::COMMAND_BUFFER_LENGTH);
+ 
+     std::copy_n(cmd_buf.begin(), untranslated_size, dst_cmdbuf);
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 3804261..c826004 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -3,9 +3,13 @@
+ // Refer to the license.txt file included.
+ 
+ #include <algorithm>
++#include <map>
++#include <mutex>
++#include <tuple>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include "common/alignment.h"
+ #include "common/archives.h"
++#include "common/logging/log.h"
+ #include "common/memory_ref.h"
+ #include "core/core.h"
+ #include "core/hle/ipc.h"
+@@ -22,6 +26,23 @@ SERIALIZE_EXPORT_IMPL(Kernel::MappedBufferContext)
+ 
+ namespace Kernel {
+ 
++void LogFailedReply(const std::string& server, const std::string& client, u32 header,
++                    u32 result) {
++    static std::mutex mutex;
++    static std::map<std::tuple<std::string, u32, u32>, int> counts;
++    const u16 command = static_cast<u16>(header >> 16);
++    {
++        std::scoped_lock lock{mutex};
++        if (++counts[{server, command, result}] > 3) {
++            return;
++        }
++    }
++    LOG_WARNING(Kernel,
++                "IPC reply failed: {} -> {} command 0x{:04X} (header 0x{:08X}) result 0x{:08X} "
++                "(module {}, description {})",
++                server, client, command, header, result, (result >> 10) & 0xFF, result & 0x3FF);
++}
++
+ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem& memory,
+                               std::shared_ptr<Thread> src_thread,
+                               std::shared_ptr<Thread> dst_thread, VAddr src_address,
+@@ -44,6 +65,11 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+     std::array<u32, IPC::COMMAND_BUFFER_LENGTH> cmd_buf;
+     memory.ReadBlock(*src_process, src_address, cmd_buf.data(), command_size * sizeof(u32));
+ 
++    // A reply from an LLE system module (nim, act, frd, ...) with a failure result.
++    if (reply && header.normal_params_size >= 1 && (cmd_buf[1] & 0x80000000) != 0) {
++        LogFailedReply(src_process->GetName(), dst_process->GetName(), header.raw, cmd_buf[1]);
++    }
++
+     const bool should_record = kernel.GetIPCRecorder().IsEnabled();
+ 
+     std::vector<u32> untranslated_cmdbuf;
+diff --git a/src/core/hle/kernel/ipc.h b/src/core/hle/kernel/ipc.h
+index fd69c3e..0ea0b6a 100644
+--- a/src/core/hle/kernel/ipc.h
++++ b/src/core/hle/kernel/ipc.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <string>
+ #include <vector>
+ #include <boost/serialization/export.hpp>
+ #include "common/common_types.h"
+@@ -39,6 +40,13 @@ Result TranslateCommandBuffer(KernelSystem& system, Memory::MemorySystem& memory
+                               std::shared_ptr<Thread> dst_thread, VAddr src_address,
+                               VAddr dst_address,
+                               std::vector<MappedBufferContext>& mapped_buffer_context, bool reply);
++
++/**
++ * Logs a reply whose result word is a failure (both for HLE services and for LLE system
++ * modules), so a program that gives up after a failed system call shows which call it was.
++ * Each (server, command, result) combination is logged at most a few times.
++ */
++void LogFailedReply(const std::string& server, const std::string& client, u32 header, u32 result);
+ } // namespace Kernel
+ 
+ BOOST_CLASS_EXPORT_KEY(Kernel::MappedBufferContext)
+-- 
+2.43.0
+
