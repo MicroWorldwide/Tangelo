@@ -1,0 +1,125 @@
+From cafe6b0d79e6d81ef946141de3fb32d986f89992 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 6 Oct 2026 14:37:09 +0200
+Subject: [PATCH] http: send raw post data of a known size without chunked
+ framing
+
+When a game announces the size of its raw post data (SetPostDataTypeSize),
+http:C sent a Content-Length header and chunked transfer encoding at the
+same time. That is invalid HTTP: nginx refuses it with 400 Bad Request
+(Swapdoodle's game server calls, 004-7004) and other servers read the
+chunk sizes as part of the body (the Badge Arcade upload repaired in the
+server package). Such data now goes out as a plain body of the announced
+length; data without a known size is still sent chunked.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/http/http_c.cpp | 50 +++++++++++++++++++++++-----
+ src/core/hle/service/http/http_c.h   |  5 +++
+ 2 files changed, 47 insertions(+), 8 deletions(-)
+
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index b01413b..63a243a 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <tuple>
+ #include <unordered_map>
+@@ -207,7 +208,7 @@ std::size_t Context::HandleHeaderWrite(std::vector<Context::RequestHeader>& pend
+     }
+ 
+     // Fifth: Transfer-Encoding
+-    if (chunked_request) {
++    if (chunked_request && !sized_raw_request) {
+         final_headers.push_back(Context::RequestHeader("Transfer-Encoding", "chunked"));
+     }
+ 
+@@ -334,16 +335,26 @@ void Context::MakeRequest() {
+         }
+ 
+         if (post_data_type == PostDataType::Raw && chunked_content_length > 0) {
++            // The game said how big the data is: send it with that Content-Length and without
++            // chunked framing. Both at once is invalid HTTP; nginx answers it with 400 Bad
++            // Request (Swapdoodle's HPP calls) and other servers read the chunk sizes as data.
++            sized_raw_request = true;
+             pending_headers.push_back(Context::RequestHeader(
+                 "Content-Length", fmt::format("{}", chunked_content_length)));
++            request.content_length_ = chunked_content_length;
++            request.content_provider_ = [this](size_t offset, size_t length,
++                                               httplib::DataSink& sink) {
++                return SizedRawContentProvider(offset, length, sink);
++            };
++            request.is_chunked_content_provider_ = false;
++        } else {
++            request.content_length_ = 0;
++            request.content_provider_ = httplib::detail::ContentProviderAdapter(
++                [this](size_t offset, httplib::DataSink& sink) {
++                    return ChunkedContentProvider(offset, sink);
++                });
++            request.is_chunked_content_provider_ = true;
+         }
+-
+-        request.content_length_ = 0;
+-        request.content_provider_ =
+-            httplib::detail::ContentProviderAdapter([this](size_t offset, httplib::DataSink& sink) {
+-                return ChunkedContentProvider(offset, sink);
+-            });
+-        request.is_chunked_content_provider_ = true;
+     }
+ 
+     if (url_info.is_https) {
+@@ -525,6 +536,29 @@ bool Context::ContentProvider(size_t offset, size_t length, httplib::DataSink& s
+     return true;
+ }
+ 
++bool Context::SizedRawContentProvider(size_t offset, size_t length, httplib::DataSink& sink) {
++    if (offset == 0) {
++        finish_post_data.Wait();
++        sized_raw_body.clear();
++        for (const auto& data : post_data) {
++            sized_raw_body += data.second.value;
++        }
++        if (sized_raw_body.size() != chunked_content_length) {
++            // The announced Content-Length is what goes out, so the body must match it.
++            LOG_WARNING(Service_HTTP, "post data is {} bytes, the game announced {}",
++                        sized_raw_body.size(), chunked_content_length);
++            sized_raw_body.resize(chunked_content_length);
++        }
++    }
++    if (offset < sized_raw_body.size()) {
++        sink.write(sized_raw_body.data() + offset,
++                   std::min(length, sized_raw_body.size() - offset));
++    }
++    // This state is set after sending the request, even if it hasn't received a response yet
++    state = RequestState::ReceivingResponse;
++    return true;
++}
++
+ bool Context::ChunkedContentProvider(size_t offset, httplib::DataSink& sink) {
+     finish_post_data.Wait();
+ 
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index 9e04566..14a727b 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -304,6 +304,11 @@ public:
+     bool force_multipart = false;
+     bool chunked_request = false;
+     u32 chunked_content_length;
++    /// Raw post data of a size the game announced (SetPostDataTypeSize): sent with that
++    /// Content-Length and no chunked framing, see MakeRequest.
++    bool sized_raw_request = false;
++    std::string sized_raw_body;
++    bool SizedRawContentProvider(size_t offset, size_t length, httplib::DataSink& sink);
+ 
+     std::future<void> request_future;
+     std::atomic<u64> current_download_size_bytes;
+-- 
+2.43.0
+

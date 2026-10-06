@@ -1,0 +1,57 @@
+From d23039b9c2300d64711e6430bcbed2f64d1adb85 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 6 Oct 2026 15:06:03 +0200
+Subject: [PATCH] http: keep raw post data pieces in the order the game sent
+ them
+
+Raw post data (SendPostDataRaw) was stored in the sorted post_data map
+under its own contents as the name, so a request sent in several pieces
+went out with the pieces sorted by their bytes. Swapdoodle uploads a
+letter as a form header, six data pieces and a closing line; the server
+received them scrambled and refused the upload (004-7006). Pieces are now
+named by their position.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/http/http_c.cpp | 10 +++++++---
+ src/core/hle/service/http/http_c.h   |  1 +
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 63a243a..060e114 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -1417,10 +1417,14 @@ void HTTP_C::SendPostDataRawImpl(Kernel::HLERequestContext& ctx, bool timeout) {
+     std::vector<u8> value(buffer.GetSize());
+     buffer.Read(value.data(), 0, value.size());
+ 
+-    // Workaround for sending the raw data in combination of other data in chunked requests
++    // Workaround for sending the raw data in combination of other data in chunked requests.
++    // post_data is sorted by name, so each piece is named by its position: naming it by its
++    // own contents (as before) sent the pieces sorted by their bytes instead of in the order
++    // the game sent them, which scrambled any upload made in more than one piece (Swapdoodle's
++    // letters: form header, 6 data pieces and the closing line).
+     Context::Param raw_param(value);
+-    std::string value_string(value.begin(), value.end());
+-    http_context.post_data.emplace(value_string, raw_param);
++    http_context.post_data.emplace(fmt::format("\x01raw{:010}", http_context.raw_post_data_count++),
++                                   raw_param);
+     http_context.post_data_added = true;
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index 14a727b..795b441 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -307,6 +307,7 @@ public:
+     /// Raw post data of a size the game announced (SetPostDataTypeSize): sent with that
+     /// Content-Length and no chunked framing, see MakeRequest.
+     bool sized_raw_request = false;
++    u32 raw_post_data_count = 0; ///< Raw post data pieces so far, kept in this order.
+     std::string sized_raw_body;
+     bool SizedRawContentProvider(size_t offset, size_t length, httplib::DataSink& sink);
+ 
+-- 
+2.43.0
+
