@@ -1,0 +1,165 @@
+From 54fc4adb0e53d3d10d9bf5b6ca677718e98e3ea2 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 6 Oct 2026 17:05:35 +0200
+Subject: [PATCH] Revert "am, cfg: own device ID and serial for installs with
+ placeholder console data"
+
+With 0061, an install that was already registered elsewhere under the
+placeholder device ID (LocalPass, the eShop) was refused with HTTP 403:
+those services bind the console to the device ID it had when it
+registered. Back to the placeholder ID until the change can be made
+opt-in for new installs.
+
+This reverts 0061.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/am/am.cpp   | 16 ---------------
+ src/core/hle/service/cfg/cfg.cpp | 12 ++---------
+ src/core/hw/unique_data.cpp      | 34 --------------------------------
+ src/core/hw/unique_data.h        | 21 --------------------
+ 4 files changed, 2 insertions(+), 81 deletions(-)
+
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index 9291aae..4e59511 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -40,7 +40,6 @@
+ #include "core/hle/service/fs/fs_user.h"
+ #include "core/hw/aes/key.h"
+ #include "core/hw/rsa/rsa.h"
+-#include "core/hle/service/cfg/cfg.h"
+ #include "core/hw/unique_data.h"
+ #include "core/loader/loader.h"
+ #include "core/loader/ncch.h"
+@@ -2947,21 +2946,6 @@ void Module::Interface::GetDeviceID(Kernel::HLERequestContext& ctx) {
+     }
+ 
+     u32 deviceID = otp.GetDeviceID();
+-    if (HW::UniqueData::IsPlaceholderOTP()) {
+-        // Every install with the placeholder otp.bin would be the same console to online
+-        // services (eShop account, NNID devices, SpotPass); use one derived from this
+-        // install's own Console ID instead (Configure > System > Console ID).
+-        const u64 console_id = Service::CFG::GetModule(am->system)->GetConsoleUniqueId();
+-        deviceID = HW::UniqueData::DeviceIDFromConsoleID(console_id);
+-        static u32 logged_id = 0;
+-        if (logged_id != deviceID) {
+-            logged_id = deviceID;
+-            LOG_INFO(Service_AM,
+-                     "Placeholder console data: device ID {:08X} from Console ID {:016X} "
+-                     "(change it with Configure > System > Console ID > Regenerate)",
+-                     deviceID, console_id);
+-        }
+-    }
+     if (am->force_new_device_id || am->force_old_device_id) {
+         if (am->force_new_device_id) {
+             deviceID |= 0x80000000;
+diff --git a/src/core/hle/service/cfg/cfg.cpp b/src/core/hle/service/cfg/cfg.cpp
+index 7cb688f..9c6c14f 100644
+--- a/src/core/hle/service/cfg/cfg.cpp
++++ b/src/core/hle/service/cfg/cfg.cpp
+@@ -549,16 +549,8 @@ void Module::Interface::SecureInfoGetSerialNo(Kernel::HLERequestContext& ctx) {
+                        ErrorLevel::Permanent));
+     }
+ 
+-    if (HW::UniqueData::IsPlaceholderSecureInfo() && HW::UniqueData::IsPlaceholderOTP()) {
+-        // The placeholder's serial (ABC12345678) is the same for every install; give the
+-        // serial that belongs to this install's own device ID (see AM GetDeviceID).
+-        const auto serial = HW::UniqueData::SerialFromDeviceID(
+-            HW::UniqueData::DeviceIDFromConsoleID(cfg->GetConsoleUniqueId()));
+-        out_buffer.Write(serial.data(), 0, serial.size());
+-    } else {
+-        out_buffer.Write(secure_info_a.body.serial_number.data(), 0,
+-                         sizeof(HW::UniqueData::SecureInfoA::body.serial_number));
+-    }
++    out_buffer.Write(secure_info_a.body.serial_number.data(), 0,
++                     sizeof(HW::UniqueData::SecureInfoA::body.serial_number));
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+     rb.Push(ResultSuccess);
+diff --git a/src/core/hw/unique_data.cpp b/src/core/hw/unique_data.cpp
+index 523974e..2c2941f 100644
+--- a/src/core/hw/unique_data.cpp
++++ b/src/core/hw/unique_data.cpp
+@@ -2,7 +2,6 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
+-#include <cstring>
+ #include <cryptopp/sha.h>
+ #include "common/common_paths.h"
+ #include "common/file_derived.h"
+@@ -842,37 +841,4 @@ int RemoveTangeloEncryption(const std::string& path)
+ 	return ret;
+ }
+ 
+-bool IsPlaceholderOTP() {
+-    auto& otp = GetOTP();
+-    return otp.Valid() && otp.GetDeviceID() == PlaceholderDeviceID;
+-}
+-
+-bool IsPlaceholderSecureInfo() {
+-    auto& secure_info = GetSecureInfoA();
+-    static constexpr char placeholder_serial[] = "ABC12345678";
+-    return secure_info.IsValid() &&
+-           std::memcmp(secure_info.body.serial_number.data(), placeholder_serial,
+-                       sizeof(placeholder_serial)) == 0;
+-}
+-
+-u32 DeviceIDFromConsoleID(u64 console_id) {
+-    // splitmix64 finaliser: spreads the Console ID's random bits over the whole ID.
+-    u64 x = console_id + 0x9E3779B97F4A7C15ULL;
+-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+-    x ^= x >> 31;
+-    u32 device_id = static_cast<u32>(x ^ (x >> 32)) & 0x7FFFFFFF;
+-    if (device_id == 0 || device_id == PlaceholderDeviceID) {
+-        device_id ^= 0x5A5A5A5A;
+-    }
+-    return device_id;
+-}
+-
+-std::array<u8, 0xF> SerialFromDeviceID(u32 device_id) {
+-    std::array<u8, 0xF> serial{};
+-    const std::string text = fmt::format("TNG{:08d}", device_id % 100000000);
+-    std::memcpy(serial.data(), text.data(), text.size());
+-    return serial;
+-}
+-
+ } // namespace HW::UniqueData
+diff --git a/src/core/hw/unique_data.h b/src/core/hw/unique_data.h
+index 7afcd73..2337f52 100644
+--- a/src/core/hw/unique_data.h
++++ b/src/core/hw/unique_data.h
+@@ -180,27 +180,6 @@ std::unique_ptr<FileUtil::IOFileBase> OpenUniqueCryptoFile(const std::string& fi
+ bool IsFullConsoleLinked();
+ void UnlinkConsole();
+ 
+-/// Device ID of the placeholder otp.bin in circulation (the text "1234"). Every install that
+-/// uses it reports the same console to online services.
+-constexpr u32 PlaceholderDeviceID = 0x34333231;
+-
+-/// True when the loaded otp.bin is that placeholder.
+-bool IsPlaceholderOTP();
+-
+-/// True when SecureInfo_A is the built-in placeholder (serial number ABC12345678).
+-bool IsPlaceholderSecureInfo();
+-
+-/**
+- * A device ID for an install without its own console data, derived from the Console ID that
+- * every install generates for itself (Configure > System > Console ID, "Regenerate"). Stable
+- * for an install, different between installs, never 0 or the placeholder; bit 31 (New 3DS) is
+- * left clear like the placeholder's.
+- */
+-u32 DeviceIDFromConsoleID(u64 console_id);
+-
+-/// A serial number ("TNG" + 8 digits) to go with DeviceIDFromConsoleID.
+-std::array<u8, 0xF> SerialFromDeviceID(u32 device_id);
+-
+ std::vector<std::string> GetAppFilepaths();
+ int RemoveTangeloEncryption(const std::string& path);
+ int RevertEncryptionRemoval();
+-- 
+2.43.0
+

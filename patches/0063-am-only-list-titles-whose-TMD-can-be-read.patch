@@ -1,0 +1,66 @@
+From 9dcff9087aede2c6ca4490fe59172c39f5d5d821 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 6 Oct 2026 19:23:34 +0200
+Subject: [PATCH] am: only list titles whose TMD can be read
+
+GetProgramList listed every title folder whose content loads, while
+GetProgramInfos answers from the title's .tmd. A title with a readable
+00000000.app but a missing or broken .tmd (an interrupted install, content
+copied by hand) was therefore listed and then reported "not found"
+(D8A083FA), and the HOME Menu, which asks for the info of every listed
+title, stopped with a fatal error when it was opened after a game.
+
+The title scan now leaves such titles out and logs a warning naming the
+title and its folder, and the "not found" answer of GetProgramInfos is a
+warning with the title ID instead of a debug line.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/am/am.cpp | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index 4e59511..bdf8cb6 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -1539,6 +1539,24 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
+                             am_title_list[static_cast<u32>(media_type)].push_back(tid);
+                         }
+                     } else {
++                        // A title only counts as installed when its TMD can be read: that is
++                        // what GetProgramInfos answers from. Without this, a title folder with
++                        // a readable 00000000.app but a missing or broken .tmd (an interrupted
++                        // install, content copied by hand) was listed by GetProgramList and
++                        // then "not found" by GetProgramInfos, and the HOME Menu, which asks
++                        // for the info of every listed title, stopped with a fatal error
++                        // (D8A083FA).
++                        FileSys::TitleMetadata tmd;
++                        if (tmd.Load(GetTitleMetadataPath(media_type, tid)) !=
++                            Loader::ResultStatus::Success) {
++                            LOG_WARNING(Service_AM,
++                                        "Title {:016X} ({}) has no readable .tmd in {}content/: "
++                                        "left out of the installed titles; reinstall it",
++                                        tid,
++                                        media_type == FS::MediaType::NAND ? "NAND" : "SD",
++                                        GetTitlePath(media_type, tid));
++                            continue;
++                        }
+                         FileSys::NCCHContainer container(GetTitleContentPath(media_type, tid));
+                         if (container.Load() == Loader::ResultStatus::Success) {
+                             am_title_list[static_cast<u32>(media_type)].push_back(tid);
+@@ -2154,7 +2172,10 @@ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_
+                 title_info.version = tmd.GetTitleVersion();
+                 title_info.type = tmd.GetTitleType();
+             } else {
+-                LOG_DEBUG(Service_AM, "not found title_id={:016X}", title_id_list[i]);
++                // A warning: the HOME Menu stops with a fatal error on this answer, and the
++                // title ID is what tells which install is broken.
++                LOG_WARNING(Service_AM, "Title info asked for {:016X}: no readable .tmd at {}",
++                            title_id_list[i], tmd_path);
+                 return Result(ErrorDescription::NotFound, ErrorModule::AM,
+                               ErrorSummary::InvalidState, ErrorLevel::Permanent);
+             }
+-- 
+2.43.0
+
