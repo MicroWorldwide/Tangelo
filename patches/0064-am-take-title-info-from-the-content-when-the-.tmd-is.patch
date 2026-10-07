@@ -1,0 +1,119 @@
+From 2ffae44cc06571f8836f9bd235eeb378ec950219 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 7 Oct 2026 14:19:29 +0200
+Subject: [PATCH] am: take title info from the content when the .tmd is missing
+
+Patch 0063 left every title without a readable .tmd out of the installed
+titles. On one install that was all 49 SD titles (Tomodachi Life, Mario
+Golf, ...), not just two broken NAND ones: their content runs, but the
+title list (HOME Menu icons, apps that look for installed games) no
+longer had them.
+
+Back to listing every title whose content loads. When GetProgramInfos
+finds no readable .tmd, the info now comes from the title's own content
+(version from the exheader, size of the content file, type 0x40), the
+way game cards are already answered, instead of "not found" (the answer
+that made the HOME Menu stop with a fatal error). A warning names each
+such title once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/am/am.cpp | 58 ++++++++++++++++++++++------------
+ 1 file changed, 38 insertions(+), 20 deletions(-)
+
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index bdf8cb6..24fe460 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -5,6 +5,8 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cstring>
++#include <mutex>
++#include <set>
+ #include <cryptopp/aes.h>
+ #include <cryptopp/modes.h>
+ #include <fmt/format.h>
+@@ -1539,24 +1541,6 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
+                             am_title_list[static_cast<u32>(media_type)].push_back(tid);
+                         }
+                     } else {
+-                        // A title only counts as installed when its TMD can be read: that is
+-                        // what GetProgramInfos answers from. Without this, a title folder with
+-                        // a readable 00000000.app but a missing or broken .tmd (an interrupted
+-                        // install, content copied by hand) was listed by GetProgramList and
+-                        // then "not found" by GetProgramInfos, and the HOME Menu, which asks
+-                        // for the info of every listed title, stopped with a fatal error
+-                        // (D8A083FA).
+-                        FileSys::TitleMetadata tmd;
+-                        if (tmd.Load(GetTitleMetadataPath(media_type, tid)) !=
+-                            Loader::ResultStatus::Success) {
+-                            LOG_WARNING(Service_AM,
+-                                        "Title {:016X} ({}) has no readable .tmd in {}content/: "
+-                                        "left out of the installed titles; reinstall it",
+-                                        tid,
+-                                        media_type == FS::MediaType::NAND ? "NAND" : "SD",
+-                                        GetTitlePath(media_type, tid));
+-                            continue;
+-                        }
+                         FileSys::NCCHContainer container(GetTitleContentPath(media_type, tid));
+                         if (container.Load() == Loader::ResultStatus::Success) {
+                             am_title_list[static_cast<u32>(media_type)].push_back(tid);
+@@ -2111,6 +2095,38 @@ void Module::Interface::GetProgramList(Kernel::HLERequestContext& ctx) {
+     }
+ }
+ 
++// Title info for an installed title whose .tmd can't be read (content copied without it, an
++// interrupted install): taken from the title's own content, the way Process9 does it for game
++// cards. The title still runs from that content, and GetProgramList lists it; answering "not
++// found" here instead made the HOME Menu stop with a fatal error (D8A083FA). Logged once per
++// title.
++static bool TitleInfoFromContent(Service::FS::MediaType media_type, u64 title_id,
++                                 TitleInfo& title_info) {
++    const std::string content_path = GetTitleContentPath(media_type, title_id);
++    FileSys::NCCHContainer ncch_container(content_path);
++    if (ncch_container.Load() != Loader::ResultStatus::Success) {
++        return false;
++    }
++    title_info.version =
++        (*reinterpret_cast<u16_le*>(
++             &ncch_container.exheader_header.codeset_info.flags.remaster_version)
++         << 10) &
++        0xFC00;
++    title_info.size = FileUtil::GetSize(content_path);
++    title_info.type = 0x40;
++
++    static std::mutex logged_mutex;
++    static std::set<u64> logged;
++    std::scoped_lock lock{logged_mutex};
++    if (logged.insert(title_id).second) {
++        LOG_WARNING(Service_AM,
++                    "Title {:016X} has no readable .tmd in {}content/: its info (version {:04X}) "
++                    "comes from its content",
++                    title_id, GetTitlePath(media_type, title_id), title_info.version);
++    }
++    return true;
++}
++
+ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_list,
+                             Service::FS::MediaType media_type,
+                             std::vector<TitleInfo>& title_info_out) {
+@@ -2171,10 +2187,12 @@ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_
+                 title_info.size = tmd.GetContentSizeByIndex(FileSys::TMDContentIndex::Main);
+                 title_info.version = tmd.GetTitleVersion();
+                 title_info.type = tmd.GetTitleType();
+-            } else {
++            } else if (!TitleInfoFromContent(media_type, title_id_list[i], title_info)) {
+                 // A warning: the HOME Menu stops with a fatal error on this answer, and the
+                 // title ID is what tells which install is broken.
+-                LOG_WARNING(Service_AM, "Title info asked for {:016X}: no readable .tmd at {}",
++                LOG_WARNING(Service_AM,
++                            "Title info asked for {:016X}: no readable .tmd at {} and no "
++                            "readable content",
+                             title_id_list[i], tmd_path);
+                 return Result(ErrorDescription::NotFound, ErrorModule::AM,
+                               ErrorSummary::InvalidState, ErrorLevel::Permanent);
+-- 
+2.43.0
+
