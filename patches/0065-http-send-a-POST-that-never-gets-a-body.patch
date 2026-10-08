@@ -1,0 +1,134 @@
+From cca0488f734bb8d94ffec2c8f38ed34687a7dee9 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 8 Oct 2026 05:42:23 +0200
+Subject: [PATCH] http: send a POST that never gets a body
+
+BeginRequest(Async) on a POST without post data waits for the game to
+stream the body and call NotifyFinishSendPostData. The eShop closes its
+session with a bare POST (ninja/ws/my/session/!close) and never adds a
+body, so the request was never sent: closing the eShop from the HOME
+Menu hung, with GetRequestState polled thousands of times.
+
+Such a POST is now sent with an empty body as soon as the game waits for
+its answer (ReceiveData, GetResponseStatusCode), or when it has polled
+the request state for over a second without adding post data. Games that
+stream a body add it right after beginning the request and are not
+affected. A warning names the URL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/http/http_c.cpp | 23 +++++++++++++++++++++++
+ src/core/hle/service/http/http_c.h   | 13 +++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 060e114..f9ee8a9 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -679,6 +679,7 @@ void HTTP_C::BeginRequest(Kernel::HLERequestContext& ctx) {
+     if (http_context.state == RequestState::NotStarted) {
+         if (http_context.method == RequestMethod::Post && !http_context.post_data_added) {
+             http_context.post_pending_request = true;
++            http_context.post_pending_since = std::chrono::steady_clock::now();
+         } else {
+             http_context.current_copied_data = 0;
+             http_context.request_future =
+@@ -721,6 +722,7 @@ void HTTP_C::BeginRequestAsync(Kernel::HLERequestContext& ctx) {
+     if (http_context.state == RequestState::NotStarted) {
+         if (http_context.method == RequestMethod::Post && !http_context.post_data_added) {
+             http_context.post_pending_request = true;
++            http_context.post_pending_since = std::chrono::steady_clock::now();
+         } else {
+             http_context.current_copied_data = 0;
+             http_context.request_future =
+@@ -770,6 +772,7 @@ void HTTP_C::ReceiveDataImpl(Kernel::HLERequestContext& ctx, bool timeout) {
+     if (!PerformStateChecks(ctx, rp, async_data->context_handle)) {
+         return;
+     }
++    StartAbandonedPost(GetContext(async_data->context_handle), true);
+ 
+     ctx.RunAsync(
+         [this, async_data](Kernel::HLERequestContext& ctx) {
+@@ -946,6 +949,23 @@ void HTTP_C::CancelConnection(Kernel::HLERequestContext& ctx) {
+     rb.Push(ResultSuccess);
+ }
+ 
++void HTTP_C::StartAbandonedPost(Context& http_context, bool force) {
++    if (http_context.state != RequestState::NotStarted || !http_context.post_pending_request ||
++        http_context.post_data_added) {
++        return;
++    }
++    if (!force && std::chrono::steady_clock::now() - http_context.post_pending_since <
++                      std::chrono::seconds(1)) {
++        return;
++    }
++    LOG_WARNING(Service_HTTP, "POST {} began without post data and none followed: sent with an "
++                              "empty body", http_context.url);
++    http_context.post_pending_request = false;
++    http_context.current_copied_data = 0;
++    http_context.request_future =
++        std::async(std::launch::async, &Context::MakeRequest, std::ref(http_context));
++}
++
+ void HTTP_C::GetRequestState(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u32 context_handle = rp.Pop<u32>();
+@@ -965,6 +985,8 @@ void HTTP_C::GetRequestState(Kernel::HLERequestContext& ctx) {
+     // We cannot do that with httplib so instead fake the state to SendingRequest
+     // if post data is pending. TODO(PabloMK7): Fix if we get a more
+     // flexible HTTP library.
++    StartAbandonedPost(http_context, false);
++    state = http_context.state;
+     if (state == RequestState::NotStarted && http_context.post_pending_request) {
+         state = RequestState::SendingRequest;
+     }
+@@ -1751,6 +1773,7 @@ void HTTP_C::GetResponseStatusCodeImpl(Kernel::HLERequestContext& ctx, bool time
+     if (!PerformStateChecks(ctx, rp, async_data->context_handle)) {
+         return;
+     }
++    StartAbandonedPost(GetContext(async_data->context_handle), true);
+ 
+     ctx.RunAsync(
+         [this, async_data](Kernel::HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index 795b441..1df1a1d 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <chrono>
+ #include <future>
+ #include <memory>
+ #include <optional>
+@@ -296,6 +297,8 @@ public:
+     const URLReplacer* url_replacer;
+     bool post_data_added = false;
+     bool post_pending_request = false;
++    /// When BeginRequest(Async) left a POST waiting for its body (see StartAbandonedPost).
++    std::chrono::steady_clock::time_point post_pending_since{};
+     Params post_data;
+     std::string post_data_raw;
+     PostDataEncoding post_data_encoding = PostDataEncoding::Auto;
+@@ -915,6 +918,16 @@ private:
+     [[nodiscard]] SessionData* EnsureSessionInitialized(Kernel::HLERequestContext& ctx,
+                                                         IPC::RequestParser rp);
+ 
++    /**
++     * A POST begun without post data waits for the game to stream its body and call
++     * NotifyFinishSendPostData. Some POSTs never get a body: the eShop's
++     * ninja/ws/my/session/!close is a bare POST, and closing the eShop then waited for it
++     * forever. Such a request is sent with an empty body once the game waits for the answer
++     * (force: ReceiveData, GetResponseStatusCode) or polls its state for over a second
++     * without adding anything.
++     */
++    void StartAbandonedPost(Context& http_context, bool force);
++
+     [[nodiscard]] bool PerformStateChecks(Kernel::HLERequestContext& ctx, IPC::RequestParser rp,
+                                           Context::Handle context_handle);
+ 
+-- 
+2.43.0
+
