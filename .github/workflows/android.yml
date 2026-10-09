@@ -1,0 +1,122 @@
+# Tangelo – Android build
+#
+# Builds the Tangelo Android app (arm64-v8a and x86_64 in one APK) and uploads it as a build
+# artifact. Like the Windows build, any *.patch files in the repository's patches/ folder are
+# applied first.
+#
+# Signing: without secrets the APK is signed with a debug key. It installs and runs normally,
+# but an APK signed with a different key can't be installed over it (uninstall first, which
+# removes the app's data unless it was exported). For a stable key, add these repository
+# secrets (Settings → Secrets and variables → Actions):
+#   ANDROID_KEYSTORE_B64   the keystore file, base64-encoded
+#   ANDROID_KEY_ALIAS      the key's alias
+#   ANDROID_KEYSTORE_PASS  the keystore (and key) password
+#
+# Run it by hand: GitHub → Actions → "Android build" → "Run workflow".
+
+name: Android build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["*"]
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      CCACHE_MAXSIZE: 2G
+      OS: android
+      TARGET: universal
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply patches from patches/
+        run: |
+          shopt -s nullglob
+          patches=(patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches to apply."
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "Applying $p"
+            git apply --whitespace=nowarn "$p"
+          done
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-android-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-android-
+
+      - name: Install ccache and the Android build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ccache
+          # The NDK and CMake versions the app's build.gradle.kts asks for.
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.3.13750724" "cmake;3.30.3" > /dev/null
+          echo "$ANDROID_HOME/cmake/3.30.3/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare signing key (when the secrets are set)
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_B64" ]; then
+            base64 --decode <<< "$ANDROID_KEYSTORE_B64" > "$RUNNER_TEMP/tangelo.jks"
+            echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/tangelo.jks" >> "$GITHUB_ENV"
+            echo "Signing with the repository's key."
+          else
+            echo "No ANDROID_KEYSTORE_B64 secret: the APK is signed with a debug key."
+          fi
+
+      - name: Build
+        working-directory: src/android
+        env:
+          NDK_CCACHE: /usr/bin/ccache
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: |
+          # build.gradle.kts takes GIT_TAG_NAME as the version name whenever it exists (even
+          # empty), so it's only set for tag builds.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then export GIT_TAG_NAME="$GITHUB_REF_NAME"; fi
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleVanillaRelease
+          ccache -s
+
+      - name: Collect the APK
+        run: |
+          mkdir -p artifacts
+          name="tangelo-android-$(git show -s --date=short --format='%ad' | tr -d '-')-$(git show -s --format='%h')"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then name="tangelo-android-$GITHUB_REF_NAME"; fi
+          apk=$(ls src/android/app/build/outputs/apk/vanilla/release/*.apk | head -n 1)
+          cp "$apk" "artifacts/$name.apk"
+          ls -la artifacts
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/tangelo.jks"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: tangelo-android
+          path: artifacts/
