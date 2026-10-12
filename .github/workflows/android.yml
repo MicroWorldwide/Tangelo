@@ -50,8 +50,15 @@ jobs:
             git apply --whitespace=nowarn "$p"
           done
 
+      - name: Check the Android default settings
+        # The app stops at start when a setting key has no declaration in jni/default_ini.h.
+        run: |
+          if [ -f tools/check_android_default_ini.py ]; then
+            python3 tools/check_android_default_ini.py
+          fi
+
       - name: Set up Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
