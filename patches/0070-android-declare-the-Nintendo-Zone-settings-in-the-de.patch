@@ -1,0 +1,108 @@
+From 89c303be17b77bcc01416dc4d9717cd42316fba3 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 12 Oct 2026 21:41:51 +0200
+Subject: [PATCH] android: declare the Nintendo Zone settings in the default
+ config
+
+The Android app checks at start that every setting key has a declaration in
+jni/default_ini.h. ac_connecting_location and nintendo_zone_mode (added for
+Nintendo Zone) had none, so the app stopped with "Validation of default
+config content (jni/default_ini.h) failed: Missing declaration for key
+'ac_connecting_location'" right after the user directory was chosen.
+
+Both are declared now, with their defaults. tools/check_android_default_ini.py
+does the same check at build time, so a missing declaration fails the build
+instead of the app on a phone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/android/app/src/main/jni/default_ini.h |  6 +++
+ tools/check_android_default_ini.py         | 58 ++++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+ create mode 100755 tools/check_android_default_ini.py
+
+diff --git a/src/android/app/src/main/jni/default_ini.h b/src/android/app/src/main/jni/default_ini.h
+index 78e9a3a..1d4cb6b 100644
+--- a/src/android/app/src/main/jni/default_ini.h
++++ b/src/android/app/src/main/jni/default_ini.h
+@@ -597,6 +597,12 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
+ )") DECLARE_KEY(use_custom_nintendo_server) BOOST_HANA_STRING(R"(
+ # Custom server address, e.g. http://localhost:8080 (http when no scheme is given)
+ )") DECLARE_KEY(nintendo_server_url) BOOST_HANA_STRING(R"(
++# Experimental: the value the ac service reports as the connecting location (GetConnectingLocation).
++# Games use it to tell a Nintendo Zone from other access points. 0: normal access point (default)
++)") DECLARE_KEY(ac_connecting_location) BOOST_HANA_STRING(R"(
++# Report the virtual access point as a Nintendo Zone hotspot (SSID "NintendoSpotPass1")
++# 0: Off (default), 1: On
++)") DECLARE_KEY(nintendo_zone_mode) BOOST_HANA_STRING(R"(
+ # With the custom server: tell it at every game start which game started and which games are
+ # installed (under this install's Console ID), for the server's overview. Nothing goes to Nintendo.
+ # 0: Off (default), 1: On
+diff --git a/tools/check_android_default_ini.py b/tools/check_android_default_ini.py
+new file mode 100755
+index 0000000..aa9f9b1
+--- /dev/null
++++ b/tools/check_android_default_ini.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++"""Checks that every setting key the Android app knows is declared in its default config.
++
++The Android app checks this itself at start (jni/config.cpp, Config::Reload) and stops with
++"Validation of default config content (jni/default_ini.h) failed: Missing declaration for key
++'...'" right after the user directory is chosen. This finds the same thing at build time:
++the shared and Android keys in CMakeModules/GenerateSettingKeys.cmake must each have a
++DECLARE_KEY(...) in src/android/app/src/main/jni/default_ini.h or be listed in its
++android_config_omitted_keys.
++
++Run from the repository root: python3 tools/check_android_default_ini.py
++"""
++
++import os
++import re
++import sys
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++KEYS_FILE = os.path.join(ROOT, "CMakeModules", "GenerateSettingKeys.cmake")
++DEFAULT_INI = os.path.join(ROOT, "src", "android", "app", "src", "main", "jni", "default_ini.h")
++
++
++def _items(lines, start):
++    keys = []
++    for line in lines[start:]:
++        if line.strip() == ")":
++            break
++        match = re.match(r'\s+"([a-z0-9_]+)"', line)
++        if match:
++            keys.append(match.group(1))
++    return keys
++
++
++def android_keys():
++    lines = open(KEYS_FILE, encoding="utf-8").read().split("\n")
++    shared = next(n for n, line in enumerate(lines) if "# Shared setting keys" in line)
++    android = next(n for n, line in enumerate(lines)
++                   if line.strip() == "if (ANDROID)" and "foreach" in lines[n + 1])
++    return _items(lines, shared + 2) + _items(lines, android + 2)
++
++
++def main():
++    text = open(DEFAULT_INI, encoding="utf-8").read()
++    omitted_block = text[text.index("android_config_omitted_keys"):]
++    omitted = set(re.findall(r"Keys::([a-z0-9_]+)", omitted_block[:omitted_block.index("};")]))
++    declared = set(re.findall(r"DECLARE_KEY\(([a-z0-9_]+)\)", text))
++    missing = [key for key in android_keys() if key not in declared and key not in omitted]
++    if missing:
++        print("jni/default_ini.h has no declaration for: " + ", ".join(missing))
++        print("Add a DECLARE_KEY(...) with a comment for each (or list it in "
++              "android_config_omitted_keys); the app stops at start otherwise.")
++        return 1
++    print(f"jni/default_ini.h declares all {len(declared)} Android setting keys.")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+

@@ -1,0 +1,56 @@
+From 34bd85607b7247818cc1a83a0a3ca56623240b87 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 12 Oct 2026 21:11:43 +0200
+Subject: [PATCH] ptm: GetPlayHistory replies with the next offset, not the
+ entry count
+
+Callers that read the play history in blocks of 1024 entries use the reply
+as the offset of their next request. Tangelo replied with the number of
+entries read, so once the history passed 2048 entries Swapdoodle asked for
+offset 1024 every 200 ms forever and never got to its "preparing" screen.
+From offset 0 the count and the next offset are the same, which is why the
+Activity Log kept working.
+
+The reply is now offset + entries read, and the offset is checked without
+32-bit overflow.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ptm/ptm.cpp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index f3a6147..901645b 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -196,18 +196,23 @@ void Module::Interface::GetPlayHistory(Kernel::HLERequestContext& ctx) {
+     const auto& entries = ptm->play_history.Entries();
+     using Entry = PlayHistory::Entry;
+     u32 written = 0;
+-    for (u32 i = 0; i < count && start + i < entries.size() &&
++    for (u32 i = 0; i < count && static_cast<std::size_t>(start) + i < entries.size() &&
+                     (written + 1) * sizeof(Entry) <= buffer.GetSize();
+          i++) {
+         buffer.Write(&entries[start + i], written * sizeof(Entry), sizeof(Entry));
+         written++;
+     }
+ 
++    // The reply is the offset to continue from (offset + entries read), not the number of
++    // entries: callers that read the history in blocks pass it back as the next offset. Replying
++    // with the count made Swapdoodle request offset 1024 forever once the history passed 2048
++    // entries. From offset 0 both are the same, which is why the Activity Log never noticed.
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
+     rb.Push(ResultSuccess);
+-    rb.Push<u32>(written);
++    rb.Push<u32>(start + written);
+     rb.PushMappedBuffer(buffer);
+-    LOG_DEBUG(Service_PTM, "start={}, count={}, written={}", start, count, written);
++    LOG_DEBUG(Service_PTM, "start={}, count={}, written={}, next={}", start, count, written,
++              start + written);
+ }
+ 
+ void Module::Interface::GetStepHistoryAll(Kernel::HLERequestContext& ctx) {
+-- 
+2.43.0
+
