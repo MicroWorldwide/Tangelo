@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 13 Oct 2026 22:56:00 +0200
+Subject: [PATCH] dynarmic: include <vector> in ir_emitter.h for newer libc++
+
+The Windows build (MSYS2 clang64, newest packages on every run) stopped in
+dynarmic's precompiled header: "no template named 'vector' in namespace
+'std'" in ir/ir_emitter.h. The header uses std::vector without including
+<vector>; older libc++ versions pulled it in through other headers, the
+newer one doesn't. Android (pinned NDK 27) is not affected.
+
+dynarmic is a submodule, so this patch changes a file inside it: the
+workflows apply patches with git apply, which reaches it (git am can't).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ externals/dynarmic/src/dynarmic/ir/ir_emitter.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/externals/dynarmic/src/dynarmic/ir/ir_emitter.h b/externals/dynarmic/src/dynarmic/ir/ir_emitter.h
+--- a/externals/dynarmic/src/dynarmic/ir/ir_emitter.h
++++ b/externals/dynarmic/src/dynarmic/ir/ir_emitter.h
+@@ -5,6 +5,8 @@
+ 
+ #pragma once
+ 
++#include <vector>
++
+ #include <mcl/stdint.hpp>
+ 
+ #include "dynarmic/ir/acc_type.h"
+-- 
+2.43.0
+
