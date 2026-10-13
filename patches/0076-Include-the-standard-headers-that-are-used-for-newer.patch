@@ -1,0 +1,1110 @@
+From b129397b4e4ae06d63e3756eb541ebb275dd93c2 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 13 Oct 2026 23:57:29 +0200
+Subject: [PATCH] Include the standard headers that are used, for newer libc++
+
+The Windows build (MSYS2 clang64, newest packages on every run) stopped in
+src/network/artic_base: std::vector used without #include <vector>. Newer
+libc++ versions no longer pull such headers in through others. A scan of
+src/ found 100 places in 82 files that use std::vector, std::string,
+std::string_view, std::optional, std::atomic, std::array, std::mutex,
+std::chrono, std::tuple, std::map, std::unordered_map, std::thread,
+std::set, std::deque, std::span or std::condition_variable without
+including its header, directly or through one of the project's own
+headers. Each now includes it, outside any #if block.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/android/app/src/main/jni/android_common/android_common.h | 2 ++
+ src/android/app/src/main/jni/applets/swkbd.h                 | 1 +
+ src/android/app/src/main/jni/default_ini.h                   | 1 +
+ src/android/app/src/main/jni/input_manager.cpp               | 1 +
+ src/android/app/src/main/jni/ndk_motion.cpp                  | 4 ++++
+ src/android/app/src/main/jni/ndk_motion.h                    | 1 +
+ src/audio_core/cubeb_sink.h                                  | 2 ++
+ src/audio_core/dsp_interface.h                               | 1 +
+ src/audio_core/null_sink.h                                   | 1 +
+ src/audio_core/openal_sink.h                                 | 1 +
+ src/audio_core/sdl2_sink.h                                   | 2 ++
+ src/citra_libretro/libretro_vk.h                             | 2 ++
+ src/citra_qt/applets/swkbd.cpp                               | 1 +
+ src/citra_qt/applets/swkbd.h                                 | 1 +
+ src/citra_qt/camera/still_image_camera.cpp                   | 1 +
+ src/citra_qt/camera/still_image_camera.h                     | 1 +
+ src/citra_qt/configuration/configure_system.h                | 1 +
+ src/citra_qt/debugger/profiler.cpp                           | 2 ++
+ src/citra_qt/loading_screen.h                                | 1 +
+ src/citra_qt/multiplayer/message.cpp                         | 1 +
+ src/citra_qt/multiplayer/message.h                           | 1 +
+ src/citra_qt/util/util.h                                     | 2 ++
+ src/common/aarch64/oaknut_abi.h                              | 1 +
+ src/common/android_utils.h                                   | 3 +++
+ src/common/bounded_threadsafe_queue.h                        | 1 +
+ src/common/detached_tasks.h                                  | 1 +
+ src/common/dynamic_library/dynamic_library.cpp               | 1 +
+ src/common/dynamic_library/dynamic_library.h                 | 1 +
+ src/common/file_derived.cpp                                  | 1 +
+ src/common/file_util.cpp                                     | 1 +
+ src/common/hash.h                                            | 1 +
+ src/common/logging/backend.h                                 | 1 +
+ src/common/logging/log_entry.h                               | 1 +
+ src/common/thread_worker.h                                   | 1 +
+ src/common/zstd_compression.h                                | 1 +
+ src/core/arm/dynarmic/arm_dynarmic_cp15.h                    | 1 +
+ src/core/cheats/gateway_cheat.h                              | 1 +
+ src/core/file_sys/archive_backend.h                          | 1 +
+ src/core/file_sys/archive_sdmcwriteonly.h                    | 1 +
+ src/core/file_sys/artic_cache.h                              | 2 ++
+ src/core/file_sys/path_parser.h                              | 1 +
+ src/core/frontend/applets/swkbd.h                            | 1 +
+ src/core/hle/kernel/event.h                                  | 1 +
+ src/core/hle/kernel/resource_limit.h                         | 1 +
+ src/core/hle/kernel/server_port.h                            | 1 +
+ src/core/hle/kernel/vm_manager.h                             | 1 +
+ src/core/hle/service/apt/applet_manager.h                    | 1 +
+ src/core/hle/service/dlp/dlp_clt_base.h                      | 1 +
+ src/core/hle/service/fs/archive.h                            | 2 ++
+ src/core/hle/service/fs/directory.h                          | 1 +
+ src/core/hle/service/fs/file.h                               | 1 +
+ src/core/hle/service/gsp/gsp_command.h                       | 1 +
+ src/core/hle/service/plgldr/plgldr.h                         | 2 ++
+ src/core/hle/service/soc/soc_u.h                             | 1 +
+ src/core/memory.h                                            | 1 +
+ src/core/movie.h                                             | 2 ++
+ src/core/nus_download.cpp                                    | 1 +
+ src/core/nus_download.h                                      | 1 +
+ src/core/rpc/udp_server.cpp                                  | 1 +
+ src/core/system_titles.h                                     | 1 +
+ src/network/artic_base/artic_base_client.cpp                 | 1 +
+ src/network/artic_base/artic_base_client.h                   | 2 ++
+ src/network/packet.h                                         | 1 +
+ src/tests/video_core/shader.cpp                              | 1 +
+ src/video_core/rasterizer_accelerated.h                      | 1 +
+ src/video_core/rasterizer_cache/surface_params.cpp           | 1 +
+ src/video_core/rasterizer_cache/surface_params.h             | 1 +
+ src/video_core/rasterizer_interface.h                        | 1 +
+ src/video_core/renderer_opengl/gl_shader_util.h              | 2 ++
+ src/video_core/renderer_opengl/gl_texture_mailbox.cpp        | 1 +
+ src/video_core/renderer_software/sw_clipper.h                | 1 +
+ src/video_core/renderer_vulkan/vk_instance.h                 | 2 ++
+ src/video_core/renderer_vulkan/vk_master_semaphore.h         | 1 +
+ src/video_core/renderer_vulkan/vk_platform.h                 | 2 ++
+ src/video_core/renderer_vulkan/vk_resource_pool.h            | 1 +
+ src/video_core/renderer_vulkan/vk_shader_disk_cache.h        | 1 +
+ src/video_core/renderer_vulkan/vk_shader_util.h              | 2 ++
+ src/video_core/shader/generator/glsl_shader_gen.h            | 2 ++
+ src/video_core/shader/generator/shader_uniforms.h            | 1 +
+ src/video_core/shader/generator/spv_fs_shader_gen.cpp        | 1 +
+ src/video_core/shader/generator/spv_fs_shader_gen.h          | 1 +
+ src/web_service/verify_user_jwt.cpp                          | 1 +
+ 82 files changed, 103 insertions(+)
+
+diff --git a/src/android/app/src/main/jni/android_common/android_common.h b/src/android/app/src/main/jni/android_common/android_common.h
+index 7c09250..9c6ad43 100644
+--- a/src/android/app/src/main/jni/android_common/android_common.h
++++ b/src/android/app/src/main/jni/android_common/android_common.h
+@@ -7,6 +7,8 @@
+ #include <string>
+ 
+ #include <jni.h>
++#include <string_view>
++#include <vector>
+ 
+ std::string GetJString(JNIEnv* env, jstring jstr);
+ jstring ToJString(JNIEnv* env, std::string_view str);
+diff --git a/src/android/app/src/main/jni/applets/swkbd.h b/src/android/app/src/main/jni/applets/swkbd.h
+index 25ab5fe..bbd1740 100644
+--- a/src/android/app/src/main/jni/applets/swkbd.h
++++ b/src/android/app/src/main/jni/applets/swkbd.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <jni.h>
++#include <string>
+ #include "core/frontend/applets/swkbd.h"
+ 
+ namespace SoftwareKeyboard {
+diff --git a/src/android/app/src/main/jni/default_ini.h b/src/android/app/src/main/jni/default_ini.h
+index e725cb0..b276f70 100644
+--- a/src/android/app/src/main/jni/default_ini.h
++++ b/src/android/app/src/main/jni/default_ini.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <boost/hana/string.hpp>
++#include <array>
+ #include "common/setting_keys.h"
+ 
+ namespace DefaultINI {
+diff --git a/src/android/app/src/main/jni/input_manager.cpp b/src/android/app/src/main/jni/input_manager.cpp
+index 9bb8552..a49fedf 100644
+--- a/src/android/app/src/main/jni/input_manager.cpp
++++ b/src/android/app/src/main/jni/input_manager.cpp
+@@ -9,6 +9,7 @@
+ #include <tuple>
+ #include <unordered_map>
+ #include <utility>
++#include <atomic>
+ #include "common/logging/log.h"
+ #include "common/math_util.h"
+ #include "common/param_package.h"
+diff --git a/src/android/app/src/main/jni/ndk_motion.cpp b/src/android/app/src/main/jni/ndk_motion.cpp
+index 5f9912a..abb68e4 100644
+--- a/src/android/app/src/main/jni/ndk_motion.cpp
++++ b/src/android/app/src/main/jni/ndk_motion.cpp
+@@ -6,6 +6,10 @@
+ #include <thread>
+ 
+ #include <android/sensor.h>
++#include <atomic>
++#include <mutex>
++#include <optional>
++#include <tuple>
+ 
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+diff --git a/src/android/app/src/main/jni/ndk_motion.h b/src/android/app/src/main/jni/ndk_motion.h
+index 81ba7bb..cfdf875 100644
+--- a/src/android/app/src/main/jni/ndk_motion.h
++++ b/src/android/app/src/main/jni/ndk_motion.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <mutex>
++#include <atomic>
+ 
+ #include "core/frontend/input.h"
+ 
+diff --git a/src/audio_core/cubeb_sink.h b/src/audio_core/cubeb_sink.h
+index 9cf3896..5bd5a02 100644
+--- a/src/audio_core/cubeb_sink.h
++++ b/src/audio_core/cubeb_sink.h
+@@ -7,6 +7,8 @@
+ #include <cstddef>
+ #include <memory>
+ #include <string>
++#include <string_view>
++#include <vector>
+ #include "audio_core/sink.h"
+ 
+ namespace AudioCore {
+diff --git a/src/audio_core/dsp_interface.h b/src/audio_core/dsp_interface.h
+index 5a33fcb..f2292c4 100644
+--- a/src/audio_core/dsp_interface.h
++++ b/src/audio_core/dsp_interface.h
+@@ -7,6 +7,7 @@
+ #include <memory>
+ #include <span>
+ #include <boost/serialization/access.hpp>
++#include <string_view>
+ #include "audio_core/audio_types.h"
+ #include "audio_core/time_stretch.h"
+ #include "common/common_types.h"
+diff --git a/src/audio_core/null_sink.h b/src/audio_core/null_sink.h
+index beaf8da..d491799 100644
+--- a/src/audio_core/null_sink.h
++++ b/src/audio_core/null_sink.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <string_view>
+ #include "audio_core/audio_types.h"
+ #include "audio_core/sink.h"
+ 
+diff --git a/src/audio_core/openal_sink.h b/src/audio_core/openal_sink.h
+index 8547c1b..4daca9e 100644
+--- a/src/audio_core/openal_sink.h
++++ b/src/audio_core/openal_sink.h
+@@ -7,6 +7,7 @@
+ #include <cstddef>
+ #include <memory>
+ #include <string>
++#include <vector>
+ #include "audio_core/sink.h"
+ 
+ namespace AudioCore {
+diff --git a/src/audio_core/sdl2_sink.h b/src/audio_core/sdl2_sink.h
+index 391b6fe..61233fa 100644
+--- a/src/audio_core/sdl2_sink.h
++++ b/src/audio_core/sdl2_sink.h
+@@ -6,6 +6,8 @@
+ 
+ #include <cstddef>
+ #include <memory>
++#include <string>
++#include <vector>
+ #include "audio_core/sink.h"
+ 
+ namespace AudioCore {
+diff --git a/src/citra_libretro/libretro_vk.h b/src/citra_libretro/libretro_vk.h
+index 17a9e95..dc270d5 100644
+--- a/src/citra_libretro/libretro_vk.h
++++ b/src/citra_libretro/libretro_vk.h
+@@ -7,6 +7,8 @@
+ #include <memory>
+ #include <variant>
+ #include <fmt/format.h>
++#include <deque>
++#include <vector>
+ 
+ #include "common/common_types.h"
+ #include "common/dynamic_library/dynamic_library.h"
+diff --git a/src/citra_qt/applets/swkbd.cpp b/src/citra_qt/applets/swkbd.cpp
+index 8866cea..b3eebbc 100644
+--- a/src/citra_qt/applets/swkbd.cpp
++++ b/src/citra_qt/applets/swkbd.cpp
+@@ -9,6 +9,7 @@
+ #include <QMessageBox>
+ #include <QString>
+ #include <QVBoxLayout>
++#include <string>
+ #include "citra_qt/applets/swkbd.h"
+ 
+ QtKeyboardValidator::QtKeyboardValidator(QtKeyboard* keyboard_) : keyboard(keyboard_) {}
+diff --git a/src/citra_qt/applets/swkbd.h b/src/citra_qt/applets/swkbd.h
+index e4f213c..63d4e62 100644
+--- a/src/citra_qt/applets/swkbd.h
++++ b/src/citra_qt/applets/swkbd.h
+@@ -6,6 +6,7 @@
+ 
+ #include <QDialog>
+ #include <QValidator>
++#include <string>
+ #include "core/frontend/applets/swkbd.h"
+ 
+ class QDialogButtonBox;
+diff --git a/src/citra_qt/camera/still_image_camera.cpp b/src/citra_qt/camera/still_image_camera.cpp
+index 00a62c0..b2b6be8 100644
+--- a/src/citra_qt/camera/still_image_camera.cpp
++++ b/src/citra_qt/camera/still_image_camera.cpp
+@@ -6,6 +6,7 @@
+ #include <QImageReader>
+ #include <QMessageBox>
+ #include <QThread>
++#include <string>
+ #include "citra_qt/camera/still_image_camera.h"
+ #include "common/logging/log.h"
+ 
+diff --git a/src/citra_qt/camera/still_image_camera.h b/src/citra_qt/camera/still_image_camera.h
+index d611066..df6c4f4 100644
+--- a/src/citra_qt/camera/still_image_camera.h
++++ b/src/citra_qt/camera/still_image_camera.h
+@@ -6,6 +6,7 @@
+ 
+ #include <vector>
+ #include <QImage>
++#include <string>
+ #include "citra_qt/camera/camera_util.h"
+ #include "citra_qt/camera/qt_camera_base.h"
+ #include "core/frontend/camera/interface.h"
+diff --git a/src/citra_qt/configuration/configure_system.h b/src/citra_qt/configuration/configure_system.h
+index 7e9cb2e..973b99d 100644
+--- a/src/citra_qt/configuration/configure_system.h
++++ b/src/citra_qt/configuration/configure_system.h
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ #include <QWidget>
++#include <string>
+ #include "common/common_types.h"
+ 
+ namespace Ui {
+diff --git a/src/citra_qt/debugger/profiler.cpp b/src/citra_qt/debugger/profiler.cpp
+index 777100f..d3d90d6 100644
+--- a/src/citra_qt/debugger/profiler.cpp
++++ b/src/citra_qt/debugger/profiler.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <vector>
++
+ #if MICROPROFILE_ENABLED
+ 
+ #include <QAction>
+diff --git a/src/citra_qt/loading_screen.h b/src/citra_qt/loading_screen.h
+index f2ad0b5..e9c4299 100644
+--- a/src/citra_qt/loading_screen.h
++++ b/src/citra_qt/loading_screen.h
+@@ -7,6 +7,7 @@
+ #include <chrono>
+ #include <memory>
+ #include <QWidget>
++#include <string>
+ 
+ namespace Loader {
+ class AppLoader;
+diff --git a/src/citra_qt/multiplayer/message.cpp b/src/citra_qt/multiplayer/message.cpp
+index 934c75e..fefa48d 100644
+--- a/src/citra_qt/multiplayer/message.cpp
++++ b/src/citra_qt/multiplayer/message.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <QMessageBox>
+ #include <QString>
++#include <string>
+ 
+ #include "citra_qt/multiplayer/message.h"
+ 
+diff --git a/src/citra_qt/multiplayer/message.h b/src/citra_qt/multiplayer/message.h
+index cbc82ef..949d4bc 100644
+--- a/src/citra_qt/multiplayer/message.h
++++ b/src/citra_qt/multiplayer/message.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <utility>
++#include <string>
+ 
+ namespace NetworkMessage {
+ 
+diff --git a/src/citra_qt/util/util.h b/src/citra_qt/util/util.h
+index 596755d..1494eb6 100644
+--- a/src/citra_qt/util/util.h
++++ b/src/citra_qt/util/util.h
+@@ -7,6 +7,8 @@
+ #include <filesystem>
+ #include <QFont>
+ #include <QString>
++#include <string>
++#include <vector>
+ #include "common/common_types.h"
+ 
+ /// Returns a QFont object appropriate to use as a monospace font for debugging widgets, etc.
+diff --git a/src/common/aarch64/oaknut_abi.h b/src/common/aarch64/oaknut_abi.h
+index 104fdad..4e9d446 100644
+--- a/src/common/aarch64/oaknut_abi.h
++++ b/src/common/aarch64/oaknut_abi.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <vector>
+ #include "common/arch.h"
+ #if CITRA_ARCH(arm64)
+ 
+diff --git a/src/common/android_utils.h b/src/common/android_utils.h
+index 14231ef..1c42a27 100644
+--- a/src/common/android_utils.h
++++ b/src/common/android_utils.h
+@@ -4,6 +4,9 @@
+ 
+ #pragma once
+ 
++#include <optional>
++#include <string_view>
++
+ #ifdef ANDROID
+ #include <string>
+ #include <vector>
+diff --git a/src/common/bounded_threadsafe_queue.h b/src/common/bounded_threadsafe_queue.h
+index 38b2e08..8129a32 100644
+--- a/src/common/bounded_threadsafe_queue.h
++++ b/src/common/bounded_threadsafe_queue.h
+@@ -10,6 +10,7 @@
+ #include <memory>
+ #include <mutex>
+ #include <new>
++#include <array>
+ 
+ #include "common/polyfill_thread.h"
+ 
+diff --git a/src/common/detached_tasks.h b/src/common/detached_tasks.h
+index 1099e8a..f7178b5 100644
+--- a/src/common/detached_tasks.h
++++ b/src/common/detached_tasks.h
+@@ -6,6 +6,7 @@
+ 
+ #include <condition_variable>
+ #include <functional>
++#include <mutex>
+ 
+ namespace Common {
+ 
+diff --git a/src/common/dynamic_library/dynamic_library.cpp b/src/common/dynamic_library/dynamic_library.cpp
+index 14694b3..4ef0b2f 100644
+--- a/src/common/dynamic_library/dynamic_library.cpp
++++ b/src/common/dynamic_library/dynamic_library.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <fmt/format.h>
++#include <string_view>
+ #if defined(_WIN32)
+ #include <windows.h>
+ #else
+diff --git a/src/common/dynamic_library/dynamic_library.h b/src/common/dynamic_library/dynamic_library.h
+index adc4f76..f876c51 100644
+--- a/src/common/dynamic_library/dynamic_library.h
++++ b/src/common/dynamic_library/dynamic_library.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <string>
++#include <string_view>
+ 
+ namespace Common {
+ 
+diff --git a/src/common/file_derived.cpp b/src/common/file_derived.cpp
+index 8a2b651..24ee250 100644
+--- a/src/common/file_derived.cpp
++++ b/src/common/file_derived.cpp
+@@ -7,6 +7,7 @@
+ #include <cryptopp/sha.h>
+ #include <zstd.h>
+ #include <zstd_seekable.h>
++#include <chrono>
+ 
+ #include "common/alignment.h"
+ #include "common/archives.h"
+diff --git a/src/common/file_util.cpp b/src/common/file_util.cpp
+index 2d144d2..7ebe4b6 100644
+--- a/src/common/file_util.cpp
++++ b/src/common/file_util.cpp
+@@ -17,6 +17,7 @@
+ #include <cryptopp/aes.h>
+ #include <cryptopp/modes.h>
+ #include <fmt/format.h>
++#include <map>
+ #include "common/archives.h"
+ #include "common/assert.h"
+ #include "common/common_funcs.h"
+diff --git a/src/common/hash.h b/src/common/hash.h
+index c08e4b2..8fcdc2c 100644
+--- a/src/common/hash.h
++++ b/src/common/hash.h
+@@ -8,6 +8,7 @@
+ #include <cstring>
+ #include <string>
+ #include <xxhash.h>
++#include <string_view>
+ #include "cityhash.h"
+ #include "common/common_types.h"
+ 
+diff --git a/src/common/logging/backend.h b/src/common/logging/backend.h
+index 9ec20ab..d283de7 100644
+--- a/src/common/logging/backend.h
++++ b/src/common/logging/backend.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <string_view>
++#include <string>
+ #include "common/logging/filter.h"
+ #ifdef HAVE_LIBRETRO
+ #include "libretro.h"
+diff --git a/src/common/logging/log_entry.h b/src/common/logging/log_entry.h
+index 3cccc75..9f4ce14 100644
+--- a/src/common/logging/log_entry.h
++++ b/src/common/logging/log_entry.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <chrono>
++#include <string>
+ 
+ #include "common/logging/types.h"
+ 
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+index 40e46e2..d922f93 100644
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -13,6 +13,7 @@
+ #include <type_traits>
+ #include <vector>
+ #include <queue>
++#include <string_view>
+ 
+ #include "common/polyfill_thread.h"
+ #include "common/thread.h"
+diff --git a/src/common/zstd_compression.h b/src/common/zstd_compression.h
+index 606bb5f..a690a2a 100644
+--- a/src/common/zstd_compression.h
++++ b/src/common/zstd_compression.h
+@@ -14,6 +14,7 @@
+ 
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/unordered_map.hpp>
++#include <string>
+ #include "common/archives.h"
+ #include "common/common_types.h"
+ 
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_cp15.h b/src/core/arm/dynarmic/arm_dynarmic_cp15.h
+index 5cc92e5..6492de6 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_cp15.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_cp15.h
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ #include <dynarmic/interface/A32/coprocessor.h>
++#include <optional>
+ #include "common/common_types.h"
+ 
+ struct CP15State {
+diff --git a/src/core/cheats/gateway_cheat.h b/src/core/cheats/gateway_cheat.h
+index 58ad90e..02fd7ca 100644
+--- a/src/core/cheats/gateway_cheat.h
++++ b/src/core/cheats/gateway_cheat.h
+@@ -7,6 +7,7 @@
+ #include <atomic>
+ #include <memory>
+ #include <vector>
++#include <string>
+ #include "common/common_types.h"
+ #include "core/cheats/cheat_base.h"
+ 
+diff --git a/src/core/file_sys/archive_backend.h b/src/core/file_sys/archive_backend.h
+index 41f6c75..8147585 100644
+--- a/src/core/file_sys/archive_backend.h
++++ b/src/core/file_sys/archive_backend.h
+@@ -10,6 +10,7 @@
+ #include <vector>
+ #include <boost/serialization/string.hpp>
+ #include <boost/serialization/vector.hpp>
++#include <tuple>
+ #include "common/bit_field.h"
+ #include "common/common_types.h"
+ #include "common/swap.h"
+diff --git a/src/core/file_sys/archive_sdmcwriteonly.h b/src/core/file_sys/archive_sdmcwriteonly.h
+index 1a711b5..03cfa86 100644
+--- a/src/core/file_sys/archive_sdmcwriteonly.h
++++ b/src/core/file_sys/archive_sdmcwriteonly.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <string>
+ #include "core/file_sys/archive_sdmc.h"
+ 
+ namespace FileSys {
+diff --git a/src/core/file_sys/artic_cache.h b/src/core/file_sys/artic_cache.h
+index 01dfee5..e89b5f8 100644
+--- a/src/core/file_sys/artic_cache.h
++++ b/src/core/file_sys/artic_cache.h
+@@ -11,6 +11,8 @@
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/base_object.hpp>
+ #include <boost/serialization/export.hpp>
++#include <map>
++#include <optional>
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+ #include "common/static_lru_cache.h"
+diff --git a/src/core/file_sys/path_parser.h b/src/core/file_sys/path_parser.h
+index 68681ba..4b0d743 100644
+--- a/src/core/file_sys/path_parser.h
++++ b/src/core/file_sys/path_parser.h
+@@ -6,6 +6,7 @@
+ 
+ #include <string>
+ #include <vector>
++#include <string_view>
+ #include "core/file_sys/archive_backend.h"
+ 
+ namespace FileSys {
+diff --git a/src/core/frontend/applets/swkbd.h b/src/core/frontend/applets/swkbd.h
+index 03de9fd..43dc2e8 100644
+--- a/src/core/frontend/applets/swkbd.h
++++ b/src/core/frontend/applets/swkbd.h
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ #include <vector>
++#include <string>
+ #include "common/assert.h"
+ 
+ namespace Core {
+diff --git a/src/core/hle/kernel/event.h b/src/core/hle/kernel/event.h
+index fa4d4ec..c767d04 100644
+--- a/src/core/hle/kernel/event.h
++++ b/src/core/hle/kernel/event.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <boost/serialization/export.hpp>
++#include <string>
+ #include "core/hle/kernel/object.h"
+ #include "core/hle/kernel/resource_limit.h"
+ #include "core/hle/kernel/wait_object.h"
+diff --git a/src/core/hle/kernel/resource_limit.h b/src/core/hle/kernel/resource_limit.h
+index 0681edd..6bb9e5a 100644
+--- a/src/core/hle/kernel/resource_limit.h
++++ b/src/core/hle/kernel/resource_limit.h
+@@ -7,6 +7,7 @@
+ #include <array>
+ #include <memory>
+ #include <boost/serialization/export.hpp>
++#include <string>
+ #include "common/common_types.h"
+ #include "core/hle/kernel/object.h"
+ 
+diff --git a/src/core/hle/kernel/server_port.h b/src/core/hle/kernel/server_port.h
+index d8ceaab..b6bbef7 100644
+--- a/src/core/hle/kernel/server_port.h
++++ b/src/core/hle/kernel/server_port.h
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <tuple>
+ #include <boost/serialization/export.hpp>
++#include <vector>
+ #include "common/common_types.h"
+ #include "core/hle/kernel/object.h"
+ #include "core/hle/kernel/server_session.h"
+diff --git a/src/core/hle/kernel/vm_manager.h b/src/core/hle/kernel/vm_manager.h
+index fbed138..e096e74 100644
+--- a/src/core/hle/kernel/vm_manager.h
++++ b/src/core/hle/kernel/vm_manager.h
+@@ -7,6 +7,7 @@
+ #include <map>
+ #include <memory>
+ #include <boost/serialization/export.hpp>
++#include <vector>
+ #include "common/common_types.h"
+ #include "common/memory_ref.h"
+ #include "core/hle/kernel/memory.h"
+diff --git a/src/core/hle/service/apt/applet_manager.h b/src/core/hle/service/apt/applet_manager.h
+index da4f2ea..5d73811 100644
+--- a/src/core/hle/service/apt/applet_manager.h
++++ b/src/core/hle/service/apt/applet_manager.h
+@@ -13,6 +13,7 @@
+ #include <boost/serialization/optional.hpp>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/vector.hpp>
++#include <atomic>
+ #include "core/frontend/input.h"
+ #include "core/global.h"
+ #include "core/hle/kernel/event.h"
+diff --git a/src/core/hle/service/dlp/dlp_clt_base.h b/src/core/hle/service/dlp/dlp_clt_base.h
+index 3b03edf..95fb7e3 100644
+--- a/src/core/hle/service/dlp/dlp_clt_base.h
++++ b/src/core/hle/service/dlp/dlp_clt_base.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <set>
+ #include "core/hle/kernel/event.h"
+ #include "core/hle/kernel/shared_memory.h"
+ #include "dlp_base.h"
+diff --git a/src/core/hle/service/fs/archive.h b/src/core/hle/service/fs/archive.h
+index 897e5d8..03f6412 100644
+--- a/src/core/hle/service/fs/archive.h
++++ b/src/core/hle/service/fs/archive.h
+@@ -10,6 +10,8 @@
+ #include <unordered_map>
+ #include <boost/serialization/unique_ptr.hpp>
+ #include <boost/serialization/unordered_map.hpp>
++#include <chrono>
++#include <string_view>
+ #include "common/common_types.h"
+ #include "core/file_sys/archive_backend.h"
+ #include "core/file_sys/archive_source_sd_savedata.h"
+diff --git a/src/core/hle/service/fs/directory.h b/src/core/hle/service/fs/directory.h
+index 3ff502d..a15ca35 100644
+--- a/src/core/hle/service/fs/directory.h
++++ b/src/core/hle/service/fs/directory.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <string>
+ #include "core/file_sys/archive_backend.h"
+ #include "core/hle/service/service.h"
+ 
+diff --git a/src/core/hle/service/fs/file.h b/src/core/hle/service/fs/file.h
+index f77cefe..f3c2315 100644
+--- a/src/core/hle/service/fs/file.h
++++ b/src/core/hle/service/fs/file.h
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ #include <boost/serialization/base_object.hpp>
++#include <string>
+ #include "core/file_sys/archive_backend.h"
+ #include "core/global.h"
+ #include "core/hle/service/service.h"
+diff --git a/src/core/hle/service/gsp/gsp_command.h b/src/core/hle/service/gsp/gsp_command.h
+index c0af96f..2f867d0 100644
+--- a/src/core/hle/service/gsp/gsp_command.h
++++ b/src/core/hle/service/gsp/gsp_command.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include "common/bit_field.h"
+ 
+ namespace Service::GSP {
+diff --git a/src/core/hle/service/plgldr/plgldr.h b/src/core/hle/service/plgldr/plgldr.h
+index 96fc30c..9f75084 100644
+--- a/src/core/hle/service/plgldr/plgldr.h
++++ b/src/core/hle/service/plgldr/plgldr.h
+@@ -25,6 +25,8 @@
+ 
+ #include <memory>
+ #include <boost/serialization/export.hpp>
++#include <string>
++#include <vector>
+ #include "core/hle/service/service.h"
+ 
+ namespace Core {
+diff --git a/src/core/hle/service/soc/soc_u.h b/src/core/hle/service/soc/soc_u.h
+index 01cbd0d..dd82840 100644
+--- a/src/core/hle/service/soc/soc_u.h
++++ b/src/core/hle/service/soc/soc_u.h
+@@ -8,6 +8,7 @@
+ #include <utility>
+ #include <boost/serialization/set.hpp>
+ #include <boost/serialization/unordered_map.hpp>
++#include <set>
+ #include "core/hle/result.h"
+ #include "core/hle/service/service.h"
+ 
+diff --git a/src/core/memory.h b/src/core/memory.h
+index d490734..7c74453 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -9,6 +9,7 @@
+ #include <string>
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/vector.hpp>
++#include <unordered_map>
+ #include "common/common_types.h"
+ #include "common/memory_ref.h"
+ #include "common/swap.h"
+diff --git a/src/core/movie.h b/src/core/movie.h
+index 7594aba..0dd80e1 100644
+--- a/src/core/movie.h
++++ b/src/core/movie.h
+@@ -7,6 +7,8 @@
+ #include <functional>
+ #include <span>
+ #include <boost/serialization/vector.hpp>
++#include <string>
++#include <vector>
+ #include "common/common_types.h"
+ 
+ namespace Service {
+diff --git a/src/core/nus_download.cpp b/src/core/nus_download.cpp
+index 28442a8..c5fea0b 100644
+--- a/src/core/nus_download.cpp
++++ b/src/core/nus_download.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <memory>
+ #include <httplib.h>
++#include <string>
+ #include "common/logging/log.h"
+ #include "core/nus_download.h"
+ 
+diff --git a/src/core/nus_download.h b/src/core/nus_download.h
+index 2e50801..47c9dea 100644
+--- a/src/core/nus_download.h
++++ b/src/core/nus_download.h
+@@ -6,6 +6,7 @@
+ 
+ #include <optional>
+ #include <vector>
++#include <string>
+ #include "common/common_types.h"
+ 
+ namespace Core::NUS {
+diff --git a/src/core/rpc/udp_server.cpp b/src/core/rpc/udp_server.cpp
+index 4e90ec9..0ee19ca 100644
+--- a/src/core/rpc/udp_server.cpp
++++ b/src/core/rpc/udp_server.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <thread>
+ #include <boost/asio.hpp>
++#include <vector>
+ #include "common/common_types.h"
+ #include "common/logging/log.h"
+ #include "core/rpc/packet.h"
+diff --git a/src/core/system_titles.h b/src/core/system_titles.h
+index 3dc5f64..4a4e40d 100644
+--- a/src/core/system_titles.h
++++ b/src/core/system_titles.h
+@@ -7,6 +7,7 @@
+ #include <optional>
+ #include <utility>
+ #include <vector>
++#include <string>
+ #include "common/common_types.h"
+ 
+ namespace Core {
+diff --git a/src/network/artic_base/artic_base_client.cpp b/src/network/artic_base/artic_base_client.cpp
+index a40476c..e983f4a 100644
+--- a/src/network/artic_base/artic_base_client.cpp
++++ b/src/network/artic_base/artic_base_client.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <vector>
+ #include "artic_base_client.h"
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+diff --git a/src/network/artic_base/artic_base_client.h b/src/network/artic_base/artic_base_client.h
+index 193ccde..b8db326 100644
+--- a/src/network/artic_base/artic_base_client.h
++++ b/src/network/artic_base/artic_base_client.h
+@@ -3,6 +3,8 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #pragma once
++#include <chrono>
++#include <vector>
+ #include "condition_variable"
+ #include "cstring"
+ #include "functional"
+diff --git a/src/network/packet.h b/src/network/packet.h
+index e07cb01..b31698f 100644
+--- a/src/network/packet.h
++++ b/src/network/packet.h
+@@ -6,6 +6,7 @@
+ 
+ #include <array>
+ #include <vector>
++#include <string>
+ #include "common/common_types.h"
+ 
+ namespace Network {
+diff --git a/src/tests/video_core/shader.cpp b/src/tests/video_core/shader.cpp
+index 867651b..3ec1572 100644
+--- a/src/tests/video_core/shader.cpp
++++ b/src/tests/video_core/shader.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <string>
+ #include "common/arch.h"
+ #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
+ 
+diff --git a/src/video_core/rasterizer_accelerated.h b/src/video_core/rasterizer_accelerated.h
+index 3855c9b..e9e7350 100644
+--- a/src/video_core/rasterizer_accelerated.h
++++ b/src/video_core/rasterizer_accelerated.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <vector>
+ #include "common/vector_math.h"
+ #include "video_core/rasterizer_interface.h"
+ #include "video_core/shader/generator/pica_fs_config.h"
+diff --git a/src/video_core/rasterizer_cache/surface_params.cpp b/src/video_core/rasterizer_cache/surface_params.cpp
+index 0ce9569..e3432ac 100644
+--- a/src/video_core/rasterizer_cache/surface_params.cpp
++++ b/src/video_core/rasterizer_cache/surface_params.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <string>
+ #include "common/alignment.h"
+ #include "video_core/rasterizer_cache/surface_params.h"
+ 
+diff --git a/src/video_core/rasterizer_cache/surface_params.h b/src/video_core/rasterizer_cache/surface_params.h
+index 280bb7e..b926a3f 100644
+--- a/src/video_core/rasterizer_cache/surface_params.h
++++ b/src/video_core/rasterizer_cache/surface_params.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <boost/icl/right_open_interval.hpp>
++#include <string>
+ #include "common/math_util.h"
+ #include "video_core/custom_textures/custom_format.h"
+ #include "video_core/rasterizer_cache/pixel_format.h"
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 9c2b604..cbc76ff 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -6,6 +6,7 @@
+ 
+ #include <atomic>
+ #include <functional>
++#include <string>
+ #include "common/common_types.h"
+ 
+ namespace Pica {
+diff --git a/src/video_core/renderer_opengl/gl_shader_util.h b/src/video_core/renderer_opengl/gl_shader_util.h
+index ee67b93..1e0ccc0 100644
+--- a/src/video_core/renderer_opengl/gl_shader_util.h
++++ b/src/video_core/renderer_opengl/gl_shader_util.h
+@@ -6,6 +6,8 @@
+ 
+ #include <span>
+ #include <glad/glad.h>
++#include <string>
++#include <string_view>
+ 
+ namespace OpenGL {
+ 
+diff --git a/src/video_core/renderer_opengl/gl_texture_mailbox.cpp b/src/video_core/renderer_opengl/gl_texture_mailbox.cpp
+index 2cdd0b7..82442f8 100644
+--- a/src/video_core/renderer_opengl/gl_texture_mailbox.cpp
++++ b/src/video_core/renderer_opengl/gl_texture_mailbox.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <chrono>
+ #include "common/logging/log.h"
+ #include "video_core/renderer_opengl/gl_state.h"
+ #include "video_core/renderer_opengl/gl_texture_mailbox.h"
+diff --git a/src/video_core/renderer_software/sw_clipper.h b/src/video_core/renderer_software/sw_clipper.h
+index 48965d6..35373f3 100644
+--- a/src/video_core/renderer_software/sw_clipper.h
++++ b/src/video_core/renderer_software/sw_clipper.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <tuple>
+ #include "common/common_types.h"
+ #include "common/vector_math.h"
+ #include "video_core/pica_types.h"
+diff --git a/src/video_core/renderer_vulkan/vk_instance.h b/src/video_core/renderer_vulkan/vk_instance.h
+index aeb404e..f33ece1 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.h
++++ b/src/video_core/renderer_vulkan/vk_instance.h
+@@ -5,6 +5,8 @@
+ #pragma once
+ 
+ #include <span>
++#include <string>
++#include <vector>
+ 
+ #include "video_core/pica/regs_pipeline.h"
+ #include "video_core/rasterizer_cache/pixel_format.h"
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.h b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+index f147128..6d3b574 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.h
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.h
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <condition_variable>
+ #include <queue>
++#include <deque>
+ #include "common/common_types.h"
+ #include "common/polyfill_thread.h"
+ #include "video_core/renderer_vulkan/vk_common.h"
+diff --git a/src/video_core/renderer_vulkan/vk_platform.h b/src/video_core/renderer_vulkan/vk_platform.h
+index ca5d765..22387cf 100644
+--- a/src/video_core/renderer_vulkan/vk_platform.h
++++ b/src/video_core/renderer_vulkan/vk_platform.h
+@@ -6,6 +6,8 @@
+ 
+ #include <memory>
+ #include <variant>
++#include <string>
++#include <string_view>
+ 
+ #include "common/common_types.h"
+ #include "common/dynamic_library/dynamic_library.h"
+diff --git a/src/video_core/renderer_vulkan/vk_resource_pool.h b/src/video_core/renderer_vulkan/vk_resource_pool.h
+index 9c5b7e8..2c69983 100644
+--- a/src/video_core/renderer_vulkan/vk_resource_pool.h
++++ b/src/video_core/renderer_vulkan/vk_resource_pool.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <vector>
++#include <span>
+ #include "common/common_types.h"
+ #include "video_core/renderer_vulkan/vk_common.h"
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_shader_disk_cache.h b/src/video_core/renderer_vulkan/vk_shader_disk_cache.h
+index 67a75db..f117717 100644
+--- a/src/video_core/renderer_vulkan/vk_shader_disk_cache.h
++++ b/src/video_core/renderer_vulkan/vk_shader_disk_cache.h
+@@ -8,6 +8,7 @@
+ #include <optional>
+ #include <unordered_set>
+ #include <tsl/robin_map.h>
++#include <unordered_map>
+ 
+ #include "common/common_types.h"
+ #include "common/file_util.h"
+diff --git a/src/video_core/renderer_vulkan/vk_shader_util.h b/src/video_core/renderer_vulkan/vk_shader_util.h
+index 7c2972d..9aa4171 100644
+--- a/src/video_core/renderer_vulkan/vk_shader_util.h
++++ b/src/video_core/renderer_vulkan/vk_shader_util.h
+@@ -5,6 +5,8 @@
+ #pragma once
+ 
+ #include <span>
++#include <string_view>
++#include <vector>
+ 
+ #include "video_core/renderer_vulkan/vk_common.h"
+ 
+diff --git a/src/video_core/shader/generator/glsl_shader_gen.h b/src/video_core/shader/generator/glsl_shader_gen.h
+index 21bb068..b5ac711 100644
+--- a/src/video_core/shader/generator/glsl_shader_gen.h
++++ b/src/video_core/shader/generator/glsl_shader_gen.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <string>
++
+ // High precision may or may not be supported in GLES3. If it isn't, use medium precision instead.
+ static constexpr char fragment_shader_precision_OES[] = R"(
+ #if GL_ES
+diff --git a/src/video_core/shader/generator/shader_uniforms.h b/src/video_core/shader/generator/shader_uniforms.h
+index 633c266..1668c00 100644
+--- a/src/video_core/shader/generator/shader_uniforms.h
++++ b/src/video_core/shader/generator/shader_uniforms.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include "common/vector_math.h"
+ #include "video_core/pica/regs_lighting.h"
+ 
+diff --git a/src/video_core/shader/generator/spv_fs_shader_gen.cpp b/src/video_core/shader/generator/spv_fs_shader_gen.cpp
+index e24c39f..87ba7e8 100644
+--- a/src/video_core/shader/generator/spv_fs_shader_gen.cpp
++++ b/src/video_core/shader/generator/spv_fs_shader_gen.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <boost/container/small_vector.hpp>
++#include <vector>
+ #include "video_core/shader/generator/pica_fs_config.h"
+ #include "video_core/shader/generator/spv_fs_shader_gen.h"
+ 
+diff --git a/src/video_core/shader/generator/spv_fs_shader_gen.h b/src/video_core/shader/generator/spv_fs_shader_gen.h
+index 851de0c..61142fd 100644
+--- a/src/video_core/shader/generator/spv_fs_shader_gen.h
++++ b/src/video_core/shader/generator/spv_fs_shader_gen.h
+@@ -6,6 +6,7 @@
+ 
+ #include <array>
+ #include <sirit/sirit.h>
++#include <vector>
+ 
+ #include "video_core/pica/regs_framebuffer.h"
+ #include "video_core/pica/regs_texturing.h"
+diff --git a/src/web_service/verify_user_jwt.cpp b/src/web_service/verify_user_jwt.cpp
+index 54b6ed9..371faa7 100644
+--- a/src/web_service/verify_user_jwt.cpp
++++ b/src/web_service/verify_user_jwt.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <system_error>
+ #include <jwt/jwt.hpp>
++#include <vector>
+ #include "common/logging/log.h"
+ #include "common/web_util.h"
+ #include "web_service/verify_user_jwt.h"
+-- 
+2.43.0
+
