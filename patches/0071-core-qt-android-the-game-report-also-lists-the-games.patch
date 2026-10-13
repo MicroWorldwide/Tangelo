@@ -1,0 +1,313 @@
+From fd785f26428a5f44086ec4b8cd5334af7252194f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 13 Oct 2026 20:52:47 +0200
+Subject: [PATCH] core/qt/android: the game report also lists the games in the game folders
+
+The opt-in game report only listed installed titles, so games played from
+the game folders (often a network folder with backups) showed up only once
+started. Both game lists now hand their folders' title IDs to the report
+when they have loaded (Qt: the game list's own folders; Android: the
+games folder, through NativeLibrary.setGameFolderTitles), and every report
+sends them as "folder". Until a game list has loaded, "folder" is left out
+so the server keeps what it knew.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ .../microworldwide/tangelo/NativeLibrary.kt   |  6 +++
+ .../tangelo/utils/GameHelper.kt               |  5 ++
+ src/android/app/src/main/jni/default_ini.h    |  4 +-
+ src/android/app/src/main/jni/native.cpp       | 16 ++++++
+ .../configuration/configure_network.ui        |  4 +-
+ src/citra_qt/game_list.cpp                    | 21 ++++++++
+ src/core/tangelo_report.cpp                   | 51 ++++++++++++++-----
+ src/core/tangelo_report.h                     | 14 ++++-
+ src/tests/core/tangelo_report.cpp             | 11 ++++
+ 9 files changed, 114 insertions(+), 18 deletions(-)
+
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/NativeLibrary.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/NativeLibrary.kt
+index c4d4196..e517ed9 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/NativeLibrary.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/NativeLibrary.kt
+@@ -158,6 +158,12 @@ object NativeLibrary {
+ 
+     private external fun getInstalledGamePathsImpl(): Array<String?>
+ 
++    /**
++     * The title IDs of the games in the games folder (not the installed ones), for the opt-in
++     * game report to the custom server.
++     */
++    external fun setGameFolderTitles(titleIds: LongArray)
++
+     // Create the config.ini file.
+     external fun createConfigFile()
+     external fun createLogFile()
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GameHelper.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GameHelper.kt
+index 31cbf26..831c206 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GameHelper.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GameHelper.kt
+@@ -32,6 +32,11 @@ object GameHelper {
+         val gamesUri = Uri.parse(gamesDir)
+ 
+         addGamesRecursive(games, FileUtil.listFiles(gamesUri), 3)
++        // The games folder's titles for the opt-in game report (installed ones are found by the
++        // report itself).
++        NativeLibrary.setGameFolderTitles(
++            games.map { it.titleId }.filter { it != 0L }.distinct().toLongArray()
++        )
+         NativeLibrary.getInstalledGamePaths().forEach {
+             games.add(
+                 getGame(Uri.parse(it.path), isInstalled = true, addedToLibrary = true, it.mediaType)
+diff --git a/src/android/app/src/main/jni/default_ini.h b/src/android/app/src/main/jni/default_ini.h
+index 1d4cb6b..3d2b011 100644
+--- a/src/android/app/src/main/jni/default_ini.h
++++ b/src/android/app/src/main/jni/default_ini.h
+@@ -603,8 +603,8 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
+ # Report the virtual access point as a Nintendo Zone hotspot (SSID "NintendoSpotPass1")
+ # 0: Off (default), 1: On
+ )") DECLARE_KEY(nintendo_zone_mode) BOOST_HANA_STRING(R"(
+-# With the custom server: tell it at every game start which game started and which games are
+-# installed (under this install's Console ID), for the server's overview. Nothing goes to Nintendo.
++# With the custom server: tell it at every game start which game started, which games are
++# installed and which are in the games folder (under this install's Console ID), for the server's overview. Nothing goes to Nintendo.
+ # 0: Off (default), 1: On
+ )") DECLARE_KEY(share_games_with_server) BOOST_HANA_STRING("\n")
+ 
+diff --git a/src/android/app/src/main/jni/native.cpp b/src/android/app/src/main/jni/native.cpp
+index 93757ad..425df4d 100644
+--- a/src/android/app/src/main/jni/native.cpp
++++ b/src/android/app/src/main/jni/native.cpp
+@@ -44,6 +44,7 @@
+ #include "core/hw/unique_data.h"
+ #include "core/loader/loader.h"
+ #include "core/savestate.h"
++#include "core/tangelo_report.h"
+ #include "core/zip_pass.h"
+ #include "core/system_titles.h"
+ #include "jni/android_common/android_common.h"
+@@ -786,6 +787,21 @@ jobjectArray Java_io_github_microworldwide_tangelo_NativeLibrary_getInstalledGam
+     return jgames;
+ }
+ 
++void Java_io_github_microworldwide_tangelo_NativeLibrary_setGameFolderTitles(
++    JNIEnv* env, [[maybe_unused]] jobject obj, jlongArray j_titles) {
++    std::vector<u64> titles;
++    if (j_titles != nullptr) {
++        const jsize count = env->GetArrayLength(j_titles);
++        std::vector<jlong> values(static_cast<std::size_t>(count));
++        env->GetLongArrayRegion(j_titles, 0, count, values.data());
++        titles.reserve(values.size());
++        for (const jlong value : values) {
++            titles.push_back(static_cast<u64>(value));
++        }
++    }
++    Core::SetGameFolderTitles(std::move(titles));
++}
++
+ jlongArray Java_io_github_microworldwide_tangelo_NativeLibrary_getSystemTitleIds(JNIEnv* env,
+                                                                      [[maybe_unused]] jobject obj,
+                                                                      jint system_type,
+diff --git a/src/citra_qt/configuration/configure_network.ui b/src/citra_qt/configuration/configure_network.ui
+index 0ad7d4b..a068727 100644
+--- a/src/citra_qt/configuration/configure_network.ui
++++ b/src/citra_qt/configuration/configure_network.ui
+@@ -116,10 +116,10 @@
+       <item>
+        <widget class="QCheckBox" name="share_games_checkbox">
+         <property name="text">
+-         <string>Share my installed and played games with the server</string>
++         <string>Share my games (installed, in my game folders, played) with the server</string>
+         </property>
+         <property name="toolTip">
+-         <string>Each time a game starts, Tangelo tells the custom server which game started and which games are installed, under this install's Console ID (Configure &gt; System). The server's owner can then see them in its overview. Nothing is sent to Nintendo.</string>
++         <string>Each time a game starts, Tangelo tells the custom server which game started, which games are installed and which are in your game folders, under this install's Console ID (Configure &gt; System). The server's owner can then see them in its overview. Nothing is sent to Nintendo.</string>
+         </property>
+        </widget>
+       </item>
+diff --git a/src/citra_qt/game_list.cpp b/src/citra_qt/game_list.cpp
+index 1409a3d..9b11e53 100644
+--- a/src/citra_qt/game_list.cpp
++++ b/src/citra_qt/game_list.cpp
+@@ -42,6 +42,7 @@
+ #include "core/file_sys/archive_source_sd_savedata.h"
+ #include "core/hle/service/am/am.h"
+ #include "core/hle/service/fs/archive.h"
++#include "core/tangelo_report.h"
+ #include "qcursor.h"
+ 
+ GameListSearchField::KeyReleaseEater::KeyReleaseEater(GameList* gamelist, QObject* parent)
+@@ -518,6 +519,26 @@ void GameList::DonePopulating(const QStringList& watch_list) {
+     }
+     tree_view->header()->setStretchLastSection(true);
+ 
++    // The games in the user's own game folders (not the installed ones) for the opt-in game
++    // report: the server lists them per console as "in the game folders".
++    std::vector<u64> folder_titles;
++    for (int i = 0; i < item_model->rowCount(); ++i) {
++        const QStandardItem* dir = item_model->item(i, 0);
++        if (dir == nullptr || static_cast<GameListItemType>(dir->type()) !=
++                                  GameListItemType::CustomDir) {
++            continue;
++        }
++        for (int row = 0; row < dir->rowCount(); ++row) {
++            const QStandardItem* game = dir->child(row, 0);
++            if (game != nullptr &&
++                static_cast<GameListItemType>(game->type()) == GameListItemType::Game) {
++                folder_titles.push_back(
++                    game->data(GameListItemPath::ProgramIdRole).toULongLong());
++            }
++        }
++    }
++    Core::SetGameFolderTitles(std::move(folder_titles));
++
+     emit PopulatingCompleted();
+ }
+ 
+diff --git a/src/core/tangelo_report.cpp b/src/core/tangelo_report.cpp
+index 70aba36..adba359 100644
+--- a/src/core/tangelo_report.cpp
++++ b/src/core/tangelo_report.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <algorithm>
+ #include <memory>
++#include <mutex>
++#include <optional>
+ #include <thread>
+ #include <fmt/format.h>
+ #include <httplib.h>
+@@ -24,6 +26,17 @@ namespace {
+ // Title ID high halves worth reporting: applications, demos, updates and DLC.
+ constexpr u32 ReportedTitleTypes[] = {0x00040000, 0x00040002, 0x0004000E, 0x0004008C};
+ 
++std::mutex folder_mutex;
++std::optional<std::vector<u64>> folder_titles;
++
++std::string TitleList(const std::vector<u64>& titles) {
++    std::string list;
++    for (const u64 title : titles) {
++        list += fmt::format("{}\"{:016X}\"", list.empty() ? "" : ",", title);
++    }
++    return list;
++}
++
+ std::string JsonString(std::string_view text) {
+     std::string out = "\"";
+     for (const char c : text) {
+@@ -92,15 +105,22 @@ std::vector<u64> ListInstalledGames() {
+     return titles;
+ }
+ 
+-std::string MakeGameReport(u64 console_id, u64 started_title, const std::vector<u64>& installed) {
+-    std::string list;
+-    for (const u64 title : installed) {
+-        list += fmt::format("{}\"{:016X}\"", list.empty() ? "" : ",", title);
+-    }
++void SetGameFolderTitles(std::vector<u64> titles) {
++    std::sort(titles.begin(), titles.end());
++    titles.erase(std::unique(titles.begin(), titles.end()), titles.end());
++    titles.erase(std::remove(titles.begin(), titles.end(), u64{0}), titles.end());
++    std::scoped_lock lock{folder_mutex};
++    folder_titles = std::move(titles);
++}
++
++std::string MakeGameReport(u64 console_id, u64 started_title, const std::vector<u64>& installed,
++                           const std::optional<std::vector<u64>>& folder) {
++    const std::string folder_part =
++        folder ? fmt::format(",\"folder\":[{}]", TitleList(*folder)) : std::string{};
+     return fmt::format("{{\"console_id\":\"{:016X}\",\"started\":\"{:016X}\","
+-                       "\"installed\":[{}],\"tangelo\":{},\"platform\":\"{}\"}}",
+-                       console_id, started_title, list, JsonString(Common::g_scm_desc),
+-                       Platform());
++                       "\"installed\":[{}]{},\"tangelo\":{},\"platform\":\"{}\"}}",
++                       console_id, started_title, TitleList(installed), folder_part,
++                       JsonString(Common::g_scm_desc), Platform());
+ }
+ 
+ std::string GameReportUrl(const std::string& server) {
+@@ -130,10 +150,15 @@ void ReportGameStart(System& system, u64 started_title) {
+     if (const auto cfg = Service::CFG::GetModule(system)) {
+         console_id = cfg->GetConsoleUniqueId();
+     }
++    std::optional<std::vector<u64>> folder;
++    {
++        std::scoped_lock lock{folder_mutex};
++        folder = folder_titles;
++    }
+     // Everything the thread needs is copied: it may outlive this game.
+-    std::thread([url, console_id, started_title] {
++    std::thread([url, console_id, started_title, folder = std::move(folder)] {
+         const std::vector<u64> installed = ListInstalledGames();
+-        const std::string body = MakeGameReport(console_id, started_title, installed);
++        const std::string body = MakeGameReport(console_id, started_title, installed, folder);
+         const Common::URLInfo info = Common::SplitUrl(url);
+         std::unique_ptr<httplib::ClientImpl> client;
+         if (info.is_https) {
+@@ -153,8 +178,10 @@ void ReportGameStart(System& system, u64 started_title) {
+         } else if (response->status != 200) {
+             LOG_WARNING(Core, "Game report for {:016X}: HTTP {}", started_title, response->status);
+         } else {
+-            LOG_INFO(Core, "Game report sent: started {:016X}, {} installed title(s)",
+-                     started_title, installed.size());
++            LOG_INFO(Core, "Game report sent: started {:016X}, {} installed title(s), {}",
++                     started_title, installed.size(),
++                     folder ? fmt::format("{} in the game folders", folder->size())
++                            : std::string{"game folders not loaded yet"});
+         }
+     }).detach();
+ }
+diff --git a/src/core/tangelo_report.h b/src/core/tangelo_report.h
+index 00a087d..930085e 100644
+--- a/src/core/tangelo_report.h
++++ b/src/core/tangelo_report.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include <string>
+ #include <vector>
+ #include "common/common_types.h"
+@@ -16,8 +17,17 @@ class System;
+ /// in the NAND, read from their title folders.
+ std::vector<u64> ListInstalledGames();
+ 
+-/// The JSON body of a game report (see ReportGameStart).
+-std::string MakeGameReport(u64 console_id, u64 started_title, const std::vector<u64>& installed);
++/**
++ * The titles of the games in the frontend's game folders (the game list's own folders, network
++ * folders included, not the installed titles), set by the frontend each time its game list has
++ * been loaded. Game reports send them as "folder". Until the frontend has set them, reports
++ * leave "folder" out, so the server keeps what it knew.
++ */
++void SetGameFolderTitles(std::vector<u64> titles);
++
++/// The JSON body of a game report (see ReportGameStart). `folder` is left out when not known.
++std::string MakeGameReport(u64 console_id, u64 started_title, const std::vector<u64>& installed,
++                           const std::optional<std::vector<u64>>& folder = std::nullopt);
+ 
+ /// The address a game report goes to: the custom Nintendo server ("[scheme://]host[:port]
+ /// [/base]", http when no scheme is given) with "/tangelo/v1/games" added to its path.
+diff --git a/src/tests/core/tangelo_report.cpp b/src/tests/core/tangelo_report.cpp
+index 39e711a..f58dc37 100644
+--- a/src/tests/core/tangelo_report.cpp
++++ b/src/tests/core/tangelo_report.cpp
+@@ -27,4 +27,15 @@ TEST_CASE("MakeGameReport lists the started and installed titles", "[core][tange
+ 
+     const std::string empty = Core::MakeGameReport(1, 2, {});
+     REQUIRE(empty.find("\"installed\":[]") != std::string::npos);
++    // The game folders are left out until the frontend has loaded its game list.
++    REQUIRE(empty.find("\"folder\"") == std::string::npos);
++}
++
++TEST_CASE("MakeGameReport sends the game folder titles when known", "[core][tangelo_report]") {
++    const std::string body = Core::MakeGameReport(
++        1, 0x00040000001A2E00, {}, std::vector<u64>{0x00040000001A2E00, 0x0004000000153600});
++    REQUIRE(body.find("\"folder\":[\"00040000001A2E00\",\"0004000000153600\"]") !=
++            std::string::npos);
++    const std::string none = Core::MakeGameReport(1, 2, {}, std::vector<u64>{});
++    REQUIRE(none.find("\"folder\":[]") != std::string::npos);
+ }
+-- 
+2.43.0
+
