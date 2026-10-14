@@ -1,0 +1,159 @@
+From c5037ebd839b2ec7ecf38a78aa8861cb14b1dd78 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 21:29:02 +0200
+Subject: [PATCH] android: Nintendo services settings on the Network screen
+
+Settings > Network now has a "Nintendo services" part like the desktop's
+Configure > General > Network: "Use a custom server", the server address,
+"Share my games with the server" and "Connect as a Nintendo Zone hotspot".
+The address and game sharing are greyed out while the custom server is
+off. They are the same config.ini settings ([WebService]) the native side
+already reads, so no more editing config.ini by hand on a phone. The room
+settings (Web API URL, token) follow under their own "Network / Room"
+header.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ .../tangelo/features/settings/SettingKeys.kt  |  4 ++
+ .../features/settings/model/BooleanSetting.kt | 13 +++++-
+ .../features/settings/model/StringSetting.kt  |  3 +-
+ .../settings/ui/SettingsFragmentPresenter.kt  | 45 +++++++++++++++++++
+ .../app/src/main/res/values/strings.xml       | 12 +++++
+ 5 files changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt
+index c6593c5..0bd7cfd 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt
+@@ -129,6 +129,10 @@ object SettingKeys {
+     external fun record_frame_times(): String
+     external fun web_api_url(): String
+     external fun network_token(): String
++    external fun use_custom_nintendo_server(): String
++    external fun nintendo_server_url(): String
++    external fun nintendo_zone_mode(): String
++    external fun share_games_with_server(): String
+     external fun check_for_update_on_start(): String
+     external fun update_check_channel(): String
+ 
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/BooleanSetting.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/BooleanSetting.kt
+index 36ee3e1..2b4cc6c 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/BooleanSetting.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/BooleanSetting.kt
+@@ -130,7 +130,18 @@ enum class BooleanSetting(
+         Settings.SECTION_RENDERER,
+         false
+     ),
+-    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), Settings.SECTION_MISC, true);
++    CHECK_FOR_UPDATES(SettingKeys.check_for_update_on_start(), Settings.SECTION_MISC, true),
++    USE_CUSTOM_NINTENDO_SERVER(
++        SettingKeys.use_custom_nintendo_server(),
++        Settings.SECTION_NETWORK,
++        false
++    ),
++    NINTENDO_ZONE_MODE(SettingKeys.nintendo_zone_mode(), Settings.SECTION_NETWORK, false),
++    SHARE_GAMES_WITH_SERVER(
++        SettingKeys.share_games_with_server(),
++        Settings.SECTION_NETWORK,
++        false
++    );
+ 
+     override var boolean: Boolean = defaultValue
+ 
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt
+index 22d27d5..0b6fa82 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt
+@@ -27,7 +27,8 @@ enum class StringSetting(
+         "_back"
+     ),
+     WEB_API_URL(SettingKeys.web_api_url(), Settings.SECTION_NETWORK, "http://88.198.47.46:5000"),
+-    NETWORK_TOKEN(SettingKeys.network_token(), Settings.SECTION_NETWORK, "");
++    NETWORK_TOKEN(SettingKeys.network_token(), Settings.SECTION_NETWORK, ""),
++    NINTENDO_SERVER_URL(SettingKeys.nintendo_server_url(), Settings.SECTION_NETWORK, "");
+ 
+     override var string: String = defaultValue
+ 
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt
+index 38be47c..ab899c1 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -1791,6 +1791,51 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView)
+     private fun addNetworkSettings(sl: ArrayList<SettingsItem>) {
+         settingsActivity.setToolbarTitle(settingsActivity.getString(R.string.preferences_network))
+         sl.apply {
++            // Tangelo: the custom Nintendo services server (same settings as Configure > General >
++            // Network on the desktop).
++            val customServer = BooleanSetting.USE_CUSTOM_NINTENDO_SERVER.boolean
++            add(HeaderSetting(R.string.nintendo_services, R.string.nintendo_services_description))
++            add(
++                SwitchSetting(
++                    BooleanSetting.USE_CUSTOM_NINTENDO_SERVER,
++                    R.string.use_custom_nintendo_server,
++                    R.string.use_custom_nintendo_server_description,
++                    BooleanSetting.USE_CUSTOM_NINTENDO_SERVER.key,
++                    BooleanSetting.USE_CUSTOM_NINTENDO_SERVER.defaultValue
++                )
++            )
++            add(
++                StringInputSetting(
++                    StringSetting.NINTENDO_SERVER_URL,
++                    R.string.nintendo_server_url,
++                    R.string.nintendo_server_url_description,
++                    StringSetting.NINTENDO_SERVER_URL.key,
++                    StringSetting.NINTENDO_SERVER_URL.defaultValue,
++                    isEnabled = customServer,
++                    disabledMessage = R.string.requires_custom_nintendo_server
++                )
++            )
++            add(
++                SwitchSetting(
++                    BooleanSetting.SHARE_GAMES_WITH_SERVER,
++                    R.string.share_games_with_server,
++                    R.string.share_games_with_server_description,
++                    BooleanSetting.SHARE_GAMES_WITH_SERVER.key,
++                    BooleanSetting.SHARE_GAMES_WITH_SERVER.defaultValue,
++                    isEnabled = customServer,
++                    disabledMessage = R.string.requires_custom_nintendo_server
++                )
++            )
++            add(
++                SwitchSetting(
++                    BooleanSetting.NINTENDO_ZONE_MODE,
++                    R.string.nintendo_zone_mode,
++                    R.string.nintendo_zone_mode_description,
++                    BooleanSetting.NINTENDO_ZONE_MODE.key,
++                    BooleanSetting.NINTENDO_ZONE_MODE.defaultValue
++                )
++            )
++            add(HeaderSetting(R.string.network_room))
+             add(
+                 StringInputSetting(
+                     StringSetting.WEB_API_URL,
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 59b9fb2..4986972 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -50,6 +50,18 @@
+     <string name="web_api_url_description">Web API URL for public room functionality</string>
+     <string name="network_token">Network Token</string>
+     <string name="network_token_description">Token for public room functionality</string>
++    <string name="nintendo_services">Nintendo services</string>
++    <string name="nintendo_services_description">Where requests meant for Nintendo\'s servers go: SpotPass, game server login, system update, accounts, eShop.</string>
++    <string name="use_custom_nintendo_server">Use a custom server</string>
++    <string name="use_custom_nintendo_server_description">Send every request meant for Nintendo to your own server (like Tangelo\'s server package) instead. Off: Nintendo\'s servers.</string>
++    <string name="nintendo_server_url">Server address</string>
++    <string name="nintendo_server_url_description">For example http://10.10.15.25:8080. Without a scheme, http is used. The path is kept and the X-Tangelo-Original-Host header names the Nintendo server, so one server can route everything.</string>
++    <string name="share_games_with_server">Share my games with the server</string>
++    <string name="share_games_with_server_description">Each time a game starts, tell the custom server which game started, which games are installed and which are in the games folder, under this install\'s Console ID. Nothing is sent to Nintendo.</string>
++    <string name="nintendo_zone_mode">Connect as a Nintendo Zone hotspot</string>
++    <string name="nintendo_zone_mode_description">Games see the virtual access point as a Nintendo Zone (network name NintendoSpotPass1), e.g. for gifts that were only handed out at Nintendo Zone hotspots.</string>
++    <string name="requires_custom_nintendo_server">Turn on \"Use a custom server\" first.</string>
++    <string name="network_room">Network / Room</string>
+     <string name="username_uses_system">This property is linked to the 3DS system username.</string>
+     <string name="username_invalid">Username is not valid. Must be 4 to 20 alphanumeric characters.</string>
+ 
+-- 
+2.43.0
+
