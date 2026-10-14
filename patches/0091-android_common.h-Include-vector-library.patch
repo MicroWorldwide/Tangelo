@@ -1,0 +1,30 @@
+From 5fc5fa3edd11f89402c956b15a93157a3847a4df Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 22:57:32 +0200
+Subject: [PATCH 91/92] android_common.h: Include vector library
+
+From AzaharPlus 2126.2-A, commit 9eeb7be8cfd37a7a4b166da0c1a41138ac7ad838, by Reg Tiangha.
+
+(cherry picked from commit 9eeb7be8cfd37a7a4b166da0c1a41138ac7ad838)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/android/app/src/main/jni/android_common/android_common.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/android/app/src/main/jni/android_common/android_common.h b/src/android/app/src/main/jni/android_common/android_common.h
+index 9c6ad434a..db5df972a 100644
+--- a/src/android/app/src/main/jni/android_common/android_common.h
++++ b/src/android/app/src/main/jni/android_common/android_common.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <string>
++#include <vector>
+ 
+ #include <jni.h>
+ #include <string_view>
+-- 
+2.43.0
+

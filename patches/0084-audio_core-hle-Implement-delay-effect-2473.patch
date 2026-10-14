@@ -1,0 +1,434 @@
+From 95987ae580a6ed2accbc5c14fe122255c663ce70 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 22:57:08 +0200
+Subject: [PATCH 84/92] audio_core: hle: Implement delay effect (#2473)
+
+* audio_core: hle: Implement delay effect
+
+* Fix undefined behaviour
+
+From AzaharPlus 2126.2-A, commit 2881dd25d78d28cd3de634e06b37f9c3b95822f6, by PabloMK7.
+
+(cherry picked from commit 2881dd25d78d28cd3de634e06b37f9c3b95822f6)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/audio_core/CMakeLists.txt  |   2 +
+ src/audio_core/hle/effects.cpp | 154 +++++++++++++++++++++++++++++++++
+ src/audio_core/hle/effects.h   |  79 +++++++++++++++++
+ src/audio_core/hle/mixers.cpp  |  31 ++++++-
+ src/audio_core/hle/mixers.h    |  11 ++-
+ src/common/string_util.cpp     |  19 ++++
+ src/common/string_util.h       |   2 +
+ 7 files changed, 296 insertions(+), 2 deletions(-)
+ create mode 100644 src/audio_core/hle/effects.cpp
+ create mode 100644 src/audio_core/hle/effects.h
+
+diff --git a/src/audio_core/CMakeLists.txt b/src/audio_core/CMakeLists.txt
+index ee028d52d..396d35d30 100644
+--- a/src/audio_core/CMakeLists.txt
++++ b/src/audio_core/CMakeLists.txt
+@@ -11,6 +11,8 @@ add_library(audio_core STATIC EXCLUDE_FROM_ALL
+     hle/common.h
+     hle/decoder.cpp
+     hle/decoder.h
++    hle/effects.cpp
++    hle/effects.h
+     hle/filter.cpp
+     hle/filter.h
+     hle/hle.cpp
+diff --git a/src/audio_core/hle/effects.cpp b/src/audio_core/hle/effects.cpp
+new file mode 100644
+index 000000000..5f327b368
+--- /dev/null
++++ b/src/audio_core/hle/effects.cpp
+@@ -0,0 +1,154 @@
++// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#include <algorithm>
++#include <cmath>
++#include <string>
++#include "audio_core/hle/effects.h"
++#include "common/logging/log.h"
++#include "common/string_util.h"
++
++namespace AudioCore::HLE {
++
++static s32 ClampToS32(float value) {
++    // Clamp to valid S32 range.
++    constexpr float min = -2147483648.0f;
++    constexpr float max = 2147483520.0f;
++    return static_cast<s32>(std::clamp(value, min, max));
++}
++
++void DelayEffect::Reset() {
++    enabled = false;
++    delay_samples = 0;
++    g = a = b = 0.0f;
++    for (auto& channel : delay_output) {
++        channel.clear();
++    }
++    last_output.fill(0.0f);
++    delay_pos = 0;
++}
++
++void DelayEffect::Resize(u32 samples) {
++    if (samples == delay_samples && !delay_output[0].empty()) {
++        return;
++    }
++    delay_samples = samples;
++    delay_pos = 0;
++    last_output.fill(0.0f);
++    for (auto& channel : delay_output) {
++        channel.assign(samples, 0.0f);
++    }
++}
++
++void DelayEffect::ParseConfig(DspConfiguration::DelayEffect& config, std::size_t index) {
++    if (!config.dirty_raw) {
++        return;
++    }
++
++    const bool was_enabled = enabled;
++    enabled = config.enable != 0;
++
++    if (!enabled) {
++        config.dirty_raw = 0;
++        if (was_enabled) {
++            LOG_DEBUG(Audio_DSP, "delay_effect[{}] disabled", index);
++            Reset();
++        }
++        return;
++    }
++
++    u32 samples = static_cast<u32>(config.frame_count) * samples_per_frame;
++    if (samples == 0) {
++        // Delay of zero samples is invalid as it would make the DSP read the sample it is
++        // about to write. Figure out what real HW does in this case.
++        LOG_DEBUG(Audio_DSP, "delay_effect[{}] enabled with frame_count=0, bypassing", index);
++        enabled = false;
++        config.dirty_raw = 0;
++        Reset();
++        return;
++    }
++    if (samples > max_delay_samples) {
++        LOG_WARNING(Audio_DSP, "delay_effect[{}] frame_count={} exceeds sane range, clamping",
++                    index, static_cast<u32>(config.frame_count));
++        samples = max_delay_samples;
++    }
++
++    // Convert s16 with 7 fractional bits to float.
++    constexpr float q7_scale = 1.0f / 128.0f;
++
++    g = static_cast<s16>(config.g) * q7_scale;
++    a = static_cast<s16>(config.a) * q7_scale;
++    b = static_cast<s16>(config.b) * q7_scale;
++
++    Resize(samples);
++
++    LOG_DEBUG(Audio_DSP,
++              "delay_effect[{}] enabled work_buffer_address=0x{:08X} frames={} samples={} g={} "
++              "a={} b={} outputs={:#x}",
++              index, static_cast<u32>(config.work_buffer_address),
++              static_cast<u32>(config.frame_count), samples, g, a, b,
++              static_cast<u32>(config.outputs));
++
++    // We do not need the work buffer provided by the application as it is kept track separately.
++    // Figure out if it is needed to have it in memory in case some application tries to access it.
++
++    config.dirty_raw = 0;
++}
++
++void DelayEffect::ProcessFrame(QuadFrame32& frame) {
++    if (!enabled) {
++        return;
++    }
++
++    for (std::size_t sample = 0; sample < samples_per_frame; sample++) {
++        const std::size_t pos = (delay_pos + sample) % delay_samples;
++        for (std::size_t channel = 0; channel < 4; channel++) {
++            /*
++             * Formula:
++             *      H(z) = a z^-N / (1 - b z^-1 + a g z^-N),   N = frame_count * samples_per_frame
++             *      \/
++             *      Y(z) * (1 - b z^-1 + a g z^-N) = a z^-N * X(z)
++             *      \/
++             *      y[n] - b y[n-1] + a g y[n-N] = a x[n-N]
++             *      \/
++             *      y[n] = b y[n-1] - a g y[n-N] + a x[n-N]
++             *          Can be simplified to no need two buffers y[n-N] and x[n-N]
++             *      \/
++             *      y[n] = b y[n-1] + a ( x[n-N] - g y[n-N] )
++             *      \/
++             *      v[n-N] = x[n-N] - g y[n-N]
++             *      y[n] = b y[n-1] + a v[n-N]
++             */
++
++            const float x = static_cast<float>(frame[sample][channel]);
++            const float delayed = delay_output[channel][pos];
++
++            // y[n] = b y[n-1] + a v[n-N]
++            const float y = b * last_output[channel] + a * delayed;
++            // v[n] = x[n] - g y[n]
++            delay_output[channel][pos] = x - g * y;
++
++            last_output[channel] = y;
++            frame[sample][channel] = ClampToS32(y);
++        }
++    }
++
++    delay_pos = (delay_pos + samples_per_frame) % delay_samples;
++}
++
++void ReverbEffect::Reset() {
++    // TODO: Implement
++}
++
++void ReverbEffect::ParseConfig(const DspConfiguration::ReverbEffect& config, std::size_t index) {
++    // TODO: Implement, log the configuration for now.
++    LOG_DEBUG(Audio_DSP, "(stubbed) reverb_effect[{}], raw block: {}", index,
++              Common::BytesToHex({reinterpret_cast<const u8*>(&config), sizeof(config)}, 4));
++}
++
++void ReverbEffect::ProcessFrame(QuadFrame32& frame) {
++    // TODO: Implement
++    (void)frame;
++}
++} // namespace AudioCore::HLE
+diff --git a/src/audio_core/hle/effects.h b/src/audio_core/hle/effects.h
+new file mode 100644
+index 000000000..c57e21ddf
+--- /dev/null
++++ b/src/audio_core/hle/effects.h
+@@ -0,0 +1,79 @@
++// Copyright 2026 Citra Emulator Project / Azahar Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the license.txt file included.
++
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <vector>
++#include <boost/serialization/array.hpp>
++#include <boost/serialization/vector.hpp>
++#include "audio_core/audio_types.h"
++#include "audio_core/hle/shared_memory.h"
++#include "common/common_types.h"
++
++namespace AudioCore::HLE {
++
++class DelayEffect final {
++public:
++    void Reset();
++
++    void ParseConfig(DspConfiguration::DelayEffect& config, std::size_t index);
++
++    void ProcessFrame(QuadFrame32& frame);
++
++    bool IsEnabled() const {
++        return enabled;
++    }
++
++private:
++    // Set a max delay to prevent garbage data allocating too much memory.
++    // 4 seconds seems like a reasonable amount.
++    // TODO: Check if real HW limits this in another way.
++    static constexpr u32 max_delay_samples = 4 * native_sample_rate;
++
++    void Resize(u32 samples);
++
++    bool enabled = false;
++    u32 delay_samples = 0;
++
++    // Coefficients, converted from the s16 Q7 values in shared memory.
++    float g = 0.0f;
++    float a = 0.0f;
++    float b = 0.0f;
++
++    std::array<std::vector<float>, 4> delay_output{};
++    std::array<float, 4> last_output{};
++    std::size_t delay_pos = 0;
++
++    template <class Archive>
++    void serialize(Archive& ar, const unsigned int) {
++        ar & enabled;
++        ar & delay_samples;
++        ar & g;
++        ar & a;
++        ar & b;
++        ar & delay_output;
++        ar & last_output;
++        ar & delay_pos;
++    }
++    friend class boost::serialization::access;
++};
++
++// TODO: Figure out the reverb effect.
++class ReverbEffect final {
++public:
++    void Reset();
++
++    void ParseConfig(const DspConfiguration::ReverbEffect& config, std::size_t index);
++
++    void ProcessFrame(QuadFrame32& frame);
++
++private:
++    template <class Archive>
++    void serialize(Archive&, const unsigned int) {}
++    friend class boost::serialization::access;
++};
++
++} // namespace AudioCore::HLE
+diff --git a/src/audio_core/hle/mixers.cpp b/src/audio_core/hle/mixers.cpp
+index 387a4f54a..ddb93d474 100644
+--- a/src/audio_core/hle/mixers.cpp
++++ b/src/audio_core/hle/mixers.cpp
+@@ -1,4 +1,4 @@
+-// Copyright 2016-2025 Citra Emulator Project / Azahar Emulator Project
++// Copyright 2016-2026 Citra Emulator Project / Azahar Emulator Project
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+@@ -35,6 +35,8 @@ DspStatus Mixers::Tick(DspConfiguration& config, const IntermediateMixSamples& r
+     AuxReturn(read_samples);
+     AuxSend(write_samples, input);
+ 
++    ApplyEffects();
++
+     MixCurrentFrame();
+ 
+     return GetCurrentStatus();
+@@ -82,6 +84,26 @@ void Mixers::ParseConfig(DspConfiguration& config) {
+                   static_cast<std::size_t>(config.output_format));
+     }
+ 
++    if (config.delay_effect_0_dirty) {
++        config.delay_effect_0_dirty.Assign(0);
++        state.delay_effect[0].ParseConfig(config.delay_effect[0], 0);
++    }
++
++    if (config.delay_effect_1_dirty) {
++        config.delay_effect_1_dirty.Assign(0);
++        state.delay_effect[1].ParseConfig(config.delay_effect[1], 1);
++    }
++
++    if (config.reverb_effect_0_dirty) {
++        config.reverb_effect_0_dirty.Assign(0);
++        state.reverb_effect[0].ParseConfig(config.reverb_effect[0], 0);
++    }
++
++    if (config.reverb_effect_1_dirty) {
++        config.reverb_effect_1_dirty.Assign(0);
++        state.reverb_effect[1].ParseConfig(config.reverb_effect[1], 1);
++    }
++
+     if (config.headphones_connected_dirty) {
+         config.headphones_connected_dirty.Assign(0);
+         // Do nothing. (Note: Whether headphones are connected does affect coefficients used for
+@@ -197,6 +219,13 @@ void Mixers::AuxSend(IntermediateMixSamples& write_samples,
+     }
+ }
+ 
++void Mixers::ApplyEffects() {
++    for (u32 i = 0; i < 2; i++) {
++        state.delay_effect[i].ProcessFrame(state.intermediate_mix_buffer[i + 1]);
++        state.reverb_effect[i].ProcessFrame(state.intermediate_mix_buffer[i + 1]);
++    }
++}
++
+ void Mixers::MixCurrentFrame() {
+     current_frame.fill({});
+ 
+diff --git a/src/audio_core/hle/mixers.h b/src/audio_core/hle/mixers.h
+index 1023f4fe5..e20ac0590 100644
+--- a/src/audio_core/hle/mixers.h
++++ b/src/audio_core/hle/mixers.h
+@@ -1,4 +1,4 @@
+-// Copyright 2016-2025 Citra Emulator Project / Azahar Emulator Project
++// Copyright 2016-2026 Citra Emulator Project / Azahar Emulator Project
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+@@ -7,6 +7,7 @@
+ #include <array>
+ #include <boost/serialization/array.hpp>
+ #include "audio_core/audio_types.h"
++#include "audio_core/hle/effects.h"
+ #include "audio_core/hle/shared_memory.h"
+ 
+ namespace AudioCore::HLE {
+@@ -41,6 +42,10 @@ private:
+         std::array<bool, 2> aux_bus_enable = {};
+         std::array<QuadFrame32, 3> intermediate_mix_buffer = {};
+ 
++        // Effect index i applies to intermediate_mix_buffer[i + 1].
++        std::array<DelayEffect, 2> delay_effect = {};
++        std::array<ReverbEffect, 2> reverb_effect = {};
++
+         OutputFormat output_format = OutputFormat::Stereo;
+ 
+         template <class Archive>
+@@ -48,6 +53,8 @@ private:
+             ar & intermediate_mixer_volume;
+             ar & aux_bus_enable;
+             ar & intermediate_mix_buffer;
++            ar & delay_effect;
++            ar & reverb_effect;
+             ar & output_format;
+         }
+     };
+@@ -61,6 +68,8 @@ private:
+     void AuxReturn(const IntermediateMixSamples& read_samples);
+     /// INTERNAL: Write samples to shared memory for the ARM11 to modify.
+     void AuxSend(IntermediateMixSamples& write_samples, const std::array<QuadFrame32, 3>& input);
++    /// INTERNAL: Apply the delay and reverb effects.
++    void ApplyEffects();
+     /// INTERNAL: Mix current_frame.
+     void MixCurrentFrame();
+     /// INTERNAL: Downmix from quadraphonic to stereo based on status.output_format and accumulate
+diff --git a/src/common/string_util.cpp b/src/common/string_util.cpp
+index 0540951a4..6069f315a 100644
+--- a/src/common/string_util.cpp
++++ b/src/common/string_util.cpp
+@@ -277,4 +277,23 @@ std::string StringFromFixedZeroTerminatedBuffer(const char* buffer, std::size_t
+ 
+     return std::string(buffer, len);
+ }
++
++std::string BytesToHex(std::span<const u8> data, u32 group_each) {
++    if (data.empty())
++        return {};
++
++    const std::size_t groups = group_each ? (data.size() + group_each - 1) / group_each : 1;
++
++    std::string result;
++    result.reserve(data.size() * 2 + (groups - 1));
++
++    for (std::size_t i = 0; i < data.size(); ++i) {
++        if (group_each && i != 0 && i % group_each == 0)
++            result += ' ';
++        result += fmt::format("{:02X}", data[i]);
++    }
++
++    return result;
++}
++
+ } // namespace Common
+diff --git a/src/common/string_util.h b/src/common/string_util.h
+index 5a88f9b03..c406d36eb 100644
+--- a/src/common/string_util.h
++++ b/src/common/string_util.h
+@@ -108,4 +108,6 @@ inline void TruncateString(std::string& str) {
+ 
+ #define HANA_TO_STD_STRING(hana_string) std::string(hana_string.c_str())
+ 
++std::string BytesToHex(std::span<const u8> data, u32 group_each = 0);
++
+ } // namespace Common
+-- 
+2.43.0
+

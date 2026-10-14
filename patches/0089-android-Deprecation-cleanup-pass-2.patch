@@ -1,0 +1,104 @@
+From 3a26219fd8176a779bd3853492c67797e82b5e8e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 22:57:17 +0200
+Subject: [PATCH 89/92] android: Deprecation cleanup pass 2
+
+From AzaharPlus 2126.2-A, commit 8f3c1f8532aee3c2b93f585a6dababf5026cbf44, by OpenSauce04.
+
+(cherry picked from commit 8f3c1f8532aee3c2b93f585a6dababf5026cbf44)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ .../tangelo/overlay/InputOverlay.kt           | 38 +++++++++++++++----
+ .../tangelo/ui/main/MainActivity.kt           | 12 ++++--
+ 2 files changed, 38 insertions(+), 12 deletions(-)
+
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/overlay/InputOverlay.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/overlay/InputOverlay.kt
+index 71343d292..4ce6dafb5 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/overlay/InputOverlay.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/overlay/InputOverlay.kt
+@@ -702,13 +702,24 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
+             @Suppress("DEPRECATION")
+             (context as Activity).windowManager.defaultDisplay
+         }
+-        val outMetrics = DisplayMetrics()
+-        display.getMetrics(outMetrics)
++        var displayWidth: Float
++        var displayHeight: Float
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            val displayMetrics = (context as Activity).windowManager.maximumWindowMetrics.bounds
++            displayWidth = displayMetrics.width().toFloat()
++            displayHeight = displayMetrics.height().toFloat()
++        } else {
++            val displayMetrics = DisplayMetrics()
++            @Suppress("DEPRECATION")
++            display.getMetrics(displayMetrics)
++            displayWidth = displayMetrics.widthPixels.toFloat()
++            displayHeight = displayMetrics.heightPixels.toFloat()
++        }
+         val cutout = ViewCompat.getRootWindowInsets(this)?.displayCutout
+         val marginsX = (cutout?.safeInsetLeft?.plus(cutout.safeInsetRight)) ?: 0
+         val marginsY = (cutout?.safeInsetTop?.plus(cutout.safeInsetBottom)) ?: 0
+-        var maxX = outMetrics.widthPixels.toFloat() - marginsX
+-        var maxY = outMetrics.heightPixels.toFloat() - marginsY
++        var maxX = displayWidth - marginsX
++        var maxY = displayHeight - marginsY
+         // Height and width changes depending on orientation. Use the larger value for height.
+         if (maxY > maxX) {
+             val tmp = maxX
+@@ -866,13 +877,24 @@ class InputOverlay(context: Context?, attrs: AttributeSet?) :
+             @Suppress("DEPRECATION")
+             (context as Activity).windowManager.defaultDisplay
+         }
+-        val outMetrics = DisplayMetrics()
+-        display.getMetrics(outMetrics)
++        var displayWidth: Float
++        var displayHeight: Float
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
++            val displayMetrics = (context as Activity).windowManager.maximumWindowMetrics.bounds
++            displayWidth = displayMetrics.width().toFloat()
++            displayHeight = displayMetrics.height().toFloat()
++        } else {
++            val displayMetrics = DisplayMetrics()
++            @Suppress("DEPRECATION")
++            display.getMetrics(displayMetrics)
++            displayWidth = displayMetrics.widthPixels.toFloat()
++            displayHeight = displayMetrics.heightPixels.toFloat()
++        }
+         val cutout = ViewCompat.getRootWindowInsets(this)?.displayCutout
+         val marginsX = (cutout?.safeInsetLeft?.plus(cutout.safeInsetRight)) ?: 0
+         val marginsY = (cutout?.safeInsetTop?.plus(cutout.safeInsetBottom)) ?: 0
+-        var maxX = outMetrics.widthPixels.toFloat() - marginsX
+-        var maxY = outMetrics.heightPixels.toFloat() - marginsY
++        var maxX = displayWidth - marginsX
++        var maxY = displayHeight - marginsY
+         // Height and width changes depending on orientation. Use the larger value for height.
+         if (maxY < maxX) {
+             val tmp = maxX
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/ui/main/MainActivity.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/ui/main/MainActivity.kt
+index e1b943f87..e02d46750 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/ui/main/MainActivity.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/ui/main/MainActivity.kt
+@@ -117,10 +117,14 @@ class MainActivity :
+         WindowCompat.setDecorFitsSystemWindows(window, false)
+         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
+ 
+-        window.statusBarColor =
+-            ContextCompat.getColor(applicationContext, android.R.color.transparent)
+-        window.navigationBarColor =
+-            ContextCompat.getColor(applicationContext, android.R.color.transparent)
++        @Suppress("DEPRECATION")
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM) {
++            // ^- These are set to transparent automatically on Vanilla Ice Cream and up.
++            window.statusBarColor =
++                ContextCompat.getColor(applicationContext, android.R.color.transparent)
++            window.navigationBarColor =
++                ContextCompat.getColor(applicationContext, android.R.color.transparent)
++        }
+ 
+         binding.statusBarShade.setBackgroundColor(
+             ThemeUtil.getColorWithOpacity(
+-- 
+2.43.0
+

@@ -1,0 +1,32 @@
+From 3aec386b944384e0499b9a44f7e24a3831e76bd9 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 22:57:09 +0200
+Subject: [PATCH 87/92] cmake: Set QT_NO_PRIVATE_MODULE_WARNING
+
+...before linking to Qt6::GuiPrivate
+
+From AzaharPlus 2126.2-A, commit 3fd9ea8f97717c281f2169e8c10afd2fbb00ffa4, by OpenSauce04.
+
+(cherry picked from commit 3fd9ea8f97717c281f2169e8c10afd2fbb00ffa4)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/citra_qt/CMakeLists.txt | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/citra_qt/CMakeLists.txt b/src/citra_qt/CMakeLists.txt
+index 7063413fc..7362506f1 100644
+--- a/src/citra_qt/CMakeLists.txt
++++ b/src/citra_qt/CMakeLists.txt
+@@ -313,6 +313,7 @@ endif()
+ if (NOT WIN32)
+     find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+     if(Qt6_VERSION VERSION_GREATER_EQUAL "6.10.0")
++        set(QT_NO_PRIVATE_MODULE_WARNING ON)
+         find_package(Qt6 REQUIRED COMPONENTS GuiPrivate)
+         target_link_libraries(citra_qt PRIVATE Qt6::GuiPrivate)
+     else()
+-- 
+2.43.0
+

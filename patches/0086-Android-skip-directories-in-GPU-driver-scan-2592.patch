@@ -1,0 +1,30 @@
+From 19c5e463953f54f37a964b0c7c47d4e61e10f850 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 22:57:09 +0200
+Subject: [PATCH 86/92] Android: skip directories in GPU driver scan (#2592)
+
+From AzaharPlus 2126.2-A, commit acdb122e9367b304c337af48424357cf475e4b2d, by Ygor Dreyer.
+
+(cherry picked from commit acdb122e9367b304c337af48424357cf475e4b2d)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ .../io/github/microworldwide/tangelo/utils/GpuDriverHelper.kt    | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GpuDriverHelper.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GpuDriverHelper.kt
+index 1b48579d0..10c0e3ff7 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GpuDriverHelper.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/utils/GpuDriverHelper.kt
+@@ -72,6 +72,7 @@ object GpuDriverHelper {
+         val driverZips = driverStoragePath.listFiles()
+         val drivers: MutableList<Pair<Uri, GpuDriverMetadata>> =
+             driverZips
++                .filter { it.isFile }
+                 .mapNotNull {
+                     val metadata = getMetadataFromZip(it.inputStream())
+                     metadata.name?.let { _ -> Pair(it.uri, metadata) }
+-- 
+2.43.0
+

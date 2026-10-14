@@ -1,0 +1,39 @@
+From 4faf7cf74d75c82935737fac23f8e596900660b5 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 22:57:17 +0200
+Subject: [PATCH 90/92] vulkan: Fix incorrect xBRZ texture filter appearance
+
+From AzaharPlus 2126.2-A, commit 6096f6441c4e6e5506c2e3d9ec5cfd4decc9240a, by OpenSauce04.
+
+(cherry picked from commit 6096f6441c4e6e5506c2e3d9ec5cfd4decc9240a)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ .../host_shaders/texture_filtering/xbrz_freescale.frag      | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/host_shaders/texture_filtering/xbrz_freescale.frag b/src/video_core/host_shaders/texture_filtering/xbrz_freescale.frag
+index 8359b2240..cae1a6b69 100644
+--- a/src/video_core/host_shaders/texture_filtering/xbrz_freescale.frag
++++ b/src/video_core/host_shaders/texture_filtering/xbrz_freescale.frag
+@@ -1,4 +1,4 @@
+-// Copyright 2023 Citra Emulator Project
++// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+@@ -11,8 +11,8 @@ layout(location = 0) out vec4 frag_color;
+ layout(binding = 0) uniform sampler2D tex;
+ 
+ #ifdef VULKAN
+-layout(push_constant, std140) uniform XbrzInfo {
+-    float scale;
++layout(push_constant) uniform PushConstants {
++    layout(offset = 16) float scale;
+ };
+ #else
+ layout(location = 2) uniform float scale;
+-- 
+2.43.0
+
