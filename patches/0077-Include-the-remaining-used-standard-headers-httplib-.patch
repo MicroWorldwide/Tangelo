@@ -1,0 +1,879 @@
+From add3b9e59dc65224b7f161b306cad78c3b8f801e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 14 Oct 2026 20:15:12 +0200
+Subject: [PATCH] Include the remaining used standard headers, httplib and microprofile too
+
+The Windows build (MSYS2 clang64, newest packages) got past patch 0076 and
+stopped in externals/httplib/httplib.h: std::current_exception with an
+incomplete std::exception_ptr, as <exception> was never included. A wider
+scan (more standard types, plus the libraries kept in this repository
+under externals/) found httplib also missing <stdexcept>, <vector>,
+<chrono> and <limits>, microprofileui.h missing <mutex>, and 70 more places
+in 63 files of src/ (mostly <utility> for std::move / std::pair, and
+<stdexcept>, <tuple>, <memory>, <functional>, <cstring>, <limits>,
+<exception>, <sstream>). All are included now, outside any #if block.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ externals/httplib/httplib.h                                | 5 +++++
+ externals/microprofile/microprofileui.h                    | 2 ++
+ src/android/app/src/main/jni/camera/ndk_camera.cpp         | 1 +
+ src/android/app/src/main/jni/camera/still_image_camera.cpp | 1 +
+ src/android/app/src/main/jni/cheats/cheat.cpp              | 1 +
+ src/android/app/src/main/jni/emu_window/emu_window_gl.h    | 1 +
+ src/android/app/src/main/jni/emu_window/emu_window_vk.h    | 1 +
+ src/android/app/src/main/jni/ndk_motion.cpp                | 2 ++
+ src/audio_core/dsp_interface.h                             | 1 +
+ src/audio_core/lle/lle.h                                   | 1 +
+ src/citra_libretro/citra_libretro.cpp                      | 1 +
+ src/citra_qt/camera/still_image_camera.cpp                 | 1 +
+ src/citra_qt/citra_qt.cpp                                  | 1 +
+ src/citra_qt/compatibility_list.h                          | 1 +
+ src/citra_qt/configuration/configure_cheats.cpp            | 1 +
+ src/citra_qt/configuration/configure_hotkeys.h             | 1 +
+ src/citra_qt/debugger/ipc/record_dialog.cpp                | 1 +
+ src/citra_qt/qt_image_interface.cpp                        | 1 +
+ src/citra_qt/update_checker.cpp                            | 1 +
+ src/citra_qt/util/graphics_device_info.cpp                 | 1 +
+ src/citra_qt/util/spinbox.cpp                              | 1 +
+ src/common/android_utils.cpp                               | 2 ++
+ src/common/detached_tasks.cpp                              | 1 +
+ src/common/file_derived.cpp                                | 1 +
+ src/common/logging/backend.cpp                             | 1 +
+ src/common/memory_ref.h                                    | 1 +
+ src/common/serialization/boost_std_variant.hpp             | 1 +
+ src/common/settings.h                                      | 1 +
+ src/common/slot_vector.h                                   | 2 ++
+ src/common/thread_queue_list.h                             | 1 +
+ src/common/zstd_compression.cpp                            | 1 +
+ src/common/zstd_compression.h                              | 1 +
+ src/core/cheats/gateway_cheat.cpp                          | 1 +
+ src/core/core.cpp                                          | 1 +
+ src/core/frontend/camera/factory.cpp                       | 1 +
+ src/core/hle/mii.h                                         | 1 +
+ src/core/hle/service/boss/boss_container.cpp               | 1 +
+ src/core/hle/service/boss/boss_download.cpp                | 1 +
+ src/core/hle/service/http/soap_result.cpp                  | 1 +
+ src/core/hle/service/http/spotpass_redirect.cpp            | 1 +
+ src/core/hw/aes/key.cpp                                    | 1 +
+ src/core/hw/aes/key.h                                      | 2 ++
+ src/core/hw/ecc.cpp                                        | 2 ++
+ src/core/hw/ecc.h                                          | 1 +
+ src/core/hw/rsa/rsa.cpp                                    | 2 ++
+ src/core/hw/rsa/rsa.h                                      | 1 +
+ src/core/memory.h                                          | 1 +
+ src/core/rpc/packet.cpp                                    | 1 +
+ src/core/rpc/udp_server.cpp                                | 2 ++
+ src/core/savestate.cpp                                     | 1 +
+ src/network/room.cpp                                       | 1 +
+ src/network/room.h                                         | 1 +
+ src/video_core/rasterizer_cache/rasterizer_cache.h         | 1 +
+ src/video_core/rasterizer_cache/surface_params.cpp         | 1 +
+ src/video_core/renderer_opengl/gl_texture_mailbox.h        | 1 +
+ src/video_core/renderer_opengl/gl_texture_runtime.h        | 1 +
+ src/video_core/renderer_vulkan/vk_instance.cpp             | 1 +
+ src/video_core/renderer_vulkan/vk_master_semaphore.cpp     | 1 +
+ src/video_core/renderer_vulkan/vk_platform.cpp             | 1 +
+ src/video_core/renderer_vulkan/vk_render_manager.h         | 2 ++
+ src/video_core/shader/generator/glsl_shader_decompiler.cpp | 1 +
+ src/video_core/shader/shader_interpreter.cpp               | 1 +
+ src/video_core/shader/shader_jit_a64_compiler.h            | 1 +
+ src/video_core/texture/etc1.cpp                            | 1 +
+ src/web_service/web_backend.cpp                            | 1 +
+ 65 files changed, 78 insertions(+)
+
+diff --git a/externals/httplib/httplib.h b/externals/httplib/httplib.h
+index c49e50e..4073afc 100644
+--- a/externals/httplib/httplib.h
++++ b/externals/httplib/httplib.h
+@@ -233,6 +233,11 @@ using socket_t = int;
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <utility>
++#include <chrono>
++#include <exception>
++#include <limits>
++#include <stdexcept>
++#include <vector>
+ 
+ #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+ #ifdef _WIN32
+diff --git a/externals/microprofile/microprofileui.h b/externals/microprofile/microprofileui.h
+index 0553734..0b639c4 100644
+--- a/externals/microprofile/microprofileui.h
++++ b/externals/microprofile/microprofileui.h
+@@ -1,4 +1,6 @@
+ #pragma once
++
++#include <mutex>
+ // This is free and unencumbered software released into the public domain.
+ // Anyone is free to copy, modify, publish, use, compile, sell, or
+ // distribute this software, either in source code form or as a compiled
+diff --git a/src/android/app/src/main/jni/camera/ndk_camera.cpp b/src/android/app/src/main/jni/camera/ndk_camera.cpp
+index ee72e1b..89bcbdf 100644
+--- a/src/android/app/src/main/jni/camera/ndk_camera.cpp
++++ b/src/android/app/src/main/jni/camera/ndk_camera.cpp
+@@ -10,6 +10,7 @@
+ #include <camera/NdkCaptureRequest.h>
+ #include <libyuv.h>
+ #include <media/NdkImageReader.h>
++#include <cstring>
+ #include "common/scope_exit.h"
+ #include "common/thread.h"
+ #include "core/frontend/camera/blank_camera.h"
+diff --git a/src/android/app/src/main/jni/camera/still_image_camera.cpp b/src/android/app/src/main/jni/camera/still_image_camera.cpp
+index d0984a2..b7c122f 100644
+--- a/src/android/app/src/main/jni/camera/still_image_camera.cpp
++++ b/src/android/app/src/main/jni/camera/still_image_camera.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <android/bitmap.h>
+ #include <libyuv.h>
++#include <utility>
+ #include "common/logging/log.h"
+ #include "core/frontend/camera/blank_camera.h"
+ #include "jni/camera/still_image_camera.h"
+diff --git a/src/android/app/src/main/jni/cheats/cheat.cpp b/src/android/app/src/main/jni/cheats/cheat.cpp
+index 9d3e8ab..13c410a 100644
+--- a/src/android/app/src/main/jni/cheats/cheat.cpp
++++ b/src/android/app/src/main/jni/cheats/cheat.cpp
+@@ -9,6 +9,7 @@
+ #include <vector>
+ 
+ #include <jni.h>
++#include <utility>
+ 
+ #include "common/string_util.h"
+ #include "core/cheats/cheat_base.h"
+diff --git a/src/android/app/src/main/jni/emu_window/emu_window_gl.h b/src/android/app/src/main/jni/emu_window/emu_window_gl.h
+index 70684bc..cbb36fd 100644
+--- a/src/android/app/src/main/jni/emu_window/emu_window_gl.h
++++ b/src/android/app/src/main/jni/emu_window/emu_window_gl.h
+@@ -8,6 +8,7 @@
+ 
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
++#include <memory>
+ 
+ #include "jni/emu_window/emu_window.h"
+ 
+diff --git a/src/android/app/src/main/jni/emu_window/emu_window_vk.h b/src/android/app/src/main/jni/emu_window/emu_window_vk.h
+index 56aafdd..e1c3a1a 100644
+--- a/src/android/app/src/main/jni/emu_window/emu_window_vk.h
++++ b/src/android/app/src/main/jni/emu_window/emu_window_vk.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <memory>
+ #include "jni/emu_window/emu_window.h"
+ 
+ struct ANativeWindow;
+diff --git a/src/android/app/src/main/jni/ndk_motion.cpp b/src/android/app/src/main/jni/ndk_motion.cpp
+index abb68e4..147ebf2 100644
+--- a/src/android/app/src/main/jni/ndk_motion.cpp
++++ b/src/android/app/src/main/jni/ndk_motion.cpp
+@@ -10,6 +10,8 @@
+ #include <mutex>
+ #include <optional>
+ #include <tuple>
++#include <memory>
++#include <utility>
+ 
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+diff --git a/src/audio_core/dsp_interface.h b/src/audio_core/dsp_interface.h
+index f2292c4..a89b604 100644
+--- a/src/audio_core/dsp_interface.h
++++ b/src/audio_core/dsp_interface.h
+@@ -8,6 +8,7 @@
+ #include <span>
+ #include <boost/serialization/access.hpp>
+ #include <string_view>
++#include <functional>
+ #include "audio_core/audio_types.h"
+ #include "audio_core/time_stretch.h"
+ #include "common/common_types.h"
+diff --git a/src/audio_core/lle/lle.h b/src/audio_core/lle/lle.h
+index 181b454..addb452 100644
+--- a/src/audio_core/lle/lle.h
++++ b/src/audio_core/lle/lle.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <span>
++#include <functional>
+ #include "audio_core/dsp_interface.h"
+ 
+ namespace Core {
+diff --git a/src/citra_libretro/citra_libretro.cpp b/src/citra_libretro/citra_libretro.cpp
+index a6246c6..b00c680 100644
+--- a/src/citra_libretro/citra_libretro.cpp
++++ b/src/citra_libretro/citra_libretro.cpp
+@@ -9,6 +9,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <exception>
+ 
+ #ifdef ENABLE_OPENGL
+ #include "glad/glad.h"
+diff --git a/src/citra_qt/camera/still_image_camera.cpp b/src/citra_qt/camera/still_image_camera.cpp
+index b2b6be8..da9d290 100644
+--- a/src/citra_qt/camera/still_image_camera.cpp
++++ b/src/citra_qt/camera/still_image_camera.cpp
+@@ -7,6 +7,7 @@
+ #include <QMessageBox>
+ #include <QThread>
+ #include <string>
++#include <utility>
+ #include "citra_qt/camera/still_image_camera.h"
+ #include "common/logging/log.h"
+ 
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index f474c60..5468067 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -22,6 +22,7 @@
+ #include <boost/algorithm/string/replace.hpp>
+ #include <fmt/format.h>
+ #include <fmt/ostream.h>
++#include <exception>
+ #ifdef __APPLE__
+ #include <unistd.h> // for chdir
+ #endif
+diff --git a/src/citra_qt/compatibility_list.h b/src/citra_qt/compatibility_list.h
+index 64a57f3..5f5e2c8 100644
+--- a/src/citra_qt/compatibility_list.h
++++ b/src/citra_qt/compatibility_list.h
+@@ -7,6 +7,7 @@
+ #include <string>
+ #include <unordered_map>
+ #include <QString>
++#include <utility>
+ #include "common/common_types.h"
+ 
+ using CompatibilityList = std::unordered_map<std::string, std::pair<QString, QString>>;
+diff --git a/src/citra_qt/configuration/configure_cheats.cpp b/src/citra_qt/configuration/configure_cheats.cpp
+index 1062ed4..4090346 100644
+--- a/src/citra_qt/configuration/configure_cheats.cpp
++++ b/src/citra_qt/configuration/configure_cheats.cpp
+@@ -6,6 +6,7 @@
+ #include <QMessageBox>
+ #include <QTableWidgetItem>
+ #include <QtGlobal>
++#include <utility>
+ #include "configure_cheats.h"
+ #include "core/cheats/cheat_base.h"
+ #include "core/cheats/cheats.h"
+diff --git a/src/citra_qt/configuration/configure_hotkeys.h b/src/citra_qt/configuration/configure_hotkeys.h
+index bfc5e1f..d3739ca 100644
+--- a/src/citra_qt/configuration/configure_hotkeys.h
++++ b/src/citra_qt/configuration/configure_hotkeys.h
+@@ -6,6 +6,7 @@
+ 
+ #include <memory>
+ #include <QWidget>
++#include <utility>
+ 
+ namespace Ui {
+ class ConfigureHotkeys;
+diff --git a/src/citra_qt/debugger/ipc/record_dialog.cpp b/src/citra_qt/debugger/ipc/record_dialog.cpp
+index 9305e49..35fdab8 100644
+--- a/src/citra_qt/debugger/ipc/record_dialog.cpp
++++ b/src/citra_qt/debugger/ipc/record_dialog.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <fmt/format.h>
++#include <utility>
+ #include "citra_qt/debugger/ipc/record_dialog.h"
+ #include "common/assert.h"
+ #include "core/hle/kernel/ipc_debugger/recorder.h"
+diff --git a/src/citra_qt/qt_image_interface.cpp b/src/citra_qt/qt_image_interface.cpp
+index 3903cf5..f68cbb3 100644
+--- a/src/citra_qt/qt_image_interface.cpp
++++ b/src/citra_qt/qt_image_interface.cpp
+@@ -5,6 +5,7 @@
+ #include <QImage>
+ #include <QImageReader>
+ #include <QString>
++#include <cstring>
+ #include "citra_qt/qt_image_interface.h"
+ #include "common/logging/log.h"
+ 
+diff --git a/src/citra_qt/update_checker.cpp b/src/citra_qt/update_checker.cpp
+index f55ff3d..8ec26c6 100644
+--- a/src/citra_qt/update_checker.cpp
++++ b/src/citra_qt/update_checker.cpp
+@@ -7,6 +7,7 @@
+ #include <fmt/format.h>
+ #include <httplib.h>
+ #include <json.hpp>
++#include <memory>
+ #include "common/logging/log.h"
+ #include "update_checker.h"
+ 
+diff --git a/src/citra_qt/util/graphics_device_info.cpp b/src/citra_qt/util/graphics_device_info.cpp
+index f8921c5..0a93343 100644
+--- a/src/citra_qt/util/graphics_device_info.cpp
++++ b/src/citra_qt/util/graphics_device_info.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <stdexcept>
+ #include "citra_qt/util/graphics_device_info.h"
+ 
+ #ifdef ENABLE_OPENGL
+diff --git a/src/citra_qt/util/spinbox.cpp b/src/citra_qt/util/spinbox.cpp
+index 0f57cfa..9183ab1 100644
+--- a/src/citra_qt/util/spinbox.cpp
++++ b/src/citra_qt/util/spinbox.cpp
+@@ -31,6 +31,7 @@
+ #include <cstdlib>
+ #include <QLineEdit>
+ #include <QRegularExpression>
++#include <limits>
+ #include "citra_qt/util/spinbox.h"
+ #include "common/assert.h"
+ 
+diff --git a/src/common/android_utils.cpp b/src/common/android_utils.cpp
+index a6622bd..5330c96 100644
+--- a/src/common/android_utils.cpp
++++ b/src/common/android_utils.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <stdexcept>
++
+ #ifdef ANDROID
+ #include <boost/algorithm/string/replace.hpp>
+ #include <boost/uuid/uuid_generators.hpp>
+diff --git a/src/common/detached_tasks.cpp b/src/common/detached_tasks.cpp
+index 98538ea..be621bc 100644
+--- a/src/common/detached_tasks.cpp
++++ b/src/common/detached_tasks.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <thread>
++#include <utility>
+ #include "common/assert.h"
+ #include "common/detached_tasks.h"
+ 
+diff --git a/src/common/file_derived.cpp b/src/common/file_derived.cpp
+index 24ee250..d9526e6 100644
+--- a/src/common/file_derived.cpp
++++ b/src/common/file_derived.cpp
+@@ -8,6 +8,7 @@
+ #include <zstd.h>
+ #include <zstd_seekable.h>
+ #include <chrono>
++#include <utility>
+ 
+ #include "common/alignment.h"
+ #include "common/archives.h"
+diff --git a/src/common/logging/backend.cpp b/src/common/logging/backend.cpp
+index a3123ce..67a83c3 100644
+--- a/src/common/logging/backend.cpp
++++ b/src/common/logging/backend.cpp
+@@ -7,6 +7,7 @@
+ #include <boost/regex.hpp>
+ 
+ #include <fmt/format.h>
++#include <stdexcept>
+ 
+ #ifdef _WIN32
+ #include <share.h>   // For _SH_DENYWR
+diff --git a/src/common/memory_ref.h b/src/common/memory_ref.h
+index 5a0d179..517c843 100644
+--- a/src/common/memory_ref.h
++++ b/src/common/memory_ref.h
+@@ -10,6 +10,7 @@
+ #include <boost/serialization/export.hpp>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/vector.hpp>
++#include <utility>
+ #include "common/assert.h"
+ #include "common/common_types.h"
+ 
+diff --git a/src/common/serialization/boost_std_variant.hpp b/src/common/serialization/boost_std_variant.hpp
+index b00f827..34d38af 100644
+--- a/src/common/serialization/boost_std_variant.hpp
++++ b/src/common/serialization/boost_std_variant.hpp
+@@ -29,6 +29,7 @@
+ #include <boost/serialization/split_free.hpp>
+ #include <boost/serialization/serialization.hpp>
+ #include <boost/serialization/nvp.hpp>
++#include <utility>
+ 
+ namespace boost {
+ namespace serialization {
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 4f5e23b..574c9a4 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -10,6 +10,7 @@
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
++#include <utility>
+ #include "audio_core/input_details.h"
+ #include "audio_core/sink_details.h"
+ #include "common/common_types.h"
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+index 101315a..d0b3ec4 100644
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -10,6 +10,8 @@
+ #include <type_traits>
+ #include <utility>
+ #include <vector>
++#include <functional>
++#include <limits>
+ #include "common/assert.h"
+ #include "common/common_types.h"
+ 
+diff --git a/src/common/thread_queue_list.h b/src/common/thread_queue_list.h
+index cd7b267..2198aa4 100644
+--- a/src/common/thread_queue_list.h
++++ b/src/common/thread_queue_list.h
+@@ -14,6 +14,7 @@
+ #include <tuple>
+ #include <boost/serialization/deque.hpp>
+ #include <boost/serialization/split_member.hpp>
++#include <utility>
+ #include "common/common_types.h"
+ 
+ namespace Common {
+diff --git a/src/common/zstd_compression.cpp b/src/common/zstd_compression.cpp
+index 24ff0ae..7f7aba4 100644
+--- a/src/common/zstd_compression.cpp
++++ b/src/common/zstd_compression.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <boost/serialization/base_object.hpp>
+ #include <boost/serialization/unique_ptr.hpp>
++#include <utility>
+ #include "common/alignment.h"
+ #include "common/archives.h"
+ #include "common/assert.h"
+diff --git a/src/common/zstd_compression.h b/src/common/zstd_compression.h
+index a690a2a..8edf6c7 100644
+--- a/src/common/zstd_compression.h
++++ b/src/common/zstd_compression.h
+@@ -15,6 +15,7 @@
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/unordered_map.hpp>
+ #include <string>
++#include <functional>
+ #include "common/archives.h"
+ #include "common/common_types.h"
+ 
+diff --git a/src/core/cheats/gateway_cheat.cpp b/src/core/cheats/gateway_cheat.cpp
+index af34681..e9691c4 100644
+--- a/src/core/cheats/gateway_cheat.cpp
++++ b/src/core/cheats/gateway_cheat.cpp
+@@ -12,6 +12,7 @@
+ #include <vector>
+ #include <boost/iostreams/device/file_descriptor.hpp>
+ #include <boost/iostreams/stream.hpp>
++#include <stdexcept>
+ #include "common/file_util.h"
+ #include "common/logging/log.h"
+ #include "common/string_util.h"
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index 89a10fd..9268b0c 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -5,6 +5,7 @@
+ #include <stdexcept>
+ #include <utility>
+ #include <boost/serialization/array.hpp>
++#include <exception>
+ #include "audio_core/dsp_interface.h"
+ #include "audio_core/hle/hle.h"
+ #include "audio_core/lle/lle.h"
+diff --git a/src/core/frontend/camera/factory.cpp b/src/core/frontend/camera/factory.cpp
+index cdc3bc9..5e6bfcb 100644
+--- a/src/core/frontend/camera/factory.cpp
++++ b/src/core/frontend/camera/factory.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <unordered_map>
++#include <utility>
+ #include "common/logging/log.h"
+ #include "core/frontend/camera/blank_camera.h"
+ #include "core/frontend/camera/factory.h"
+diff --git a/src/core/hle/mii.h b/src/core/hle/mii.h
+index 9f77b20..2035570 100644
+--- a/src/core/hle/mii.h
++++ b/src/core/hle/mii.h
+@@ -5,6 +5,7 @@
+ #pragma once
+ 
+ #include <boost/serialization/export.hpp>
++#include <utility>
+ #include "common/bit_field.h"
+ #include "common/common_types.h"
+ 
+diff --git a/src/core/hle/service/boss/boss_container.cpp b/src/core/hle/service/boss/boss_container.cpp
+index faed232..aa59cd6 100644
+--- a/src/core/hle/service/boss/boss_container.cpp
++++ b/src/core/hle/service/boss/boss_container.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <cryptopp/aes.h>
+ #include <cryptopp/modes.h>
++#include <utility>
+ #include "core/hle/service/boss/boss_container.h"
+ 
+ namespace Service::BOSS {
+diff --git a/src/core/hle/service/boss/boss_download.cpp b/src/core/hle/service/boss/boss_download.cpp
+index 93eebca..dc2f29b 100644
+--- a/src/core/hle/service/boss/boss_download.cpp
++++ b/src/core/hle/service/boss/boss_download.cpp
+@@ -5,6 +5,7 @@
+ #include <memory>
+ #include <optional>
+ #include <httplib.h>
++#include <utility>
+ #include "common/logging/log.h"
+ #include "common/settings.h"
+ #include "common/web_util.h"
+diff --git a/src/core/hle/service/http/soap_result.cpp b/src/core/hle/service/http/soap_result.cpp
+index a8f7364..bda971e 100644
+--- a/src/core/hle/service/http/soap_result.cpp
++++ b/src/core/hle/service/http/soap_result.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the LICENSE.txt file included.
+ 
+ #include <cstdlib>
++#include <utility>
+ #include "core/hle/service/http/soap_result.h"
+ 
+ namespace Service::HTTP {
+diff --git a/src/core/hle/service/http/spotpass_redirect.cpp b/src/core/hle/service/http/spotpass_redirect.cpp
+index e0f7de5..1d5a26d 100644
+--- a/src/core/hle/service/http/spotpass_redirect.cpp
++++ b/src/core/hle/service/http/spotpass_redirect.cpp
+@@ -5,6 +5,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
++#include <utility>
+ #include "core/hle/service/http/spotpass_redirect.h"
+ 
+ namespace Service::HTTP {
+diff --git a/src/core/hw/aes/key.cpp b/src/core/hw/aes/key.cpp
+index bc0f8de..95225c1 100644
+--- a/src/core/hw/aes/key.cpp
++++ b/src/core/hw/aes/key.cpp
+@@ -9,6 +9,7 @@
+ #include <boost/iostreams/stream.hpp>
+ #include <cryptopp/aes.h>
+ #include <cryptopp/modes.h>
++#include <stdexcept>
+ #include "common/common_paths.h"
+ #include "common/file_util.h"
+ #include "common/logging/log.h"
+diff --git a/src/core/hw/aes/key.h b/src/core/hw/aes/key.h
+index dc562d6..c8b5ea6 100644
+--- a/src/core/hw/aes/key.h
++++ b/src/core/hw/aes/key.h
+@@ -8,6 +8,8 @@
+ #include <cstddef>
+ #include <istream>
+ #include <vector>
++#include <sstream>
++#include <utility>
+ #include "common/common_types.h"
+ 
+ namespace FileSys {
+diff --git a/src/core/hw/ecc.cpp b/src/core/hw/ecc.cpp
+index 6016f9a..31a3388 100644
+--- a/src/core/hw/ecc.cpp
++++ b/src/core/hw/ecc.cpp
+@@ -7,6 +7,8 @@
+ #include <boost/iostreams/stream.hpp>
+ #include "common/assert.h"
+ #include <common/string_util.h>
++#include <stdexcept>
++#include <utility>
+ #include "common/common_paths.h"
+ #include "common/file_util.h"
+ #include "common/logging/log.h"
+diff --git a/src/core/hw/ecc.h b/src/core/hw/ecc.h
+index b811987..da6e33d 100644
+--- a/src/core/hw/ecc.h
++++ b/src/core/hw/ecc.h
+@@ -9,6 +9,7 @@
+ #include <span>
+ #include <vector>
+ #include <cryptopp/oids.h>
++#include <utility>
+ #include "common/common_types.h"
+ #include "cryptopp/eccrypto.h"
+ 
+diff --git a/src/core/hw/rsa/rsa.cpp b/src/core/hw/rsa/rsa.cpp
+index 263f403..1ecab4d 100644
+--- a/src/core/hw/rsa/rsa.cpp
++++ b/src/core/hw/rsa/rsa.cpp
+@@ -10,6 +10,8 @@
+ #include <cryptopp/nbtheory.h>
+ #include <cryptopp/sha.h>
+ #include <fmt/format.h>
++#include <stdexcept>
++#include <utility>
+ #include "common/common_paths.h"
+ #include "common/file_util.h"
+ #include "common/logging/log.h"
+diff --git a/src/core/hw/rsa/rsa.h b/src/core/hw/rsa/rsa.h
+index 82844d4..db6d17a 100644
+--- a/src/core/hw/rsa/rsa.h
++++ b/src/core/hw/rsa/rsa.h
+@@ -6,6 +6,7 @@
+ 
+ #include <span>
+ #include <vector>
++#include <utility>
+ #include "common/common_types.h"
+ 
+ namespace HW::RSA {
+diff --git a/src/core/memory.h b/src/core/memory.h
+index 7c74453..40e6780 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -10,6 +10,7 @@
+ #include <boost/serialization/array.hpp>
+ #include <boost/serialization/vector.hpp>
+ #include <unordered_map>
++#include <utility>
+ #include "common/common_types.h"
+ #include "common/memory_ref.h"
+ #include "common/swap.h"
+diff --git a/src/core/rpc/packet.cpp b/src/core/rpc/packet.cpp
+index c89a07e..43d3aa3 100644
+--- a/src/core/rpc/packet.cpp
++++ b/src/core/rpc/packet.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <utility>
+ #include "core/rpc/packet.h"
+ 
+ namespace Core::RPC {
+diff --git a/src/core/rpc/udp_server.cpp b/src/core/rpc/udp_server.cpp
+index 0ee19ca..4732aab 100644
+--- a/src/core/rpc/udp_server.cpp
++++ b/src/core/rpc/udp_server.cpp
+@@ -5,6 +5,8 @@
+ #include <thread>
+ #include <boost/asio.hpp>
+ #include <vector>
++#include <cstring>
++#include <utility>
+ #include "common/common_types.h"
+ #include "common/logging/log.h"
+ #include "core/rpc/packet.h"
+diff --git a/src/core/savestate.cpp b/src/core/savestate.cpp
+index e065efd..f568a66 100644
+--- a/src/core/savestate.cpp
++++ b/src/core/savestate.cpp
+@@ -6,6 +6,7 @@
+ #include <sstream>
+ #include <cryptopp/hex.h>
+ #include <fmt/ranges.h>
++#include <stdexcept>
+ #include "common/archives.h"
+ #include "common/file_util.h"
+ #include "common/logging/log.h"
+diff --git a/src/network/room.cpp b/src/network/room.cpp
+index c3e37a7..d4d9d6c 100644
+--- a/src/network/room.cpp
++++ b/src/network/room.cpp
+@@ -9,6 +9,7 @@
+ #include <regex>
+ #include <sstream>
+ #include <thread>
++#include <utility>
+ #include "common/logging/log.h"
+ #include "enet/enet.h"
+ #include "network/packet.h"
+diff --git a/src/network/room.h b/src/network/room.h
+index 4af2953..4050681 100644
+--- a/src/network/room.h
++++ b/src/network/room.h
+@@ -8,6 +8,7 @@
+ #include <memory>
+ #include <string>
+ #include <vector>
++#include <utility>
+ #include "common/common_types.h"
+ #include "network/verify_user.h"
+ 
+diff --git a/src/video_core/rasterizer_cache/rasterizer_cache.h b/src/video_core/rasterizer_cache/rasterizer_cache.h
+index 6a17a70..a6b1b7b 100644
+--- a/src/video_core/rasterizer_cache/rasterizer_cache.h
++++ b/src/video_core/rasterizer_cache/rasterizer_cache.h
+@@ -7,6 +7,7 @@
+ #include <type_traits>
+ #include <boost/container/small_vector.hpp>
+ #include <boost/range/iterator_range.hpp>
++#include <tuple>
+ #include "common/alignment.h"
+ #include "common/logging/log.h"
+ #include "common/microprofile.h"
+diff --git a/src/video_core/rasterizer_cache/surface_params.cpp b/src/video_core/rasterizer_cache/surface_params.cpp
+index e3432ac..2ac11d8 100644
+--- a/src/video_core/rasterizer_cache/surface_params.cpp
++++ b/src/video_core/rasterizer_cache/surface_params.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <string>
++#include <tuple>
+ #include "common/alignment.h"
+ #include "video_core/rasterizer_cache/surface_params.h"
+ 
+diff --git a/src/video_core/renderer_opengl/gl_texture_mailbox.h b/src/video_core/renderer_opengl/gl_texture_mailbox.h
+index 01175c5..70ef69a 100644
+--- a/src/video_core/renderer_opengl/gl_texture_mailbox.h
++++ b/src/video_core/renderer_opengl/gl_texture_mailbox.h
+@@ -8,6 +8,7 @@
+ #include <deque>
+ #include <mutex>
+ #include <queue>
++#include <stdexcept>
+ 
+ #include "core/frontend/emu_window.h"
+ #include "video_core/renderer_opengl/gl_resource_manager.h"
+diff --git a/src/video_core/renderer_opengl/gl_texture_runtime.h b/src/video_core/renderer_opengl/gl_texture_runtime.h
+index 7d42978..d6bc23b 100644
+--- a/src/video_core/renderer_opengl/gl_texture_runtime.h
++++ b/src/video_core/renderer_opengl/gl_texture_runtime.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <tuple>
+ #include "video_core/rasterizer_cache/framebuffer_base.h"
+ #include "video_core/rasterizer_cache/rasterizer_cache_base.h"
+ #include "video_core/rasterizer_cache/surface_base.h"
+diff --git a/src/video_core/renderer_vulkan/vk_instance.cpp b/src/video_core/renderer_vulkan/vk_instance.cpp
+index 7f2e239..2072a03 100644
+--- a/src/video_core/renderer_vulkan/vk_instance.cpp
++++ b/src/video_core/renderer_vulkan/vk_instance.cpp
+@@ -14,6 +14,7 @@
+ #include "video_core/renderer_vulkan/vk_platform.h"
+ 
+ #include <vk_mem_alloc.h>
++#include <stdexcept>
+ 
+ namespace Vulkan {
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+index 0e5ec6d..5ad5ef0 100644
+--- a/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
++++ b/src/video_core/renderer_vulkan/vk_master_semaphore.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include <limits>
+ #include <mutex>
++#include <tuple>
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_platform.cpp b/src/video_core/renderer_vulkan/vk_platform.cpp
+index 352aba4..ff13832 100644
+--- a/src/video_core/renderer_vulkan/vk_platform.cpp
++++ b/src/video_core/renderer_vulkan/vk_platform.cpp
+@@ -18,6 +18,7 @@
+ #include <vector>
+ #include <boost/container/static_vector.hpp>
+ #include <fmt/format.h>
++#include <stdexcept>
+ 
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+diff --git a/src/video_core/renderer_vulkan/vk_render_manager.h b/src/video_core/renderer_vulkan/vk_render_manager.h
+index cd8b81a..36e7827 100644
+--- a/src/video_core/renderer_vulkan/vk_render_manager.h
++++ b/src/video_core/renderer_vulkan/vk_render_manager.h
+@@ -5,6 +5,8 @@
+ #pragma once
+ 
+ #include <mutex>
++#include <cstring>
++#include <tuple>
+ 
+ #include "common/math_util.h"
+ #include "video_core/renderer_vulkan/vk_common.h"
+diff --git a/src/video_core/shader/generator/glsl_shader_decompiler.cpp b/src/video_core/shader/generator/glsl_shader_decompiler.cpp
+index 784b73d..8314665 100644
+--- a/src/video_core/shader/generator/glsl_shader_decompiler.cpp
++++ b/src/video_core/shader/generator/glsl_shader_decompiler.cpp
+@@ -9,6 +9,7 @@
+ #include <utility>
+ #include <fmt/format.h>
+ #include <nihstro/shader_bytecode.h>
++#include <stdexcept>
+ #include "common/assert.h"
+ #include "common/common_types.h"
+ #include "video_core/shader/generator/glsl_shader_decompiler.h"
+diff --git a/src/video_core/shader/shader_interpreter.cpp b/src/video_core/shader/shader_interpreter.cpp
+index d3543a4..105b683 100644
+--- a/src/video_core/shader/shader_interpreter.cpp
++++ b/src/video_core/shader/shader_interpreter.cpp
+@@ -8,6 +8,7 @@
+ #include <boost/circular_buffer.hpp>
+ #include <boost/container/static_vector.hpp>
+ #include <nihstro/shader_bytecode.h>
++#include <limits>
+ #include "common/assert.h"
+ #include "common/common_types.h"
+ #include "common/logging/log.h"
+diff --git a/src/video_core/shader/shader_jit_a64_compiler.h b/src/video_core/shader/shader_jit_a64_compiler.h
+index 2855ac7..6e07b61 100644
+--- a/src/video_core/shader/shader_jit_a64_compiler.h
++++ b/src/video_core/shader/shader_jit_a64_compiler.h
+@@ -4,6 +4,7 @@
+ 
+ #pragma once
+ 
++#include <memory>
+ #include "common/arch.h"
+ #if CITRA_ARCH(arm64)
+ 
+diff --git a/src/video_core/texture/etc1.cpp b/src/video_core/texture/etc1.cpp
+index 1a02bbd..5682896 100644
+--- a/src/video_core/texture/etc1.cpp
++++ b/src/video_core/texture/etc1.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <utility>
+ #include "common/bit_field.h"
+ #include "common/color.h"
+ #include "common/common_types.h"
+diff --git a/src/web_service/web_backend.cpp b/src/web_service/web_backend.cpp
+index dba633c..9581662 100644
+--- a/src/web_service/web_backend.cpp
++++ b/src/web_service/web_backend.cpp
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <fmt/format.h>
+ #include <httplib.h>
++#include <utility>
+ #include "common/common_types.h"
+ #include "common/logging/log.h"
+ #include "common/web_util.h"
+-- 
+2.43.0
+
