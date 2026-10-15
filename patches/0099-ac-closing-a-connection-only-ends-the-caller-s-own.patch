@@ -1,0 +1,130 @@
+From 872f7ba04071d16f7f4de65bff2e866e6efe318a Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 15 Oct 2026 22:42:31 +0200
+Subject: [PATCH] ac: closing a connection only ends the caller's own
+
+The connection was one flag for the whole console: whoever called
+CloseAsync marked everyone offline and signalled the disconnect event
+of whichever process had registered one last.
+
+With the real NDM (patch 0096) that broke online games. NDM connects
+and closes again every few seconds for its background checks, and
+Badge Arcade, which had registered its disconnect event, lost its game
+server connection right after signing in: error 006-0114, with nothing
+reaching the game server.
+
+ac now keeps the processes that hold a connection and each process's
+own disconnect event. CloseAsync ends the caller's connection and only
+signals the caller's event; IsConnected and the connecting info stay
+true while any process is connected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp | 24 ++++++++++++++++++------
+ src/core/hle/service/ac/ac.h   | 11 +++++++++++
+ 2 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 08828e752..a2a646f06 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -54,7 +54,7 @@ void Module::Interface::CreateDefaultConfig(Kernel::HLERequestContext& ctx) {
+ void Module::Interface::ConnectAsync(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+-    rp.Skip(2, false); // ProcessId descriptor
++    const u32 pid = rp.PopPID();
+     ac->connect_event = rp.PopObject<Kernel::Event>();
+     rp.Skip(2, false); // Buffer descriptor
+ 
+@@ -62,6 +62,7 @@ void Module::Interface::ConnectAsync(Kernel::HLERequestContext& ctx) {
+         ac->connect_event->SetName("AC:connect_event");
+         ac->connect_event->Signal();
+         ac->ac_connected = true;
++        ac->connected_processes.insert(pid);
+     }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+@@ -95,12 +96,20 @@ void Module::Interface::CancelConnectAsync(Kernel::HLERequestContext& ctx) {
+ 
+ void Module::Interface::CloseAsync(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+-    rp.Skip(2, false); // ProcessId descriptor
++    const u32 pid = rp.PopPID();
+ 
+     ac->close_event = rp.PopObject<Kernel::Event>();
+ 
+-    if (ac->ac_connected && ac->disconnect_event) {
+-        ac->disconnect_event->Signal();
++    // Only the caller's own connection ends. Before, any close (NDM closes its connection every
++    // few seconds with the real NDM) signalled the disconnect event of whichever process
++    // registered one last and marked everyone offline: Badge Arcade then lost its game server
++    // connection right after signing in (006-0114, 2026-10-15).
++    const bool was_connected = ac->connected_processes.erase(pid) > 0;
++    if (was_connected) {
++        if (const auto it = ac->disconnect_events.find(pid);
++            it != ac->disconnect_events.end() && it->second) {
++            it->second->Signal();
++        }
+     }
+ 
+     if (ac->close_event) {
+@@ -108,7 +117,7 @@ void Module::Interface::CloseAsync(Kernel::HLERequestContext& ctx) {
+         ac->close_event->Signal();
+     }
+ 
+-    ac->ac_connected = false;
++    ac->ac_connected = !ac->connected_processes.empty();
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(ResultSuccess);
+@@ -253,11 +262,14 @@ void Module::Interface::GetNZoneBeaconNotFoundEvent(Kernel::HLERequestContext& c
+ 
+ void Module::Interface::RegisterDisconnectEvent(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+-    rp.Skip(2, false); // ProcessId descriptor
++    const u32 pid = rp.PopPID();
+ 
+     ac->disconnect_event = rp.PopObject<Kernel::Event>();
+     if (ac->disconnect_event) {
+         ac->disconnect_event->SetName("AC:disconnect_event");
++        ac->disconnect_events[pid] = ac->disconnect_event;
++    } else {
++        ac->disconnect_events.erase(pid);
+     }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index c455b47ff..151609fa7 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -5,7 +5,9 @@
+ #pragma once
+ 
+ #include <array>
++#include <map>
+ #include <memory>
++#include <set>
+ #include "core/hle/service/service.h"
+ 
+ namespace Core {
+@@ -296,6 +298,15 @@ protected:
+ 
+     bool ac_connected = false;
+ 
++    /**
++     * Processes that hold a connection (ConnectAsync without CloseAsync since). On the console
++     * the connection is shared: one process closing it (NDM does every few seconds for its
++     * background checks) doesn't take it away from the others.
++     */
++    std::set<u32> connected_processes;
++    /// Each process's disconnect event (RegisterDisconnectEvent), by process ID.
++    std::map<u32, std::shared_ptr<Kernel::Event>> disconnect_events;
++
+     std::shared_ptr<Kernel::Event> close_event;
+     std::shared_ptr<Kernel::Event> connect_event;
+     std::shared_ptr<Kernel::Event> disconnect_event;
+-- 
+2.43.0
+
