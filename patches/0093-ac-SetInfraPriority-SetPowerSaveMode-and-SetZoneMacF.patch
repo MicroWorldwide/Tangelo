@@ -1,0 +1,152 @@
+From cf1a0b0dab123b94fcf3643db0bf562852216c14 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 15 Oct 2026 21:07:52 +0200
+Subject: [PATCH] ac: SetInfraPriority, SetPowerSaveMode and SetZoneMacFilter
+
+With Nintendo's own NDM module (LLE), NDM calls ac:u SetInfraPriority
+(0x0026), SetPowerSaveMode (0x0028) and SetZoneMacFilter (0x003D) over and
+over; they were unimplemented. They now succeed and hand the connection
+config back as it came in, like SetFromApplication.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp   | 43 ++++++++++++++++++++++++++++++++
+ src/core/hle/service/ac/ac.h     | 21 ++++++++++++++++
+ src/core/hle/service/ac/ac_i.cpp |  3 +++
+ src/core/hle/service/ac/ac_u.cpp |  3 +++
+ 4 files changed, 70 insertions(+)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index c6a458f0b..99c448373 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -161,6 +161,49 @@ void Module::Interface::GetInfraPriority(Kernel::HLERequestContext& ctx) {
+     LOG_WARNING(Service_AC, "(STUBBED) called");
+ }
+ 
++void Module::Interface::SetInfraPriority(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    const u32 priority = rp.Pop<u32>();
++    const std::vector<u8>& ac_config = rp.PopStaticBuffer();
++
++    // Called by NDM (with the real NDM module) before its connection checks. Like
++    // SetFromApplication, the setting only matters to the real connection logic, so the config
++    // goes back as it came in.
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(ac_config), 0);
++
++    LOG_DEBUG(Service_AC, "called, priority={}", priority);
++}
++
++void Module::Interface::SetPowerSaveMode(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    const u32 mode = rp.Pop<u32>();
++    const std::vector<u8>& ac_config = rp.PopStaticBuffer();
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(ac_config), 0);
++
++    LOG_DEBUG(Service_AC, "called, mode={}", mode);
++}
++
++void Module::Interface::SetZoneMacFilter(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++
++    const u32 filter = rp.Pop<u32>();
++    const std::vector<u8>& ac_config = rp.PopStaticBuffer();
++
++    // NDM sets it (0xC1) at start; only the real Nintendo Zone scan uses it.
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushStaticBuffer(std::move(ac_config), 0);
++
++    LOG_DEBUG(Service_AC, "called, filter={:#x}", filter);
++}
++
+ void Module::Interface::SetFromApplication(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index 017bcef27..c455b47ff 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -138,6 +138,27 @@ public:
+          */
+         void SetRequestEulaVersion(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::SetInfraPriority service function
++         *  Inputs:
++         *      1 : u32, infrastructure priority
++         *      2-3 : Static buffer with the ACConfig
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2-3 : Static buffer with the ACConfig
++         */
++        void SetInfraPriority(Kernel::HLERequestContext& ctx);
++
++        /**
++         * AC::SetPowerSaveMode service function (same layout as SetInfraPriority)
++         */
++        void SetPowerSaveMode(Kernel::HLERequestContext& ctx);
++
++        /**
++         * AC::SetZoneMacFilter service function (same layout as SetInfraPriority)
++         */
++        void SetZoneMacFilter(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::SetFromApplication service function
+          *  Inputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index 6f8816ba7..fafdf504b 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -28,7 +28,9 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0025, &AC_I::SetNetworkArea, "SetNetworkArea"},
++        {0x0026, &AC_I::SetInfraPriority, "SetInfraPriority"},
+         {0x0027, &AC_I::GetInfraPriority, "GetInfraPriority"},
++        {0x0028, &AC_I::SetPowerSaveMode, "SetPowerSaveMode"},
+         {0x002C, &AC_I::SetFromApplication, "SetFromApplication"},
+         {0x002D, &AC_I::SetRequestEulaVersion, "SetRequestEulaVersion"},
+         {0x002F, &AC_I::GetNZoneBeaconNotFoundEvent, "GetNZoneBeaconNotFoundEvent"},
+@@ -38,6 +40,7 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x0035, &AC_I::GetConnectingSsidLength, "GetConnectingSsidLength"},
+         {0x0036, &AC_I::GetConnectingProxyEnable, "GetConnectingProxyEnable"},
+         {0x003C, nullptr, "GetAPSSIDList"},
++        {0x003D, &AC_I::SetZoneMacFilter, "SetZoneMacFilter"},
+         {0x003E, &AC_I::IsConnected, "IsConnected"},
+         {0x0040, &AC_I::SetClientVersion, "SetClientVersion"},
+         // clang-format on
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 60b2f07be..03e3ab65a 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -28,7 +28,9 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0025, &AC_U::SetNetworkArea, "SetNetworkArea"},
++        {0x0026, &AC_U::SetInfraPriority, "SetInfraPriority"},
+         {0x0027, &AC_U::GetInfraPriority, "GetInfraPriority"},
++        {0x0028, &AC_U::SetPowerSaveMode, "SetPowerSaveMode"},
+         {0x002C, &AC_U::SetFromApplication, "SetFromApplication"},
+         {0x002D, &AC_U::SetRequestEulaVersion, "SetRequestEulaVersion"},
+         {0x002F, &AC_U::GetNZoneBeaconNotFoundEvent, "GetNZoneBeaconNotFoundEvent"},
+@@ -38,6 +40,7 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x0035, &AC_U::GetConnectingSsidLength, "GetConnectingSsidLength"},
+         {0x0036, &AC_U::GetConnectingProxyEnable, "GetConnectingProxyEnable"},
+         {0x003C, nullptr, "GetAPSSIDList"},
++        {0x003D, &AC_U::SetZoneMacFilter, "SetZoneMacFilter"},
+         {0x003E, &AC_U::IsConnected, "IsConnected"},
+         {0x0040, &AC_U::SetClientVersion, "SetClientVersion"},
+         // clang-format on
+-- 
+2.43.0
+
