@@ -1,0 +1,57 @@
+From b86e18f636648e8434ba0d5b850ad24b33a76574 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 15 Oct 2026 23:20:21 +0200
+Subject: [PATCH] ac: IsConnected answers for the calling process
+
+IsConnected takes the caller's process ID and tells whether that process
+holds a connection. Tangelo answered with the console-wide flag instead.
+
+With the real NDM (patch 0096) the HOME Menu and NDM are connected before
+a game starts. Badge Arcade asks IsConnected at startup, got "yes",
+skipped its own ConnectAsync and never set up its sockets, so its game
+server login failed with 006-0114 right after signing in. With the HLE
+NDM nobody was connected yet, so the game connected itself and worked.
+
+IsConnected now answers whether the caller is one of the processes that
+connected (patch 0099 keeps that list).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp | 16 ++++++++++------
+ 1 file changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index a2a646f06..f51046b5d 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -432,16 +432,20 @@ void Module::Interface::GetConnectingLocation(Kernel::HLERequestContext& ctx) {
+ 
+ void Module::Interface::IsConnected(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+-    u32 unk = rp.Pop<u32>();
+-    u32 unk_descriptor = rp.Pop<u32>();
+-    u32 unk_param = rp.Pop<u32>();
++    const u32 unk = rp.Pop<u32>();
++    const u32 pid = rp.PopPID();
++
++    // The answer is about the calling process's own connection. A game asks this before going
++    // online and only connects (and sets up its sockets) when it isn't connected yet. With the
++    // real NDM the HOME Menu and NDM hold connections too; answering "connected" for them made
++    // Badge Arcade skip its own connect and fail with 006-0114 (2026-10-15).
++    const bool connected = ac->connected_processes.contains(pid);
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+-    rb.Push(ac->ac_connected);
++    rb.Push(connected);
+ 
+-    LOG_DEBUG(Service_AC, "(STUBBED) called unk=0x{:08X} descriptor=0x{:08X} param=0x{:08X}", unk,
+-              unk_descriptor, unk_param);
++    LOG_DEBUG(Service_AC, "called unk=0x{:08X} pid={} connected={}", unk, pid, connected);
+ }
+ 
+ void Module::Interface::SetClientVersion(Kernel::HLERequestContext& ctx) {
+-- 
+2.43.0
+
