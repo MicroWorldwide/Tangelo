@@ -1,0 +1,91 @@
+From 07035493edae2ef17135c23ef40ed5f89ff148ec Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 00:30:06 +0200
+Subject: [PATCH 101/102] am: title info for the started game file when it
+ isn't installed
+
+Starting a game straight from its file (Smash 3DS from a .3ds) and then
+going to the HOME Menu ended in a fatal error (RSL 0xD8A083FA, ADR
+0x0021C220): the HOME Menu asks am:sys GetProgramInfos for the last
+played game on the SD card, the game isn't installed there, and AM
+answered NotFound.
+
+When a title has neither a readable TMD nor installed content but is
+the file Tangelo was started with, its info (version, size, type 0x40,
+as for game cards) now comes from that file. System gets GetFilePath()
+for it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/core.h                |  5 +++++
+ src/core/hle/service/am/am.cpp | 30 +++++++++++++++++++++++++++++-
+ 2 files changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/core.h b/src/core/core.h
+index 8aa9315fc..725a786db 100644
+--- a/src/core/core.h
++++ b/src/core/core.h
+@@ -316,6 +316,11 @@ public:
+         return status_details;
+     }
+ 
++    /// The file Tangelo was started with (a game file, or the HOME Menu).
++    [[nodiscard]] const std::string& GetFilePath() const {
++        return m_filepath;
++    }
++
+     [[nodiscard]] Loader::AppLoader& GetAppLoader() const {
+         return *app_loader;
+     }
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index e49fd838c..92efe1c2c 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -2317,6 +2317,33 @@ static bool TitleInfoFromContent(Service::FS::MediaType media_type, u64 title_id
+     return true;
+ }
+ 
++/**
++ * Title info for the game file Tangelo was started with, when that game isn't installed. The HOME
++ * Menu asks for the last played game when it starts after it (e.g. Smash 3DS started from a .3ds
++ * file, then HOME): it asks on the SD card, and a NotFound answer stops it with a fatal error
++ * (RSL 0xD8A083FA, ADR 0x0021C220).
++ */
++static bool TitleInfoFromBootedFile(Core::System& system, u64 title_id, TitleInfo& title_info) {
++    const std::string& path = system.GetFilePath();
++    if (path.empty()) {
++        return false;
++    }
++    FileSys::NCCHContainer ncch_container(path);
++    if (ncch_container.Load() != Loader::ResultStatus::Success ||
++        ncch_container.exheader_header.arm11_system_local_caps.program_id != title_id) {
++        return false;
++    }
++    title_info.version =
++        (*reinterpret_cast<u16_le*>(
++             &ncch_container.exheader_header.codeset_info.flags.remaster_version)
++         << 10) &
++        0xFC00;
++    title_info.size = FileUtil::GetSize(path);
++    title_info.type = 0x40;
++    LOG_INFO(Service_AM, "Title info for {:016X} comes from the started file {}", title_id, path);
++    return true;
++}
++
+ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_list,
+                             Service::FS::MediaType media_type,
+                             std::vector<TitleInfo>& title_info_out) {
+@@ -2377,7 +2404,8 @@ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_
+                 title_info.size = tmd.GetContentSizeByIndex(FileSys::TMDContentIndex::Main);
+                 title_info.version = tmd.GetTitleVersion();
+                 title_info.type = tmd.GetTitleType();
+-            } else if (!TitleInfoFromContent(media_type, title_id_list[i], title_info)) {
++            } else if (!TitleInfoFromContent(media_type, title_id_list[i], title_info) &&
++                       !TitleInfoFromBootedFile(system, title_id_list[i], title_info)) {
+                 // A warning: the HOME Menu stops with a fatal error on this answer, and the
+                 // title ID is what tells which install is broken.
+                 LOG_WARNING(Service_AM,
+-- 
+2.43.0
+

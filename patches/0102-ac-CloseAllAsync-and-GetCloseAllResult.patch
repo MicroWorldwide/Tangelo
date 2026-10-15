@@ -1,0 +1,141 @@
+From b8117d12c3b637fac4bb3ee13193952d65172f45 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 00:30:06 +0200
+Subject: [PATCH 102/102] ac: CloseAllAsync and GetCloseAllResult
+
+The real NDM calls ac:u 0x0019 CloseAllAsync when it stops its
+background connection (right after its CancelConnectAsync), which was
+unimplemented. It now ends the caller's own connection and signals the
+given event, like CloseAsync; other processes keep theirs, so a running
+game isn't cut off (see 0099). 0x001A GetCloseAllResult answers like
+GetCloseResult. Both on ac:u and ac:i.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp   | 40 +++++++++++++++++++++++++-------
+ src/core/hle/service/ac/ac.h     | 13 +++++++++++
+ src/core/hle/service/ac/ac_i.cpp |  2 ++
+ src/core/hle/service/ac/ac_u.cpp |  2 ++
+ 4 files changed, 49 insertions(+), 8 deletions(-)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index f51046b5d..9d08dac94 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -104,23 +104,47 @@ void Module::Interface::CloseAsync(Kernel::HLERequestContext& ctx) {
+     // few seconds with the real NDM) signalled the disconnect event of whichever process
+     // registered one last and marked everyone offline: Badge Arcade then lost its game server
+     // connection right after signing in (006-0114, 2026-10-15).
+-    const bool was_connected = ac->connected_processes.erase(pid) > 0;
+-    if (was_connected) {
+-        if (const auto it = ac->disconnect_events.find(pid);
+-            it != ac->disconnect_events.end() && it->second) {
+-            it->second->Signal();
+-        }
+-    }
++    ac->CloseConnection(pid);
+ 
+     if (ac->close_event) {
+         ac->close_event->SetName("AC:close_event");
+         ac->close_event->Signal();
+     }
+ 
+-    ac->ac_connected = !ac->connected_processes.empty();
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(ResultSuccess);
++}
++
++void Module::Interface::CloseAllAsync(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 pid = rp.PopPID();
++    const auto event = rp.PopObject<Kernel::Event>();
++
++    // The real NDM calls this when it stops its background connection (seen 2026-10-16 after its
++    // CancelConnectAsync). On the console the other processes' connections are separate; ending
++    // them here would cut off a running game the way 0099 fixed for CloseAsync, so only the
++    // caller's connection ends.
++    ac->CloseConnection(pid);
++
++    if (event) {
++        event->SetName("AC:close_all_event");
++        event->Signal();
++    }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(ResultSuccess);
++
++    LOG_DEBUG(Service_AC, "called, pid={}", pid);
++}
++
++void Module::CloseConnection(u32 pid) {
++    if (connected_processes.erase(pid) > 0) {
++        if (const auto it = disconnect_events.find(pid);
++            it != disconnect_events.end() && it->second) {
++            it->second->Signal();
++        }
++    }
++    ac_connected = !connected_processes.empty();
+ }
+ 
+ void Module::Interface::GetCloseResult(Kernel::HLERequestContext& ctx) {
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index 151609fa7..e6c1497c1 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -80,6 +80,16 @@ public:
+          */
+         void CloseAsync(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::CloseAllAsync service function (NDM, when it stops its background connection)
++         *  Inputs:
++         *      1-2 : ProcessId descriptor and PID
++         *      3-4 : Copy handle descriptor and the event to signal
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         */
++        void CloseAllAsync(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::GetCloseResult service function
+          *  Inputs:
+@@ -307,6 +317,9 @@ protected:
+     /// Each process's disconnect event (RegisterDisconnectEvent), by process ID.
+     std::map<u32, std::shared_ptr<Kernel::Event>> disconnect_events;
+ 
++    /// Ends the connection of one process and signals its own disconnect event.
++    void CloseConnection(u32 pid);
++
+     std::shared_ptr<Kernel::Event> close_event;
+     std::shared_ptr<Kernel::Event> connect_event;
+     std::shared_ptr<Kernel::Event> disconnect_event;
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index fafdf504b..7d6d78582 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -25,6 +25,8 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+         {0x0011, &AC_I::GetNZoneApNumService, "GetNZoneApNumService"},
+         {0x0014, &AC_I::GetConnectingLocation, "GetConnectingLocation"},
++        {0x0019, &AC_I::CloseAllAsync, "CloseAllAsync"},
++        {0x001A, &AC_I::GetCloseResult, "GetCloseAllResult"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0025, &AC_I::SetNetworkArea, "SetNetworkArea"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 03e3ab65a..9bb74a8fe 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -25,6 +25,8 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x0010, nullptr, "GetCurrentNZoneInfo"},
+         {0x0011, &AC_U::GetNZoneApNumService, "GetNZoneApNumService"},
+         {0x0014, &AC_U::GetConnectingLocation, "GetConnectingLocation"},
++        {0x0019, &AC_U::CloseAllAsync, "CloseAllAsync"},
++        {0x001A, &AC_U::GetCloseResult, "GetCloseAllResult"},
+         {0x001D, nullptr, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0025, &AC_U::SetNetworkArea, "SetNetworkArea"},
+-- 
+2.43.0
+
