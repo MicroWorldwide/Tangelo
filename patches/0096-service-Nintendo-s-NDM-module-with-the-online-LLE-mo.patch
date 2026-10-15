@@ -1,0 +1,37 @@
+From 548117824522bbe8550276c19116d090054f6493 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 15 Oct 2026 21:52:29 +0200
+Subject: [PATCH] service: Nintendo's NDM module with the online LLE modules
+
+Tangelo's own NDM only stubs SuspendDaemons/ResumeDaemons, so the real
+SpotPass module never ran its background schedule: every task that a game
+doesn't start itself stayed "not started" (StreetPass relay, notifications,
+Golf tournaments, Tomodachi letters, ...), and the friends module didn't
+send its presence. With NDM 0004013000002B02 from the NAND they all ran
+within a minute (user test 2026-10-15). "Enable required LLE modules for
+online features" now loads NDM too, like BOSS, FRD, CECD, NIM and ACT, so
+no hand edit of the config is needed. Without the title in the NAND the
+HLE NDM stays in use, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/service.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index ed81a5b4a..e0a7a6b7d 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -87,7 +87,7 @@ const std::array<ServiceModuleInfo, 41> service_module_map{
+      {"IR", 0x00040130'00003302, IR::InstallInterfaces, false},
+      {"MIC", 0x00040130'00002002, MIC::InstallInterfaces, false},
+      {"MVD", 0x00040130'20004102, MVD::InstallInterfaces, false},
+-     {"NDM", 0x00040130'00002B02, NDM::InstallInterfaces, false},
++     {"NDM", 0x00040130'00002B02, NDM::InstallInterfaces, true},
+      {"NEWS", 0x00040130'00003502, NEWS::InstallInterfaces, false},
+      {"NFC", 0x00040130'00004002, NFC::InstallInterfaces, false},
+      {"NIM", 0x00040130'00002C02, NIM::InstallInterfaces, true},
+-- 
+2.43.0
+
