@@ -1,0 +1,56 @@
+From 1aaea4f45de5bfba524a16a303b7c5fab416ced0 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 15 Oct 2026 21:41:02 +0200
+Subject: [PATCH] apt: application jump with flags 1 goes back to the previous
+ title
+
+System Transfer (0004001020025100), started from System Settings, ends
+with PrepareToDoApplicationJump(-1, flags 1), which hit "Unimplemented
+application jump flags 1" and closed Tangelo. Flags 1 now uses the stored
+parameters of the previous jump: the title that jumped to the current one
+(System Settings here); without a previous jump it restarts the current
+title like flags 2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/apt/applet_manager.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/core/hle/service/apt/applet_manager.cpp b/src/core/hle/service/apt/applet_manager.cpp
+index 232b544fe..35689abff 100644
+--- a/src/core/hle/service/apt/applet_manager.cpp
++++ b/src/core/hle/service/apt/applet_manager.cpp
+@@ -1352,8 +1352,11 @@ Result AppletManager::PrepareToDoApplicationJump(u64 title_id, FS::MediaType med
+     // for the Application slot is already in use. The way this is implemented in hardware is to
+     // launch the Home Menu and tell it to launch our desired application.
+ 
+-    ASSERT_MSG(flags != ApplicationJumpFlags::UseStoredParameters,
+-               "Unimplemented application jump flags 1");
++    // Flags 1 jumps back with the parameters of the previous jump: to the title that jumped to
++    // the current one (System Transfer, started from System Settings, returns to System Settings
++    // this way). Without a previous jump it acts like flags 2 (restart the current title).
++    const u64 previous_title_id = app_jump_parameters.current_title_id;
++    const FS::MediaType previous_media_type = app_jump_parameters.current_media_type;
+ 
+     // Save the title data to send it to the Home Menu when DoApplicationJump is called.
+     auto application_slot_data = GetAppletSlot(AppletSlot::Application);
+@@ -1368,7 +1371,14 @@ Result AppletManager::PrepareToDoApplicationJump(u64 title_id, FS::MediaType med
+     }
+ 
+     app_jump_parameters.current_media_type = curr_media_type;
+-    if (flags == ApplicationJumpFlags::UseCurrentParameters) {
++    if (flags == ApplicationJumpFlags::UseStoredParameters && previous_title_id != 0 &&
++        previous_title_id != ~0ULL &&
++        previous_title_id != app_jump_parameters.current_title_id) {
++        LOG_INFO(Service_APT, "jumping back to {:016X}", previous_title_id);
++        app_jump_parameters.next_title_id = previous_title_id;
++        app_jump_parameters.next_media_type = previous_media_type;
++    } else if (flags == ApplicationJumpFlags::UseCurrentParameters ||
++               flags == ApplicationJumpFlags::UseStoredParameters) {
+         app_jump_parameters.next_title_id = app_jump_parameters.current_title_id;
+         app_jump_parameters.next_media_type = app_jump_parameters.current_media_type;
+     } else {
+-- 
+2.43.0
+
