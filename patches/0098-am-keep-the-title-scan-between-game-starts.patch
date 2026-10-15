@@ -1,0 +1,174 @@
+From 699537895e646db1612ba23979a3c0ac6f39d8a3 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 15 Oct 2026 22:08:46 +0200
+Subject: [PATCH 98/98] am: keep the title scan between game starts
+
+Every game start makes a new AM module, and its title scan read the TMD
+and NCCH header of every installed title again: some 240 system titles,
+which takes seconds on Android where each file goes through the storage
+framework.
+
+Titles a scan found readable are now kept for the whole run (per title
+folder, so a changed NAND or SD folder starts empty). A new module only
+lists the folders and checks titles it hasn't seen yet. Anything that
+installs, deletes or uninstalls a title (CIA install, the AM delete and
+uninstall calls, the front ends' uninstall, ScanForTitles) forgets the
+list, so the next scan checks everything again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/am/am.cpp | 48 +++++++++++++++++++++++++++++++---
+ src/core/hle/service/am/am.h   | 10 ++++++-
+ 2 files changed, 54 insertions(+), 4 deletions(-)
+
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index 846ab175c..e49fd838c 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -8,6 +8,8 @@
+ #include <mutex>
+ #include <optional>
+ #include <set>
++#include <unordered_map>
++#include <unordered_set>
+ #include <cryptopp/aes.h>
+ #include <cryptopp/modes.h>
+ #include <fmt/format.h>
+@@ -67,6 +69,35 @@ constexpr Result ResultInvalidMediaType(ErrorDescription::InvalidEnumValue, Erro
+ constexpr Result ResultReadNotSupported(ErrorDescription::NotImplemented, ErrorModule::AM,
+                                         ErrorSummary::NotSupported, ErrorLevel::Permanent);
+ 
++namespace {
++/**
++ * Titles already found readable by a title scan, kept for the whole run of the emulator.
++ * Every game start makes a new AM module, and its scan used to read the TMD and NCCH header of
++ * every installed title again (some 240 system titles; seconds on Android, where each file goes
++ * through the storage framework). Only titles that loaded are kept, per title folder, so a new
++ * title is always checked and a changed NAND/SD folder starts empty. Anything that installs,
++ * deletes or uninstalls a title forgets the list (ForgetScannedTitles).
++ */
++std::mutex scanned_titles_mutex;
++std::unordered_map<std::string, std::unordered_set<u64>> scanned_titles;
++
++bool WasScannedBefore(const std::string& title_path, u64 tid) {
++    std::scoped_lock lock(scanned_titles_mutex);
++    const auto it = scanned_titles.find(title_path);
++    return it != scanned_titles.end() && it->second.contains(tid);
++}
++
++void RememberScanned(const std::string& title_path, u64 tid) {
++    std::scoped_lock lock(scanned_titles_mutex);
++    scanned_titles[title_path].insert(tid);
++}
++} // namespace
++
++void ForgetScannedTitles() {
++    std::scoped_lock lock(scanned_titles_mutex);
++    scanned_titles.clear();
++}
++
+ /// Imported tickets, TMDs and contents are stored on FAT32 partitions on hardware, so none of
+ /// them can be larger than the maximum FAT32 file size.
+ constexpr u64 MAX_IMPORT_FILE_SIZE = 0xFFFFFFFF;
+@@ -999,6 +1030,7 @@ bool CIAFile::Close() {
+     if (is_closed)
+         return true;
+     is_closed = true;
++    ForgetScannedTitles();
+ 
+     // Commit last pending install result
+     if (current_content_install_result.type != InstallResult::Type::NONE) {
+@@ -1650,6 +1682,7 @@ void Module::ScanForTicketsImpl() {
+ }
+ 
+ void Module::ScanForTitles(Service::FS::MediaType media_type) {
++    ForgetScannedTitles();
+     if (Settings::values.deterministic_async_operations) {
+         ScanForTitlesImpl(media_type);
+     } else {
+@@ -1698,17 +1731,21 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
+                 if (tid_string.length() == TITLE_ID_VALID_LENGTH) {
+                     const u64 tid = std::stoull(tid_string, nullptr, 16);
+ 
+-                    if (tid & TWL_TITLE_ID_FLAG) {
++                    if (WasScannedBefore(title_path, tid)) {
++                        am_title_list[static_cast<u32>(media_type)].push_back(tid);
++                    } else if (tid & TWL_TITLE_ID_FLAG) {
+                         // TODO(PabloMK7) Move to TWL Nand, for now only check that
+                         // the contents exists in CTR Nand as this is a SRL file
+                         // instead of NCCH.
+                         if (FileUtil::Exists(GetTitleContentPath(media_type, tid))) {
+                             am_title_list[static_cast<u32>(media_type)].push_back(tid);
++                            RememberScanned(title_path, tid);
+                         }
+                     } else {
+                         FileSys::NCCHContainer container(GetTitleContentPath(media_type, tid));
+                         if (container.Load() == Loader::ResultStatus::Success) {
+                             am_title_list[static_cast<u32>(media_type)].push_back(tid);
++                            RememberScanned(title_path, tid);
+                         }
+                     }
+                 }
+@@ -1719,7 +1756,10 @@ void Module::ScanForTitlesImpl(Service::FS::MediaType media_type) {
+     LOG_DEBUG(Service_AM, "Finished title scan for media_type={}", static_cast<int>(media_type));
+ }
+ 
+-void Module::ScanForAllTitles() {
++void Module::ScanForAllTitles(bool forget_scanned) {
++    if (forget_scanned) {
++        ForgetScannedTitles();
++    }
+     if (Settings::values.deterministic_async_operations) {
+         ScanForTicketsImpl();
+         ScanForTitlesImpl(Service::FS::MediaType::NAND);
+@@ -4112,6 +4152,7 @@ Result UninstallProgram(const FS::MediaType media_type, const u64 title_id) {
+     if (!IsInstallableMediaType(media_type)) {
+         return ResultInvalidMediaType;
+     }
++    ForgetScannedTitles();
+     // Use the content folder so we don't delete the user's save data.
+     const auto path = GetTitlePath(media_type, title_id) + "content/";
+     if (!FileUtil::Exists(path)) {
+@@ -5442,7 +5483,8 @@ bool Module::IsTitleImportPending(u64 title_id) const {
+ 
+ Module::Module(Core::System& _system) : system(_system) {
+     FileUtil::CreateFullPath(GetTicketDirectory());
+-    ScanForAllTitles();
++    // A new module (a game start) keeps what earlier scans found; installs forget it.
++    ScanForAllTitles(false);
+     system_updater_mutex = system.Kernel().CreateMutex(false, "AM::SystemUpdaterMutex");
+ }
+ 
+diff --git a/src/core/hle/service/am/am.h b/src/core/hle/service/am/am.h
+index 2fa43baa9..63c66d82c 100644
+--- a/src/core/hle/service/am/am.h
++++ b/src/core/hle/service/am/am.h
+@@ -505,6 +505,12 @@ Result GetTitleInfoFromList(Core::System& system, std::span<const u64> title_id_
+  */
+ Result UninstallProgram(const FS::MediaType media_type, const u64 title_id);
+ 
++/**
++ * Makes the next title scan check every installed title again. Called by anything that
++ * installs, deletes or uninstalls a title outside the AM service.
++ */
++void ForgetScannedTitles();
++
+ class Module final {
+ public:
+     explicit Module(Core::System& system);
+@@ -1214,8 +1220,10 @@ private:
+ 
+     /**
+      * Scans all storage mediums for titles for listing.
++     * @param forget_scanned false keeps the titles earlier scans found readable (a new module
++     *        at game start); true checks every title again (after an install or delete)
+      */
+-    void ScanForAllTitles();
++    void ScanForAllTitles(bool forget_scanned = true);
+ 
+     Core::System& system;
+     bool cia_installing = false;
+-- 
+2.43.0
+

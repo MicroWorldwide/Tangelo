@@ -1,0 +1,44 @@
+From f46b74273211333cd92a74025e17e459e936e6bc Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 15 Oct 2026 22:08:46 +0200
+Subject: [PATCH 97/98] ac: SetZoneMacFilter answers without a buffer
+
+Patch 0093 handed SetZoneMacFilter's data back like the other Set* calls,
+but NDM sets up no buffer for an answer to this one. With the real NDM
+(patch 0096) that hit "Static buffer data is too big" and Tangelo
+crashed as soon as the HOME Menu started. Now only the result goes back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ src/core/hle/service/ac/ac.cpp | 11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 99c448373..08828e752 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -194,14 +194,15 @@ void Module::Interface::SetZoneMacFilter(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+     const u32 filter = rp.Pop<u32>();
+-    const std::vector<u8>& ac_config = rp.PopStaticBuffer();
++    const std::vector<u8>& data = rp.PopStaticBuffer();
+ 
+-    // NDM sets it (0xC1) at start; only the real Nintendo Zone scan uses it.
+-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    // NDM sets it (0xC1) at start; only the real Nintendo Zone scan uses it. Unlike the other
++    // Set* calls nothing comes back: NDM sets up no buffer for an answer (handing the data back
++    // ended in "Static buffer data is too big" when the HOME Menu started, 2026-10-15).
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(ResultSuccess);
+-    rb.PushStaticBuffer(std::move(ac_config), 0);
+ 
+-    LOG_DEBUG(Service_AC, "called, filter={:#x}", filter);
++    LOG_DEBUG(Service_AC, "called, filter={:#x}, {} bytes", filter, data.size());
+ }
+ 
+ void Module::Interface::SetFromApplication(Kernel::HLERequestContext& ctx) {
+-- 
+2.43.0
+
