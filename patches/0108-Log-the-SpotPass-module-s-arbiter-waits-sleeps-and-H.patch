@@ -1,0 +1,157 @@
+From 7db3e5e9d3a58adc0cbf7b64cddb26728e87461e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 18:50:48 +0200
+Subject: [PATCH] Log the SpotPass module's arbiter waits, sleeps and HLE service calls
+
+Build 107 showed only a handful of WaitSynchronization waits for boss: its
+threads block on their own light events through ArbitrateAddress, and its
+calls to HLE services (http:C, ac, fs) don't pass through the kernel IPC log.
+Both are now logged for the boss process (Service_BOSS:Info, throttled),
+plus its SleepThread calls, to find where the foreground task stops.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                     |  2 +-
+ src/core/hle/kernel/svc.cpp      | 45 +++++++++++++++++++++++++++++---
+ src/core/hle/service/service.cpp | 26 ++++++++++++++++++
+ 3 files changed, 69 insertions(+), 4 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index e34885bbc..3b20426c0 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-107
++108
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 38980b96c..7e694c102 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -7,6 +7,7 @@
+ #include <chrono>
+ #include <map>
+ #include <mutex>
++#include <tuple>
+ #include <fmt/format.h>
+ #include "common/archives.h"
+ #include "common/logging/log.h"
+@@ -790,6 +791,36 @@ static void LogBossWait(Core::System& system, const Thread* thread,
+              core.GetPC(), core.GetReg(14));
+ }
+ 
++/// Address arbiter use and sleeps of the SpotPass module's threads (boss only, Service_BOSS:Info):
++/// system modules block on their own light events and critical sections through
++/// ArbitrateAddress, which WaitSynchronization logging doesn't see. Each distinct (thread, kind,
++/// address) is logged the first 10 times, then every 500th.
++static void LogBossArbiter(Core::System& system, const Thread* thread, const char* kind,
++                           u32 address, s64 value, s64 nano_seconds) {
++    auto& kernel = system.Kernel();
++    const auto process = kernel.GetCurrentProcess();
++    if (!thread || process->GetName() != "boss") {
++        return;
++    }
++    static std::mutex mutex;
++    static std::map<std::tuple<u32, std::string, u32>, u64> counts;
++    {
++        std::scoped_lock lock{mutex};
++        const u64 n = ++counts[{thread->thread_id, kind, address}];
++        if (n > 10 && n % 500 != 0) {
++            return;
++        }
++    }
++    auto& core = system.GetRunningCore();
++    const u32 now = address ? system.Memory().Read32(address) : 0;
++    LOG_INFO(Service_BOSS,
++             "boss thread {} {} address 0x{:08X} (now {}) value {}{} (pc 0x{:08X}, lr 0x{:08X})",
++             thread->thread_id, kind, address, static_cast<s32>(now), value,
++             nano_seconds < 0 ? ""
++                              : fmt::format(", timeout {} ms", nano_seconds / 1000000),
++             core.GetPC(), core.GetReg(14));
++}
++
+ /// Logs what a wait on an invalid handle was about: the waiting thread and, if the handle was
+ /// closed shortly before, who closed it and what it was.
+ static void LogInvalidWaitHandle(Core::System& system, Handle handle, VAddr handles_address,
+@@ -1244,9 +1275,15 @@ Result SVC::ArbitrateAddress(Handle handle, u32 address, u32 type, u32 value, s6
+         kernel.GetCurrentProcess()->handle_table.Get<AddressArbiter>(handle);
+     R_UNLESS(arbiter, ResultInvalidHandle);
+ 
+-    auto res =
+-        arbiter->ArbitrateAddress(SharedFrom(kernel.GetCurrentThreadManager().GetCurrentThread()),
+-                                  static_cast<ArbitrationType>(type), address, value, nanoseconds);
++    Thread* current = kernel.GetCurrentThreadManager().GetCurrentThread();
++    auto res = arbiter->ArbitrateAddress(SharedFrom(current), static_cast<ArbitrationType>(type),
++                                         address, value, nanoseconds);
++    if (current->status == ThreadStatus::WaitArb) {
++        LogBossArbiter(system, current, "waits on", address, value,
++                       type == 3 || type == 4 ? nanoseconds : -1);
++    } else if (type == 0) {
++        LogBossArbiter(system, current, "signals", address, value, -1);
++    }
+ 
+     // TODO(Subv): Identify in which specific cases this call should cause a reschedule.
+     system.PrepareReschedule();
+@@ -1755,6 +1792,8 @@ void SVC::SleepThread(s64 nanoseconds) {
+         return;
+     }
+ 
++    LogBossArbiter(system, thread_manager.GetCurrentThread(), "sleeps", 0, 0, nanoseconds);
++
+     // Sleep current thread and check for next thread to schedule
+     thread_manager.WaitCurrentThread_Sleep();
+ 
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index e0a7a6b7d..109f93fc3 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -3,6 +3,9 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <algorithm>
++#include <map>
++#include <mutex>
++#include <utility>
+ #include <fmt/format.h>
+ #include "common/assert.h"
+ #include "common/hacks/hack_manager.h"
+@@ -176,6 +179,28 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(u32* cmd_buf, const Funct
+     cmd_buf[1] = 0;
+ }
+ 
++// Calls from the real (LLE) SpotPass module to the HLE services (http:C, ac:i, fs, ...): the
++// kernel IPC log only sees calls between LLE modules. Service_BOSS:Info; each (service, function)
++// is logged the first 20 times, then every 200th.
++static void LogBossHleCall(const std::string& service, const char* function,
++                           Kernel::HLERequestContext& context) {
++    const auto thread = context.ClientThread();
++    const auto process = thread ? thread->owner_process.lock() : nullptr;
++    if (!process || process->GetName() != "boss") {
++        return;
++    }
++    static std::mutex mutex;
++    static std::map<std::pair<std::string, std::string>, u64> counts;
++    {
++        std::scoped_lock lock{mutex};
++        const u64 n = ++counts[{service, function}];
++        if (n > 20 && n % 200 != 0) {
++            return;
++        }
++    }
++    LOG_INFO(Service_BOSS, "boss thread {} -> {}: {}", thread->thread_id, service, function);
++}
++
+ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context) {
+     auto itr = handlers.find(context.CommandHeader().command_id.Value());
+     const FunctionInfoBase* info = itr == handlers.end() ? nullptr : &itr->second;
+@@ -186,6 +211,7 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
+ 
+     LOG_TRACE(Service, "{}",
+               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
++    LogBossHleCall(GetServiceName(), info->name, context);
+     handler_invoker(this, info->handler_callback, context);
+ }
+ 
+-- 
+2.43.0
+
