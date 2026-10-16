@@ -1,0 +1,99 @@
+From 14b7e085931090663390541e5ae5ca6173ea5abc Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 17:13:35 +0200
+Subject: [PATCH] Log every call to and from the SpotPass module (boss)
+
+With the online LLE modules the real boss sysmodule runs and logs nothing
+itself; only failed replies were visible (LogFailedReply). Badge Arcade can
+hang on "Downloading/Reading latest data" with nothing in the log
+(2026-10-16), so every IPC request to boss and every reply from it is now
+logged under Service.BOSS (Info): who called, the command, the task ID when
+the request carries one in its first mapped buffer, and boss's result.
+Repeats of the same call are cut down (the first 20, then every 100th).
+
+BUILD-NUMBER 105.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/ipc.cpp | 49 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 50 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index b16e5f75e..f96ac0672 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-104
++105
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index dfe7bd079..dddd4fd1d 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -43,6 +43,50 @@ void LogFailedReply(const std::string& server, const std::string& client, u32 he
+                 server, client, command, header, result, (result >> 10) & 0xFF, result & 0x3FF);
+ }
+ 
++// Calls to and from the real (LLE) SpotPass module: one line per request and reply, so a stuck
++// SpotPass download can be followed (which game asked for what, what boss answered). With the
++// online LLE modules boss logs nothing itself; before this, only failed replies were visible.
++// Repeats of the same call are cut down (the first 20, then every 100th).
++static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst,
++                        const std::array<u32, IPC::COMMAND_BUFFER_LENGTH>& cmd_buf,
++                        std::size_t untranslated_size, std::size_t command_size, bool reply) {
++    static std::mutex mutex;
++    static std::map<std::tuple<std::string, std::string, u32, u32>, u64> counts;
++    const u32 header = cmd_buf[0];
++    const u16 command = static_cast<u16>(header >> 16);
++    const u32 result = reply && untranslated_size > 1 ? cmd_buf[1] : 0;
++    {
++        std::scoped_lock lock{mutex};
++        const u64 n = ++counts[{src.GetName(), dst.GetName(), command, result}];
++        if (n > 20 && n % 100 != 0) {
++            return;
++        }
++    }
++    if (reply) {
++        LOG_INFO(Service_BOSS, "{} -> {}: reply to command 0x{:04X}: 0x{:08X}", src.GetName(),
++                 dst.GetName(), command, result);
++        return;
++    }
++    // A task ID (up to 8 characters) in the request's first mapped buffer, e.g. StartTask,
++    // RegisterTask, UnregisterTask, GetTaskState.
++    std::string task;
++    for (std::size_t i = untranslated_size; i + 1 < command_size; ++i) {
++        const u32 desc = cmd_buf[i];
++        if (IPC::GetDescriptorType(desc) == IPC::MappedBuffer) {
++            const u32 size = desc >> 4;
++            if (size > 0 && size <= 8) {
++                char buffer[9]{};
++                memory.ReadBlock(src, cmd_buf[i + 1], buffer, size);
++                task = buffer;
++            }
++            break;
++        }
++        i += 1; // the other descriptors used with boss take one parameter word
++    }
++    LOG_INFO(Service_BOSS, "{} -> {}: command 0x{:04X} (header 0x{:08X}){}{}", src.GetName(),
++             dst.GetName(), command, header, task.empty() ? "" : " task ", task);
++}
++
+ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem& memory,
+                               std::shared_ptr<Thread> src_thread,
+                               std::shared_ptr<Thread> dst_thread, VAddr src_address,
+@@ -70,6 +114,11 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+         LogFailedReply(src_process->GetName(), dst_process->GetName(), header.raw, cmd_buf[1]);
+     }
+ 
++    if (src_process->GetName() == "boss" || dst_process->GetName() == "boss") {
++        LogBossCall(memory, *src_process, *dst_process, cmd_buf, untranslated_size, command_size,
++                    reply);
++    }
++
+     const bool should_record = kernel.GetIPCRecorder().IsEnabled();
+ 
+     std::vector<u32> untranslated_cmdbuf;
+-- 
+2.43.0
+
