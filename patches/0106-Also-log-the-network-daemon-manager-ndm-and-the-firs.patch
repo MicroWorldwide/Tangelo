@@ -1,0 +1,66 @@
+From e95bc83c800f8a8aedc124602bc705798c5b3cd2 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 17:49:33 +0200
+Subject: [PATCH] Also log the network daemon manager (ndm) and the first call parameters
+
+The Badge Arcade hang under the HOME Menu happens after boss fetches the
+policy list; ndm suspends and resumes boss when the HOME Menu starts an
+application, so its calls and their parameters (daemon masks) are logged too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/ipc.cpp | 15 +++++++++++----
+ 2 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index f96ac0672..fe4afb0df 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-105
++106
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index dddd4fd1d..1bb253b71 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -43,7 +43,8 @@ void LogFailedReply(const std::string& server, const std::string& client, u32 he
+                 server, client, command, header, result, (result >> 10) & 0xFF, result & 0x3FF);
+ }
+ 
+-// Calls to and from the real (LLE) SpotPass module: one line per request and reply, so a stuck
++// Calls to and from the real (LLE) SpotPass module (boss) and the network daemon manager
++// (ndm, which suspends and resumes boss while the HOME Menu starts applications): one line per request and reply, so a stuck
+ // SpotPass download can be followed (which game asked for what, what boss answered). With the
+ // online LLE modules boss logs nothing itself; before this, only failed replies were visible.
+ // Repeats of the same call are cut down (the first 20, then every 100th).
+@@ -83,8 +84,13 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+         }
+         i += 1; // the other descriptors used with boss take one parameter word
+     }
+-    LOG_INFO(Service_BOSS, "{} -> {}: command 0x{:04X} (header 0x{:08X}){}{}", src.GetName(),
+-             dst.GetName(), command, header, task.empty() ? "" : " task ", task);
++    // The first plain parameters (e.g. the ndm daemon masks and states, boss task options).
++    std::string params;
++    for (std::size_t i = 1; i < untranslated_size && i <= 4; ++i) {
++        params += fmt::format("{}{:08X}", i == 1 ? " params " : " ", cmd_buf[i]);
++    }
++    LOG_INFO(Service_BOSS, "{} -> {}: command 0x{:04X} (header 0x{:08X}){}{}{}", src.GetName(),
++             dst.GetName(), command, header, task.empty() ? "" : " task ", task, params);
+ }
+ 
+ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem& memory,
+@@ -114,7 +120,8 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+         LogFailedReply(src_process->GetName(), dst_process->GetName(), header.raw, cmd_buf[1]);
+     }
+ 
+-    if (src_process->GetName() == "boss" || dst_process->GetName() == "boss") {
++    const auto logged = [](const std::string& name) { return name == "boss" || name == "ndm"; };
++    if (logged(src_process->GetName()) || logged(dst_process->GetName())) {
+         LogBossCall(memory, *src_process, *dst_process, cmd_buf, untranslated_size, command_size,
+                     reply);
+     }
+-- 
+2.43.0
+
