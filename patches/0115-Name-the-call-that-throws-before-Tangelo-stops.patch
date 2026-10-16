@@ -1,0 +1,105 @@
+From 578bb3e58c1df85ccb1b94e901f27743c1b05b1d Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 21:28:11 +0200
+Subject: [PATCH] Name the call that throws before Tangelo stops
+
+Build 114's crash report showed the crash after a game returns to the HOME
+Menu is std::terminate on the emulation thread (QThread) without a caught
+exception: a C++ exception leaving the emulation. HLE service calls now log
+service, function, calling process and the exception's message before passing
+it on, and so does the emulation loop. The boss call log no longer prints
+output buffers as task IDs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                     |  2 +-
+ src/citra_qt/bootmanager.cpp     | 10 +++++++++-
+ src/core/hle/kernel/ipc.cpp      |  5 +++++
+ src/core/hle/service/service.cpp | 12 +++++++++++-
+ 4 files changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index dee79f109..ee977b5ec 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-114
++115
+diff --git a/src/citra_qt/bootmanager.cpp b/src/citra_qt/bootmanager.cpp
+index 62da3abb9..a0c4ca134 100644
+--- a/src/citra_qt/bootmanager.cpp
++++ b/src/citra_qt/bootmanager.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <exception>
+ #include <QApplication>
+ #include <QHBoxLayout>
+ #include <QKeyEvent>
+@@ -112,7 +113,14 @@ void EmuThread::run() {
+             if (!was_active)
+                 emit DebugModeLeft();
+ 
+-            const Core::System::ResultStatus result = system.RunLoop();
++            Core::System::ResultStatus result;
++            try {
++                result = system.RunLoop();
++            } catch (const std::exception& e) {
++                // Leaving run() with an exception ends Tangelo (std::terminate); log it first.
++                LOG_CRITICAL(Frontend, "Emulation stopped by an exception: {}", e.what());
++                throw;
++            }
+             if (result == Core::System::ResultStatus::ShutdownRequested) {
+                 // Notify frontend we shutdown
+                 emit ErrorThrown(result, "");
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 2d16ecb1c..253ac2d85 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -85,6 +85,11 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+                 char buffer[9]{};
+                 memory.ReadBlock(src, cmd_buf[i + 1], buffer, size);
+                 task = buffer;
++                // Output buffers (e.g. boss:P 0x040D) hold no task ID.
++                if (!std::all_of(task.begin(), task.end(),
++                                 [](char c) { return c >= 0x20 && c < 0x7F; })) {
++                    task.clear();
++                }
+             }
+             break;
+         }
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index e0a7a6b7d..8e3e82cb3 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <algorithm>
++#include <exception>
+ #include <fmt/format.h>
+ #include "common/assert.h"
+ #include "common/hacks/hack_manager.h"
+@@ -186,7 +187,16 @@ void ServiceFrameworkBase::HandleSyncRequest(Kernel::HLERequestContext& context)
+ 
+     LOG_TRACE(Service, "{}",
+               MakeFunctionString(info->name, GetServiceName(), context.CommandBuffer()));
+-    handler_invoker(this, info->handler_callback, context);
++    try {
++        handler_invoker(this, info->handler_callback, context);
++    } catch (const std::exception& e) {
++        // An exception here ends Tangelo (it leaves the emulation thread); name the call first.
++        const auto thread = context.ClientThread();
++        const auto process = thread ? thread->owner_process.lock() : nullptr;
++        LOG_CRITICAL(Service, "{}::{} (called by {}) threw: {}", GetServiceName(), info->name,
++                     process ? process->GetName() : "?", e.what());
++        throw;
++    }
+ }
+ 
+ std::string ServiceFrameworkBase::GetFunctionName(IPC::Header header) const {
+-- 
+2.43.0
+

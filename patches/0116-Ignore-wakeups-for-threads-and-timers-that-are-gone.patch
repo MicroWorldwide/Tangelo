@@ -1,0 +1,72 @@
+From 5b329fc8d64261a3aa6ad98ae976ec6180a58e9e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 21:42:56 +0200
+Subject: [PATCH] Ignore wakeups for threads and timers that are gone
+
+Tangelo closed about a second after a game returned to the HOME Menu
+(Build 115 log: "Emulation stopped by an exception: unordered_map::at: key
+not found"). The game's threads are terminated when it closes; Thread::Stop
+unschedules their wakeup event, but not one queued in thread-safe mode (HLE
+requests that complete on a host thread, e.g. network calls), and that event
+then fired for a thread no longer in wakeup_callback_table. The wakeup and
+timer callbacks now ignore IDs they no longer know.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                   |  2 +-
+ src/core/hle/kernel/thread.cpp | 11 ++++++++++-
+ src/core/hle/kernel/timer.cpp  |  8 +++++++-
+ 3 files changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index ee977b5ec..4699eb3cc 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-115
++116
+diff --git a/src/core/hle/kernel/thread.cpp b/src/core/hle/kernel/thread.cpp
+index e5145ac5b..58bbbedb9 100644
+--- a/src/core/hle/kernel/thread.cpp
++++ b/src/core/hle/kernel/thread.cpp
+@@ -312,7 +312,16 @@ void ThreadManager::TerminateProcessThreads(std::shared_ptr<Process> process) {
+ }
+ 
+ void ThreadManager::ThreadWakeupCallback(u64 thread_id, s64 cycles_late) {
+-    std::shared_ptr<Thread> thread = SharedFrom(wakeup_callback_table.at(thread_id));
++    // A wakeup can still arrive for a thread that is gone: Stop() unschedules its event, but not
++    // one queued in thread-safe mode (HLE requests that finish on another host thread; those
++    // queues can't be searched). Seen 2026-10-16: a game's threads were terminated when it
++    // closed back to the HOME Menu, and a second later .at() threw and ended Tangelo.
++    const auto entry = wakeup_callback_table.find(thread_id);
++    if (entry == wakeup_callback_table.end()) {
++        LOG_DEBUG(Kernel, "Wakeup for thread {} that no longer exists, ignored", thread_id);
++        return;
++    }
++    std::shared_ptr<Thread> thread = SharedFrom(entry->second);
+     if (thread == nullptr) {
+         LOG_CRITICAL(Kernel, "Callback fired for invalid thread {:08X}", thread_id);
+         return;
+diff --git a/src/core/hle/kernel/timer.cpp b/src/core/hle/kernel/timer.cpp
+index ae87098b5..18d447fa1 100644
+--- a/src/core/hle/kernel/timer.cpp
++++ b/src/core/hle/kernel/timer.cpp
+@@ -114,7 +114,13 @@ SERIALIZE_IMPL(Timer)
+ 
+ /// The timer callback event, called when a timer is fired
+ void TimerManager::TimerCallback(u64 callback_id, s64 cycles_late) {
+-    std::shared_ptr<Timer> timer = SharedFrom(timer_callback_table.at(callback_id));
++    // Same as thread wakeups: a timer of a closed process can still fire once.
++    const auto entry = timer_callback_table.find(callback_id);
++    if (entry == timer_callback_table.end()) {
++        LOG_DEBUG(Kernel, "Timer {:016x} that no longer exists fired, ignored", callback_id);
++        return;
++    }
++    std::shared_ptr<Timer> timer = SharedFrom(entry->second);
+ 
+     if (timer == nullptr) {
+         LOG_CRITICAL(Kernel, "Callback fired for invalid timer {:016x}", callback_id);
+-- 
+2.43.0
+
