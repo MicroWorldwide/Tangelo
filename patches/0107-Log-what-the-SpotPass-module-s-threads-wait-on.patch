@@ -1,0 +1,108 @@
+From 9cd402a921d4beb6d2b7d05b5f3c5ae008944d97 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 18:30:45 +0200
+Subject: [PATCH] Log what the SpotPass module's threads wait on
+
+Started from the HOME Menu, Badge Arcade's foreground SpotPass task makes
+boss fetch the policy list and then go idle: no download, no more database
+writes. Each blocking wait of a boss thread (objects, timeout, pc/lr) is now
+logged under Service_BOSS so the stuck thread and what it waits for show up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/svc.cpp | 42 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index fe4afb0df..e34885bbc 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-106
++107
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 937700858..38980b96c 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -5,6 +5,8 @@
+ #include <algorithm>
+ #include <array>
+ #include <chrono>
++#include <map>
++#include <mutex>
+ #include <fmt/format.h>
+ #include "common/archives.h"
+ #include "common/logging/log.h"
+@@ -753,6 +755,41 @@ Result SVC::CloseHandle(Handle handle) {
+     return process->handle_table.Close(handle);
+ }
+ 
++/// What the real (LLE) SpotPass module's threads block on (boss only, Service_BOSS:Info). Used
++/// for the Badge Arcade hang when it is started from the HOME Menu: the module fetches the policy
++/// list and then goes idle without downloading. Each distinct wait (thread, objects, timeout) is
++/// logged the first 10 times, then every 200th.
++static void LogBossWait(Core::System& system, const Thread* thread,
++                        const std::vector<std::shared_ptr<WaitObject>>& objects, s64 nano_seconds,
++                        bool wait_all) {
++    auto& kernel = system.Kernel();
++    const auto process = kernel.GetCurrentProcess();
++    if (!thread || process->GetName() != "boss") {
++        return;
++    }
++    std::string what;
++    for (const auto& object : objects) {
++        what += fmt::format(" {}:{}#{}", object->GetTypeName(), object->GetName(),
++                            object->GetObjectId());
++    }
++    static std::mutex mutex;
++    static std::map<std::string, u64> counts;
++    const std::string key = fmt::format("{}|{}|{}", thread->thread_id, what, nano_seconds);
++    {
++        std::scoped_lock lock{mutex};
++        const u64 n = ++counts[key];
++        if (n > 10 && n % 200 != 0) {
++            return;
++        }
++    }
++    auto& core = system.GetRunningCore();
++    LOG_INFO(Service_BOSS, "boss thread {} waits ({}{}){} (pc 0x{:08X}, lr 0x{:08X})",
++             thread->thread_id, wait_all ? "all of" : "any of", what,
++             nano_seconds < 0 ? ", no timeout"
++                              : fmt::format(", timeout {} ms", nano_seconds / 1000000),
++             core.GetPC(), core.GetReg(14));
++}
++
+ /// Logs what a wait on an invalid handle was about: the waiting thread and, if the handle was
+ /// closed shortly before, who closed it and what it was.
+ static void LogInvalidWaitHandle(Core::System& system, Handle handle, VAddr handles_address,
+@@ -872,6 +909,7 @@ Result SVC::WaitSynchronization1(Handle handle, s64 nano_seconds) {
+ 
+     if (object->ShouldWait(thread)) {
+         R_UNLESS(nano_seconds != 0, ResultTimeout);
++        LogBossWait(system, thread, {object}, nano_seconds, false);
+ 
+         thread->wait_objects = {object};
+         object->AddWaitingThread(SharedFrom(thread));
+@@ -940,6 +978,8 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
+         // suspending the thread.
+         R_UNLESS(nano_seconds != 0, ResultTimeout);
+ 
++        LogBossWait(system, thread, objects, nano_seconds, true);
++
+         // Put the thread to sleep
+         thread->status = ThreadStatus::WaitSynchAll;
+ 
+@@ -982,6 +1022,8 @@ Result SVC::WaitSynchronizationN(s32* out, VAddr handles_address, s32 handle_cou
+         // suspending the thread.
+         R_UNLESS(nano_seconds != 0, ResultTimeout);
+ 
++        LogBossWait(system, thread, objects, nano_seconds, false);
++
+         // Put the thread to sleep
+         thread->status = ThreadStatus::WaitSynchAny;
+ 
+-- 
+2.43.0
+
