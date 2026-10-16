@@ -1,0 +1,512 @@
+From 66215c130f7aeb34517b8160585576760627e2a3 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 20:36:33 +0200
+Subject: [PATCH] Logging tab: choose what to log by topic
+
+Configure > General > Logging replaces the log fields of the Debug tab. One
+checkbox per topic (SpotPass and background tasks, StreetPass, internet and
+network, friends/accounts/online play, eShop and titles, HOME Menu/applets/
+sleep, save data and files, system calls, sound, graphics, controls) logs
+that topic's classes at Debug, so a tester can be asked to tick a box by
+name instead of typing log classes. A level for everything else, and under
+Advanced the log filter itself (written by the boxes, still editable;
+hand-written entries are kept), the regex filter, console output, flush on
+every message and Open Log Location.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                                  |   2 +-
+ src/citra_qt/CMakeLists.txt                   |   2 +
+ .../configuration/configure_debug.cpp         |  17 +-
+ .../configuration/configure_dialog.cpp        |  10 +-
+ src/citra_qt/configuration/configure_dialog.h |   2 +
+ .../configuration/configure_logging.cpp       | 252 ++++++++++++++++++
+ .../configuration/configure_logging.h         |  50 ++++
+ 7 files changed, 318 insertions(+), 17 deletions(-)
+ create mode 100644 src/citra_qt/configuration/configure_logging.cpp
+ create mode 100644 src/citra_qt/configuration/configure_logging.h
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 194b81caa..9b252fd09 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-112
++113
+diff --git a/src/citra_qt/CMakeLists.txt b/src/citra_qt/CMakeLists.txt
+index 7362506f1..668931523 100644
+--- a/src/citra_qt/CMakeLists.txt
++++ b/src/citra_qt/CMakeLists.txt
+@@ -43,6 +43,8 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
+     configuration/configure_debug.cpp
+     configuration/configure_debug.h
+     configuration/configure_debug.ui
++    configuration/configure_logging.cpp
++    configuration/configure_logging.h
+     configuration/configure_enhancements.cpp
+     configuration/configure_enhancements.h
+     configuration/configure_enhancements.ui
+diff --git a/src/citra_qt/configuration/configure_debug.cpp b/src/citra_qt/configuration/configure_debug.cpp
+index e5d8d9210..c4daa060f 100644
+--- a/src/citra_qt/configuration/configure_debug.cpp
++++ b/src/citra_qt/configuration/configure_debug.cpp
+@@ -32,6 +32,8 @@ static constexpr int SettingsToSlider(int value) {
+ ConfigureDebug::ConfigureDebug(bool is_powered_on_, QWidget* parent)
+     : QWidget(parent), ui(std::make_unique<Ui::ConfigureDebug>()), is_powered_on{is_powered_on_} {
+     ui->setupUi(this);
++    // The log settings moved to their own tab (Configure > General > Logging).
++    ui->groupBox_2->setVisible(false);
+     SetConfiguration();
+ 
+     connect(ui->toggle_gdbstub, &QCheckBox::clicked,
+@@ -121,11 +123,6 @@ void ConfigureDebug::SetConfiguration() {
+     }
+     ui->gdbport_spinbox->setEnabled(Settings::values.use_gdbstub.GetValue());
+     ui->gdbport_spinbox->setValue(Settings::values.gdbstub_port.GetValue());
+-    ui->toggle_console->setEnabled(!is_powered_on);
+-    ui->toggle_console->setChecked(UISettings::values.show_console.GetValue());
+-    ui->log_filter_edit->setText(QString::fromStdString(Settings::values.log_filter.GetValue()));
+-    ui->log_regex_filter_edit->setText(
+-        QString::fromStdString(Settings::values.log_regex_filter.GetValue()));
+     ui->toggle_cpu_jit->setChecked(Settings::values.use_cpu_jit.GetValue());
+     ui->delay_start_for_lle_modules->setChecked(
+         Settings::values.delay_start_for_lle_modules.GetValue());
+@@ -159,7 +156,6 @@ void ConfigureDebug::SetConfiguration() {
+         SettingsToSlider(Settings::values.cpu_clock_percentage.GetValue()));
+     ui->clock_display_label->setText(
+         QStringLiteral("%1%").arg(Settings::values.cpu_clock_percentage.GetValue()));
+-    ui->instant_debug_log->setChecked(Settings::values.instant_debug_log.GetValue());
+ 
+     if (Core::System::GetInstance().GetDebugNextProcessFlag()) {
+         ui->debug_next_process->setChecked(true);
+@@ -169,14 +165,6 @@ void ConfigureDebug::SetConfiguration() {
+ void ConfigureDebug::ApplyConfiguration() {
+     Settings::values.use_gdbstub = ui->toggle_gdbstub->isChecked();
+     Settings::values.gdbstub_port = static_cast<u16>(ui->gdbport_spinbox->value());
+-    UISettings::values.show_console = ui->toggle_console->isChecked();
+-    Settings::values.log_filter = ui->log_filter_edit->text().toStdString();
+-    Settings::values.log_regex_filter = ui->log_regex_filter_edit->text().toStdString();
+-    Debugger::ToggleConsole();
+-    Common::Log::Filter filter;
+-    filter.ParseFilterString(Settings::values.log_filter.GetValue());
+-    Common::Log::SetGlobalFilter(filter);
+-    Common::Log::SetRegexFilter(Settings::values.log_regex_filter.GetValue());
+     Settings::values.use_cpu_jit = ui->toggle_cpu_jit->isChecked();
+     Settings::values.delay_start_for_lle_modules = ui->delay_start_for_lle_modules->isChecked();
+     Settings::values.deterministic_async_operations =
+@@ -188,7 +176,6 @@ void ConfigureDebug::ApplyConfiguration() {
+     Settings::values.renderer_debug = ui->toggle_renderer_debug->isChecked();
+     Settings::values.pica_debugging = ui->toggle_pica_debugging->isChecked();
+     Settings::values.dump_command_buffers = ui->toggle_dump_command_buffers->isChecked();
+-    Settings::values.instant_debug_log = ui->instant_debug_log->isChecked();
+ 
+     ConfigurationShared::ApplyPerGameSetting(
+         &Settings::values.cpu_clock_percentage, ui->clock_speed_combo,
+diff --git a/src/citra_qt/configuration/configure_dialog.cpp b/src/citra_qt/configuration/configure_dialog.cpp
+index ecdb10a3f..e70ffdb87 100644
+--- a/src/citra_qt/configuration/configure_dialog.cpp
++++ b/src/citra_qt/configuration/configure_dialog.cpp
+@@ -15,6 +15,7 @@
+ #include "citra_qt/configuration/configure_hotkeys_controller.h"
+ #include "citra_qt/configuration/configure_input.h"
+ #include "citra_qt/configuration/configure_layout.h"
++#include "citra_qt/configuration/configure_logging.h"
+ #include "citra_qt/configuration/configure_network.h"
+ #include "citra_qt/configuration/configure_storage.h"
+ #include "citra_qt/configuration/configure_system.h"
+@@ -41,6 +42,7 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_, Cor
+       audio_tab{std::make_unique<ConfigureAudio>(is_powered_on, this)},
+       camera_tab{std::make_unique<ConfigureCamera>(this)},
+       debug_tab{std::make_unique<ConfigureDebug>(is_powered_on, this)},
++      logging_tab{std::make_unique<ConfigureLogging>(is_powered_on, this)},
+       storage_tab{std::make_unique<ConfigureStorage>(is_powered_on, this)},
+       web_tab{std::make_unique<ConfigureWeb>(this)}, ui_tab{std::make_unique<ConfigureUi>(this)} {
+     Settings::SetConfiguringGlobal(true);
+@@ -58,6 +60,7 @@ ConfigureDialog::ConfigureDialog(QWidget* parent, HotkeyRegistry& registry_, Cor
+     ui->tabWidget->addTab(audio_tab.get(), tr("Audio"));
+     ui->tabWidget->addTab(camera_tab.get(), tr("Camera"));
+     ui->tabWidget->addTab(debug_tab.get(), tr("Debug"));
++    ui->tabWidget->addTab(logging_tab.get(), tr("Logging"));
+     ui->tabWidget->addTab(storage_tab.get(), tr("Storage"));
+     ui->tabWidget->addTab(web_tab.get(), tr("Network"));
+     ui->tabWidget->addTab(ui_tab.get(), tr("UI"));
+@@ -96,6 +99,7 @@ void ConfigureDialog::SetConfiguration() {
+     audio_tab->SetConfiguration();
+     camera_tab->SetConfiguration();
+     debug_tab->SetConfiguration();
++    logging_tab->SetConfiguration();
+     web_tab->SetConfiguration();
+     ui_tab->SetConfiguration();
+     storage_tab->SetConfiguration();
+@@ -114,6 +118,7 @@ void ConfigureDialog::ApplyConfiguration() {
+     audio_tab->ApplyConfiguration();
+     camera_tab->ApplyConfiguration();
+     debug_tab->ApplyConfiguration();
++    logging_tab->ApplyConfiguration();
+     web_tab->ApplyConfiguration();
+     ui_tab->ApplyConfiguration();
+     storage_tab->ApplyConfiguration();
+@@ -127,7 +132,8 @@ void ConfigureDialog::PopulateSelectionList() {
+     ui->selectorList->clear();
+ 
+     const std::array<std::pair<QString, QList<QWidget*>>, 5> items{
+-        {{tr("General"), {general_tab.get(), web_tab.get(), debug_tab.get(), ui_tab.get()}},
++        {{tr("General"), {general_tab.get(), web_tab.get(), debug_tab.get(), logging_tab.get(),
++                           ui_tab.get()}},
+          {tr("System"), {system_tab.get(), camera_tab.get(), storage_tab.get()}},
+          {tr("Graphics"), {enhancements_tab.get(), layout_tab.get(), graphics_tab.get()}},
+          {tr("Audio"), {audio_tab.get()}},
+@@ -169,6 +175,7 @@ void ConfigureDialog::RetranslateUI() {
+     audio_tab->RetranslateUI();
+     camera_tab->RetranslateUI();
+     debug_tab->RetranslateUI();
++    logging_tab->RetranslateUI();
+     web_tab->RetranslateUI();
+     ui_tab->RetranslateUI();
+     storage_tab->RetranslateUI();
+@@ -191,6 +198,7 @@ void ConfigureDialog::UpdateVisibleTabs() {
+         {audio_tab.get(), tr("Audio")},
+         {camera_tab.get(), tr("Camera")},
+         {debug_tab.get(), tr("Debug")},
++        {logging_tab.get(), tr("Logging")},
+         {storage_tab.get(), tr("Storage")},
+         {web_tab.get(), tr("Network")},
+         {ui_tab.get(), tr("UI")}};
+diff --git a/src/citra_qt/configuration/configure_dialog.h b/src/citra_qt/configuration/configure_dialog.h
+index 141233561..193691fb5 100644
+--- a/src/citra_qt/configuration/configure_dialog.h
++++ b/src/citra_qt/configuration/configure_dialog.h
+@@ -30,6 +30,7 @@ class ConfigureEnhancements;
+ class ConfigureAudio;
+ class ConfigureCamera;
+ class ConfigureDebug;
++class ConfigureLogging;
+ class ConfigureStorage;
+ class ConfigureWeb;
+ class ConfigureUi;
+@@ -73,6 +74,7 @@ private:
+     std::unique_ptr<ConfigureAudio> audio_tab;
+     std::unique_ptr<ConfigureCamera> camera_tab;
+     std::unique_ptr<ConfigureDebug> debug_tab;
++    std::unique_ptr<ConfigureLogging> logging_tab;
+     std::unique_ptr<ConfigureStorage> storage_tab;
+     std::unique_ptr<ConfigureWeb> web_tab;
+     std::unique_ptr<ConfigureUi> ui_tab;
+diff --git a/src/citra_qt/configuration/configure_logging.cpp b/src/citra_qt/configuration/configure_logging.cpp
+new file mode 100644
+index 000000000..39f69a72b
+--- /dev/null
++++ b/src/citra_qt/configuration/configure_logging.cpp
+@@ -0,0 +1,252 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the misc/licenses/gplv2.txt file included.
++
++#include <array>
++#include <map>
++#include <QCheckBox>
++#include <QComboBox>
++#include <QDesktopServices>
++#include <QGridLayout>
++#include <QGroupBox>
++#include <QHBoxLayout>
++#include <QLabel>
++#include <QLineEdit>
++#include <QPushButton>
++#include <QScrollArea>
++#include <QUrl>
++#include <QVBoxLayout>
++#include "citra_qt/configuration/configure_logging.h"
++#include "citra_qt/debugger/console.h"
++#include "citra_qt/uisettings.h"
++#include "common/file_util.h"
++#include "common/logging/backend.h"
++#include "common/logging/filter.h"
++#include "common/settings.h"
++
++namespace {
++
++// Levels as the log filter writes them, from most to least detail.
++constexpr std::array<const char*, 6> Levels{"Trace", "Debug", "Info", "Warning", "Error",
++                                            "Critical"};
++
++int LevelRank(const QString& level) {
++    for (std::size_t i = 0; i < Levels.size(); ++i) {
++        if (level.compare(QString::fromLatin1(Levels[i]), Qt::CaseInsensitive) == 0) {
++            return static_cast<int>(i);
++        }
++    }
++    return -1;
++}
++
++} // namespace
++
++ConfigureLogging::ConfigureLogging(bool is_powered_on_, QWidget* parent)
++    : QWidget(parent), is_powered_on{is_powered_on_} {
++    BuildUI();
++    SetConfiguration();
++}
++
++ConfigureLogging::~ConfigureLogging() = default;
++
++void ConfigureLogging::BuildUI() {
++    // Each topic logs its classes at Debug level. Names say what the player would be testing,
++    // so a box can be asked for by name ("tick SpotPass and StreetPass").
++    topics = {
++        {tr("SpotPass and background tasks"),
++         tr("Downloads in the background and by games, NDM pausing and resuming them, news."),
++         {QStringLiteral("Service.BOSS"), QStringLiteral("Service.NDM"),
++          QStringLiteral("Service.NEWS")}},
++        {tr("StreetPass"), tr("StreetPass boxes and exchanges (cecd), NetPass."),
++         {QStringLiteral("Service.CECD")}},
++        {tr("Internet and network"),
++         tr("Web requests (with the custom server redirect), connection state, sockets."),
++         {QStringLiteral("Service.HTTP"), QStringLiteral("Service.AC"),
++          QStringLiteral("Service.SOC"), QStringLiteral("Network"),
++          QStringLiteral("WebService")}},
++        {tr("Friends, accounts and online play"),
++         tr("Friend list, Nintendo Network ID, game server logins, local wireless."),
++         {QStringLiteral("Service.FRD"), QStringLiteral("Service.ACT"),
++          QStringLiteral("Service.NWM"), QStringLiteral("Service.DLP")}},
++        {tr("eShop, installed titles and updates"),
++         tr("Title list, installing, update checks, the eShop."),
++         {QStringLiteral("Service.AM"), QStringLiteral("Service.NIM"),
++          QStringLiteral("Service.NS")}},
++        {tr("HOME Menu, applets and sleep"),
++         tr("Starting and closing software, applets (keyboard, error screens), lid and sleep."),
++         {QStringLiteral("Service.APT"), QStringLiteral("Applet"), QStringLiteral("Service.PTM")}},
++        {tr("Save data and files"), tr("Save data, extdata, SD card, loading games."),
++         {QStringLiteral("Service.FS"), QStringLiteral("Loader")}},
++        {tr("System calls (crashes and hangs)"),
++         tr("Kernel, threads, calls between system modules. Very much text."),
++         {QStringLiteral("Kernel"), QStringLiteral("Kernel.SVC"), QStringLiteral("Service.SRV"),
++          QStringLiteral("Service.ERR")}},
++        {tr("Sound"), tr("Audio output and the DSP."),
++         {QStringLiteral("Audio"), QStringLiteral("Audio.DSP"), QStringLiteral("Service.DSP"),
++          QStringLiteral("Service.CSND")}},
++        {tr("Graphics"), tr("Renderer and GPU."),
++         {QStringLiteral("Render"), QStringLiteral("HW.GPU"), QStringLiteral("Service.GSP")}},
++        {tr("Controls, camera and microphone"), tr("Buttons, touch, motion, camera, microphone."),
++         {QStringLiteral("Input"), QStringLiteral("Service.HID"), QStringLiteral("Service.IR"),
++          QStringLiteral("Service.CAM"), QStringLiteral("Service.MIC")}},
++    };
++
++    auto* outer = new QVBoxLayout(this);
++    auto* scroll = new QScrollArea(this);
++    scroll->setWidgetResizable(true);
++    scroll->setFrameShape(QFrame::NoFrame);
++    auto* page = new QWidget(scroll);
++    auto* layout = new QVBoxLayout(page);
++
++    auto* level_row = new QHBoxLayout();
++    level_row->addWidget(new QLabel(tr("Everything else:"), page));
++    level_combo = new QComboBox(page);
++    level_combo->addItem(tr("Normal (Info)"), QStringLiteral("Info"));
++    level_combo->addItem(tr("Only problems (Warning)"), QStringLiteral("Warning"));
++    level_combo->addItem(tr("Only errors (Error)"), QStringLiteral("Error"));
++    level_combo->addItem(tr("Everything in detail (Debug)"), QStringLiteral("Debug"));
++    level_row->addWidget(level_combo);
++    level_row->addStretch();
++    layout->addLayout(level_row);
++
++    auto* topic_group = new QGroupBox(tr("Log in detail"), page);
++    auto* topic_layout = new QGridLayout(topic_group);
++    int row = 0;
++    for (auto& topic : topics) {
++        topic.box = new QCheckBox(topic.name, topic_group);
++        topic.box->setToolTip(topic.classes.join(QLatin1Char(' ')));
++        auto* label = new QLabel(topic.description, topic_group);
++        label->setWordWrap(true);
++        label->setEnabled(false); // greyed, as a hint
++        topic_layout->addWidget(topic.box, row, 0);
++        topic_layout->addWidget(label, row, 1);
++        connect(topic.box, &QCheckBox::toggled, this, [this] { FilterFromTopics(); });
++        ++row;
++    }
++    topic_layout->setColumnStretch(1, 1);
++    layout->addWidget(topic_group);
++
++    auto* advanced = new QGroupBox(tr("Advanced"), page);
++    auto* adv_layout = new QGridLayout(advanced);
++    adv_layout->addWidget(new QLabel(tr("Log filter:"), advanced), 0, 0);
++    filter_edit = new QLineEdit(advanced);
++    filter_edit->setToolTip(tr("Written by the choices above; can be edited by hand "
++                               "(e.g. Service.BOSS:Debug). Entries that are not part of a topic "
++                               "are kept."));
++    adv_layout->addWidget(filter_edit, 0, 1);
++    adv_layout->addWidget(new QLabel(tr("Regex filter:"), advanced), 1, 0);
++    regex_edit = new QLineEdit(advanced);
++    adv_layout->addWidget(regex_edit, 1, 1);
++    console_box = new QCheckBox(tr("Show log output in console"), advanced);
++    console_box->setEnabled(!is_powered_on);
++    adv_layout->addWidget(console_box, 2, 0, 1, 2);
++    flush_box = new QCheckBox(tr("Flush log output on every message"), advanced);
++    flush_box->setToolTip(tr("Every line reaches the log file at once, so nothing is lost when "
++                             "Tangelo crashes. Slower."));
++    adv_layout->addWidget(flush_box, 3, 0, 1, 2);
++    auto* open_button = new QPushButton(tr("Open Log Location"), advanced);
++    connect(open_button, &QPushButton::clicked, [] {
++        const QString path =
++            QString::fromStdString(FileUtil::GetUserPath(FileUtil::UserPath::LogDir));
++        QDesktopServices::openUrl(QUrl::fromLocalFile(path));
++    });
++    adv_layout->addWidget(open_button, 4, 0, 1, 2);
++    adv_layout->setColumnStretch(1, 1);
++    layout->addWidget(advanced);
++    layout->addStretch();
++
++    scroll->setWidget(page);
++    outer->addWidget(scroll);
++
++    connect(level_combo, &QComboBox::currentIndexChanged, this, [this] { FilterFromTopics(); });
++    connect(filter_edit, &QLineEdit::editingFinished, this, [this] { TopicsFromFilter(); });
++}
++
++/// Topics and base level → filter text. Entries the user added by hand that belong to no
++/// topic are kept after the base level.
++void ConfigureLogging::FilterFromTopics() {
++    if (updating) {
++        return;
++    }
++    QStringList owned;
++    for (const auto& topic : topics) {
++        owned += topic.classes;
++    }
++    QStringList extras;
++    for (const auto& entry : filter_edit->text().split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
++        const QString name = entry.section(QLatin1Char(':'), 0, 0);
++        if (name != QStringLiteral("*") && !owned.contains(name)) {
++            extras << entry;
++        }
++    }
++    QStringList parts{QStringLiteral("*:") + level_combo->currentData().toString()};
++    parts += extras;
++    for (const auto& topic : topics) {
++        if (topic.box->isChecked()) {
++            for (const auto& name : topic.classes) {
++                parts << name + QStringLiteral(":Debug");
++            }
++        }
++    }
++    updating = true;
++    filter_edit->setText(parts.join(QLatin1Char(' ')));
++    updating = false;
++}
++
++/// Filter text → base level and topics: a topic is ticked when one of its classes logs at Debug
++/// (or Trace), e.g. an older hand-written filter; ticked, it logs all of them.
++void ConfigureLogging::TopicsFromFilter() {
++    if (updating) {
++        return;
++    }
++    QString base = QStringLiteral("Info");
++    std::map<QString, QString> levels;
++    for (const auto& entry : filter_edit->text().split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
++        const QString name = entry.section(QLatin1Char(':'), 0, 0);
++        const QString level = entry.section(QLatin1Char(':'), 1, 1);
++        if (name == QStringLiteral("*")) {
++            base = level;
++        } else {
++            levels[name] = level;
++        }
++    }
++    updating = true;
++    const int base_index = level_combo->findData(base, Qt::UserRole, Qt::MatchFixedString);
++    level_combo->setCurrentIndex(base_index >= 0 ? base_index : 0);
++    for (auto& topic : topics) {
++        bool any = false;
++        for (const auto& name : topic.classes) {
++            const auto it = levels.find(name);
++            any = any || (it != levels.end() && LevelRank(it->second) >= 0 &&
++                          LevelRank(it->second) <= LevelRank(QStringLiteral("Debug")));
++        }
++        topic.box->setChecked(any);
++    }
++    updating = false;
++}
++
++void ConfigureLogging::SetConfiguration() {
++    updating = true;
++    filter_edit->setText(QString::fromStdString(Settings::values.log_filter.GetValue()));
++    regex_edit->setText(QString::fromStdString(Settings::values.log_regex_filter.GetValue()));
++    console_box->setChecked(UISettings::values.show_console.GetValue());
++    flush_box->setChecked(Settings::values.instant_debug_log.GetValue());
++    updating = false;
++    TopicsFromFilter();
++}
++
++void ConfigureLogging::ApplyConfiguration() {
++    Settings::values.log_filter = filter_edit->text().toStdString();
++    Settings::values.log_regex_filter = regex_edit->text().toStdString();
++    UISettings::values.show_console = console_box->isChecked();
++    Settings::values.instant_debug_log = flush_box->isChecked();
++    Debugger::ToggleConsole();
++    Common::Log::Filter filter;
++    filter.ParseFilterString(Settings::values.log_filter.GetValue());
++    Common::Log::SetGlobalFilter(filter);
++    Common::Log::SetRegexFilter(Settings::values.log_regex_filter.GetValue());
++}
++
++void ConfigureLogging::RetranslateUI() {
++    // Built in code with tr(); texts follow the language at the next opening of the dialog.
++}
+diff --git a/src/citra_qt/configuration/configure_logging.h b/src/citra_qt/configuration/configure_logging.h
+new file mode 100644
+index 000000000..bcb36acff
+--- /dev/null
++++ b/src/citra_qt/configuration/configure_logging.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the misc/licenses/gplv2.txt file included.
++
++#pragma once
++
++#include <vector>
++#include <QString>
++#include <QStringList>
++#include <QWidget>
++
++class QCheckBox;
++class QComboBox;
++class QLineEdit;
++
++/// Configure > General > Logging: what goes into the log, by topic (SpotPass, StreetPass,
++/// internet, ...) instead of typing log classes. The topics write the same log filter the
++/// Debug tab used to edit; the filter itself stays editable under "Advanced".
++class ConfigureLogging : public QWidget {
++    Q_OBJECT
++
++public:
++    explicit ConfigureLogging(bool is_powered_on, QWidget* parent = nullptr);
++    ~ConfigureLogging() override;
++
++    void ApplyConfiguration();
++    void SetConfiguration();
++    void RetranslateUI();
++
++private:
++    struct Topic {
++        QString name;
++        QString description;
++        QStringList classes;
++        QCheckBox* box = nullptr;
++    };
++
++    void BuildUI();
++    void FilterFromTopics();
++    void TopicsFromFilter();
++
++    bool is_powered_on;
++    bool updating = false;
++    std::vector<Topic> topics;
++    QComboBox* level_combo = nullptr;
++    QLineEdit* filter_edit = nullptr;
++    QLineEdit* regex_edit = nullptr;
++    QCheckBox* console_box = nullptr;
++    QCheckBox* flush_box = nullptr;
++};
+-- 
+2.43.0
+

@@ -1,0 +1,59 @@
+From 16bc4ffd5c2769bacd9fbf0eee3149f52c171e01 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 20:22:07 +0200
+Subject: [PATCH] Keep SpotPass and StreetPass running while a game runs (test)
+
+Games ask NDM to pause the background daemons when they start; on a console
+the HOME Menu and sleep mode let them run again, so SpotPass and StreetPass
+still happen. Started from Tangelo's game list there is neither, and the
+background tasks never ran (2026-10-16: tasks waiting since 2026-10-06 only
+ran once the HOME Menu was used). An application's SuspendDaemons and
+ResumeDaemons now leave the StreetPass (cecd) and SpotPass (boss) bits out;
+nim is still paused. Logged under Service_BOSS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/ipc.cpp | 18 ++++++++++++++++++
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index bc6298e80..58c9bdf9d 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-110
++111
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 1bb253b71..fe4db4788 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -120,6 +120,24 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+         LogFailedReply(src_process->GetName(), dst_process->GetName(), header.raw, cmd_buf[1]);
+     }
+ 
++    // Background SpotPass and StreetPass while a game runs (test, 2026-10-16). Games ask NDM to
++    // pause the background daemons when they start (ndm:u SuspendDaemons, mask bit 0 = StreetPass
++    // (cecd), bit 1 = SpotPass (boss), bit 2 = nim); on a console the HOME Menu and sleep mode
++    // let them run again. Started from the game list there's neither, so SpotPass and StreetPass
++    // never run in the background. A game's request keeps pausing nim only; its matching
++    // ResumeDaemons (0x0007) is cut down the same way so NDM's pause counts stay balanced.
++    if (!reply && dst_process->GetName() == "ndm" &&
++        (header.raw == 0x00060040 || header.raw == 0x00070040) &&
++        src_process->codeset && (src_process->codeset->program_id >> 32) == 0x00040000 &&
++        (cmd_buf[1] & 0x3) != 0) {
++        LOG_INFO(Service_BOSS,
++                 "{} asks NDM to {} background daemons 0x{:X}: leaving SpotPass and "
++                 "StreetPass running (0x{:X})",
++                 src_process->GetName(), header.raw == 0x00060040 ? "pause" : "resume",
++                 cmd_buf[1], cmd_buf[1] & ~0x3u);
++        cmd_buf[1] &= ~0x3u;
++    }
++
+     const auto logged = [](const std::string& name) { return name == "boss" || name == "ndm"; };
+     if (logged(src_process->GetName()) || logged(dst_process->GetName())) {
+         LogBossCall(memory, *src_process, *dst_process, cmd_buf, untranslated_size, command_size,
+-- 
+2.43.0
+
