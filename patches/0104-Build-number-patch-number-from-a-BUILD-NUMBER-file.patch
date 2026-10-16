@@ -1,0 +1,103 @@
+From b283aa94735b39a86998535b11eefa57fe417b73 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 12:34:18 +0200
+Subject: [PATCH] Build number = patch number, from a BUILD-NUMBER file
+
+Patch 0103 counted commits, but that depends on how the patches were
+applied: a local checkout built from 0103 showed "Build 66" instead of 105. 
+The build number is now the number of the last Tangelo patch,
+kept in BUILD-NUMBER at the top of the repository; every patch sets it
+to its own number (this one: 104). It no longer needs the git history,
+so CI doesn't need the whole history or a patch count.
+TANGELO_BUILD_NUMBER (environment) still overrides it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                         |  1 +
+ CMakeModules/GenerateBuildInfo.cmake | 27 ++++++---------------------
+ src/android/app/build.gradle.kts     | 12 +++++-------
+ 3 files changed, 12 insertions(+), 28 deletions(-)
+ create mode 100644 BUILD-NUMBER
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+new file mode 100644
+index 000000000..b16e5f75e
+--- /dev/null
++++ b/BUILD-NUMBER
+@@ -0,0 +1 @@
++104
+diff --git a/CMakeModules/GenerateBuildInfo.cmake b/CMakeModules/GenerateBuildInfo.cmake
+index 1e8ef4e81..5290ac6f3 100644
+--- a/CMakeModules/GenerateBuildInfo.cmake
++++ b/CMakeModules/GenerateBuildInfo.cmake
+@@ -32,34 +32,19 @@ macro(generate_build_info)
+     endif()
+     string(SUBSTRING "${GIT_REV}" 0 7 GIT_SHORT_REV)
+ 
+-    # Tangelo's build number: the commits from Tangelo's first commit (2ff2af5) up to this one,
+-    # so every patch on top makes the next build (patches 0001-0102 = build 104). A clone that
+-    # doesn't reach back to that commit (CI checkouts without fetch-depth: 0) can't count;
+-    # TANGELO_BUILD_NUMBER (environment) or a BUILD-NUMBER file next to GIT-COMMIT gives the
+-    # number instead, otherwise it shows "?".
+-    set(TANGELO_ROOT_COMMIT "2ff2af57139673621a047ed9baa4c591e0694b47")
++    # Tangelo's build number: the number of the last Tangelo patch in this source, kept in the
++    # BUILD-NUMBER file at the top of the repository (every patch sets it to its own number). It
++    # doesn't depend on how the patches were applied (git am, git apply, CI). TANGELO_BUILD_NUMBER
++    # (environment) overrides it; without either it shows "?".
+     set(BUILD_NUMBER "?")
+     if (DEFINED ENV{TANGELO_BUILD_NUMBER} AND NOT "$ENV{TANGELO_BUILD_NUMBER}" STREQUAL "")
+         set(BUILD_NUMBER "$ENV{TANGELO_BUILD_NUMBER}")
+     elseif (EXISTS "${CMAKE_SOURCE_DIR}/BUILD-NUMBER")
+         file(READ "${CMAKE_SOURCE_DIR}/BUILD-NUMBER" BUILD_NUMBER_RAW LIMIT 16)
+         string(STRIP "${BUILD_NUMBER_RAW}" BUILD_NUMBER)
+-    elseif (GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+-        execute_process(COMMAND "${GIT_EXECUTABLE}" merge-base --is-ancestor
+-                                "${TANGELO_ROOT_COMMIT}" HEAD
+-                        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+-                        RESULT_VARIABLE GIT_ROOT_RESULT OUTPUT_QUIET ERROR_QUIET)
+-        if (GIT_ROOT_RESULT EQUAL 0)
+-            execute_process(COMMAND "${GIT_EXECUTABLE}" rev-list --count
+-                                    "${TANGELO_ROOT_COMMIT}..HEAD"
+-                            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+-                            OUTPUT_VARIABLE GIT_COMMIT_COUNT OUTPUT_STRIP_TRAILING_WHITESPACE
+-                            RESULT_VARIABLE GIT_COUNT_RESULT ERROR_QUIET)
+-            if (GIT_COUNT_RESULT EQUAL 0 AND GIT_COMMIT_COUNT MATCHES "^[0-9]+$")
+-                math(EXPR BUILD_NUMBER "${GIT_COMMIT_COUNT} + 1")
+-            endif()
+-        endif()
+     endif()
++    # Rebuild the version strings when the number changes.
++    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/BUILD-NUMBER")
+     # What Tangelo shows: "Build 104 - b8117d1" (window title, About, log, game reports).
+     set(BUILD_DISPLAY "Build ${BUILD_NUMBER} - ${GIT_SHORT_REV}")
+ 
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 05296d870..9f9d9a3b6 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -272,16 +272,14 @@ fun getGitVersion(): String {
+ }
+ 
+ /**
+- * Tangelo's build number: the commits from Tangelo's first commit (2ff2af5) up to this one, the
+- * same as the native side (CMakeModules/GenerateBuildInfo.cmake). TANGELO_BUILD_NUMBER overrides
+- * it; a clone that doesn't reach back to that commit (CI without fetch-depth: 0) gives "?".
++ * Tangelo's build number: the number of the last Tangelo patch, in the BUILD-NUMBER file at the
++ * top of the repository (the same as the native side, CMakeModules/GenerateBuildInfo.cmake).
++ * TANGELO_BUILD_NUMBER overrides it; without either it is "?".
+  */
+ fun getBuildNumber(): String {
+     System.getenv("TANGELO_BUILD_NUMBER")?.takeIf { it.isNotBlank() }?.let { return it.trim() }
+-    val root = "2ff2af57139673621a047ed9baa4c591e0694b47"
+-    val count = runGitCommand(ProcessBuilder("git", "rev-list", "--count", "$root..HEAD"))
+-        ?.toIntOrNull() ?: return "?"
+-    return (count + 1).toString()
++    val file = project.rootDir.resolve("../../BUILD-NUMBER")
++    return if (file.exists()) file.readText().trim().ifEmpty { "?" } else "?"
+ }
+ 
+ fun getGitHash(): String =
+-- 
+2.43.0
+
