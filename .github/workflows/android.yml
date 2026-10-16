@@ -36,6 +36,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          # The whole history, so the build number (commits since Tangelo's first commit) can
+          # be counted.
+          fetch-depth: 0
 
       - name: Apply patches from patches/
         run: |
@@ -49,6 +52,11 @@ jobs:
             echo "Applying $p"
             git apply --whitespace=nowarn "$p"
           done
+          # Build number = commits since Tangelo's first commit + the patches applied here
+          # (each patch would be one commit), e.g. "Tangelo - Build 105 - <commit>".
+          commits=$(git rev-list --count 2ff2af57139673621a047ed9baa4c591e0694b47..HEAD)
+          echo "TANGELO_BUILD_NUMBER=$((commits + 1 + ${#patches[@]}))" >> "$GITHUB_ENV"
+          echo "Build number: $((commits + 1 + ${#patches[@]}))"
 
       - name: Check the Android default settings
         # The app stops at start when a setting key has no declaration in jni/default_ini.h.
