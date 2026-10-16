@@ -1,0 +1,236 @@
+From 8ce0158a7290ab3c78b57a5a79264887fc310ed6 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 12:01:39 +0200
+Subject: [PATCH] Tangelo build numbers: "Tangelo - Build 105 - <commit>"
+
+Tangelo now shows "Build <number> - <short commit>" as its version, so
+it is easy to see which build a player runs: in the window title
+("Tangelo - Build 105 - 1a2b3c4 | <game>"), the About dialog, --version,
+the log's "Tangelo Version" line, Android's About page (versionName) and
+the game report sent to the custom server ("tangelo" field), which the
+server shows in its log and on its Consoles page.
+
+The number counts the commits from Tangelo's first commit (2ff2af5) up
+to this one, so every patch on top makes the next build (this patch
+makes build 105). A clone that doesn't reach back to that commit
+(GitHub Actions checks out one commit by default) shows "?" unless
+TANGELO_BUILD_NUMBER is set or a BUILD-NUMBER file sits next to
+GIT-COMMIT; the CI workflows fetch the whole history and add the
+number of patches they apply.
+
+g_build_fullname is unchanged (update check, shader cache and save
+states still use it); the new strings are g_build_number and
+g_build_display.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ CMakeModules/GenerateBuildInfo.cmake    | 31 +++++++++++++++++++++++++
+ src/android/app/build.gradle.kts        | 16 ++++++++++++-
+ src/android/app/src/main/jni/native.cpp |  2 +-
+ src/citra_qt/aboutdialog.cpp            |  2 +-
+ src/citra_qt/citra_qt.cpp               | 16 ++++++-------
+ src/common/scm_rev.cpp.in               |  4 ++++
+ src/common/scm_rev.h                    |  4 ++++
+ src/core/tangelo_report.cpp             |  2 +-
+ 8 files changed, 65 insertions(+), 12 deletions(-)
+
+diff --git a/CMakeModules/GenerateBuildInfo.cmake b/CMakeModules/GenerateBuildInfo.cmake
+index cfc1c284c..1e8ef4e81 100644
+--- a/CMakeModules/GenerateBuildInfo.cmake
++++ b/CMakeModules/GenerateBuildInfo.cmake
+@@ -32,6 +32,37 @@ macro(generate_build_info)
+     endif()
+     string(SUBSTRING "${GIT_REV}" 0 7 GIT_SHORT_REV)
+ 
++    # Tangelo's build number: the commits from Tangelo's first commit (2ff2af5) up to this one,
++    # so every patch on top makes the next build (patches 0001-0102 = build 104). A clone that
++    # doesn't reach back to that commit (CI checkouts without fetch-depth: 0) can't count;
++    # TANGELO_BUILD_NUMBER (environment) or a BUILD-NUMBER file next to GIT-COMMIT gives the
++    # number instead, otherwise it shows "?".
++    set(TANGELO_ROOT_COMMIT "2ff2af57139673621a047ed9baa4c591e0694b47")
++    set(BUILD_NUMBER "?")
++    if (DEFINED ENV{TANGELO_BUILD_NUMBER} AND NOT "$ENV{TANGELO_BUILD_NUMBER}" STREQUAL "")
++        set(BUILD_NUMBER "$ENV{TANGELO_BUILD_NUMBER}")
++    elseif (EXISTS "${CMAKE_SOURCE_DIR}/BUILD-NUMBER")
++        file(READ "${CMAKE_SOURCE_DIR}/BUILD-NUMBER" BUILD_NUMBER_RAW LIMIT 16)
++        string(STRIP "${BUILD_NUMBER_RAW}" BUILD_NUMBER)
++    elseif (GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
++        execute_process(COMMAND "${GIT_EXECUTABLE}" merge-base --is-ancestor
++                                "${TANGELO_ROOT_COMMIT}" HEAD
++                        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
++                        RESULT_VARIABLE GIT_ROOT_RESULT OUTPUT_QUIET ERROR_QUIET)
++        if (GIT_ROOT_RESULT EQUAL 0)
++            execute_process(COMMAND "${GIT_EXECUTABLE}" rev-list --count
++                                    "${TANGELO_ROOT_COMMIT}..HEAD"
++                            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
++                            OUTPUT_VARIABLE GIT_COMMIT_COUNT OUTPUT_STRIP_TRAILING_WHITESPACE
++                            RESULT_VARIABLE GIT_COUNT_RESULT ERROR_QUIET)
++            if (GIT_COUNT_RESULT EQUAL 0 AND GIT_COMMIT_COUNT MATCHES "^[0-9]+$")
++                math(EXPR BUILD_NUMBER "${GIT_COMMIT_COUNT} + 1")
++            endif()
++        endif()
++    endif()
++    # What Tangelo shows: "Build 104 - b8117d1" (window title, About, log, game reports).
++    set(BUILD_DISPLAY "Build ${BUILD_NUMBER} - ${GIT_SHORT_REV}")
++
+     # Set build version
+     set(REPO_NAME "")
+     set(BUILD_VERSION "0")
+diff --git a/src/android/app/build.gradle.kts b/src/android/app/build.gradle.kts
+index 7473e6528..05296d870 100644
+--- a/src/android/app/build.gradle.kts
++++ b/src/android/app/build.gradle.kts
+@@ -68,7 +68,8 @@ android {
+         minSdk = 28
+         targetSdk = 35
+         versionCode = autoVersion
+-        versionName = getGitVersion()
++        // What Tangelo shows (About, toast): "Build <number> - <commit>", like the desktop title.
++        versionName = "Build ${getBuildNumber()} - ${getGitHash()}"
+ 
+         ndk {
+             //noinspection ChromeOsAbiSupport
+@@ -270,6 +271,19 @@ fun getGitVersion(): String {
+     return versionName
+ }
+ 
++/**
++ * Tangelo's build number: the commits from Tangelo's first commit (2ff2af5) up to this one, the
++ * same as the native side (CMakeModules/GenerateBuildInfo.cmake). TANGELO_BUILD_NUMBER overrides
++ * it; a clone that doesn't reach back to that commit (CI without fetch-depth: 0) gives "?".
++ */
++fun getBuildNumber(): String {
++    System.getenv("TANGELO_BUILD_NUMBER")?.takeIf { it.isNotBlank() }?.let { return it.trim() }
++    val root = "2ff2af57139673621a047ed9baa4c591e0694b47"
++    val count = runGitCommand(ProcessBuilder("git", "rev-list", "--count", "$root..HEAD"))
++        ?.toIntOrNull() ?: return "?"
++    return (count + 1).toString()
++}
++
+ fun getGitHash(): String =
+     runGitCommand(ProcessBuilder("git", "rev-parse", "--short", "HEAD")) ?: "dummy-hash"
+ 
+diff --git a/src/android/app/src/main/jni/native.cpp b/src/android/app/src/main/jni/native.cpp
+index d2043c603..e5384ba36 100644
+--- a/src/android/app/src/main/jni/native.cpp
++++ b/src/android/app/src/main/jni/native.cpp
+@@ -1307,7 +1307,7 @@ void Java_io_github_microworldwide_tangelo_NativeLibrary_loadState([[maybe_unuse
+ 
+ void Java_io_github_microworldwide_tangelo_NativeLibrary_logDeviceInfo([[maybe_unused]] JNIEnv* env,
+                                                            [[maybe_unused]] jobject obj) {
+-    LOG_INFO(Frontend, "Tangelo Version: {} | {}-{}", Common::g_build_fullname, Common::g_scm_branch,
++    LOG_INFO(Frontend, "Tangelo Version: {} | {}-{}", Common::g_build_display, Common::g_scm_branch,
+              Common::g_scm_desc);
+     LOG_INFO(Frontend, "Host CPU: {}", Common::GetCPUCaps().cpu_string);
+     // There is no decent way to get the OS version, so we log the API level instead.
+diff --git a/src/citra_qt/aboutdialog.cpp b/src/citra_qt/aboutdialog.cpp
+index d1f3565ce..a40717bbb 100644
+--- a/src/citra_qt/aboutdialog.cpp
++++ b/src/citra_qt/aboutdialog.cpp
+@@ -12,7 +12,7 @@ AboutDialog::AboutDialog(QWidget* parent)
+       ui(std::make_unique<Ui::AboutDialog>()) {
+     ui->setupUi(this);
+     ui->labelBuildInfo->setText(ui->labelBuildInfo->text().arg(
+-        QString::fromUtf8(Common::g_build_fullname), QString::fromUtf8(Common::g_scm_branch),
++        QString::fromUtf8(Common::g_build_display), QString::fromUtf8(Common::g_scm_branch),
+         QString::fromUtf8(Common::g_scm_desc), QString::fromUtf8(Common::g_build_date).left(10),
+         QString::fromUtf8(Common::g_build_variant)));
+ }
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index 546806746..f9e6272ca 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -1487,7 +1487,7 @@ GMainWindow::GMainWindow(Core::System& system_)
+         }
+ 
+         if (args[i] == QStringLiteral("--version") || args[i] == QStringLiteral("-v")) {
+-            const std::string version_string = std::string("Tangelo ") + Common::g_build_fullname;
++            const std::string version_string = std::string("Tangelo - ") + Common::g_build_display;
+             ShowCommandOutput("Version", version_string);
+             exit(0);
+         }
+@@ -1568,7 +1568,7 @@ GMainWindow::GMainWindow(Core::System& system_)
+     ConnectMenuEvents();
+     ConnectWidgetEvents();
+ 
+-    LOG_INFO(Frontend, "Tangelo Version: {} | {}-{}", Common::g_build_fullname, Common::g_scm_branch,
++    LOG_INFO(Frontend, "Tangelo Version: {} | {}-{}", Common::g_build_display, Common::g_scm_branch,
+              Common::g_scm_desc);
+     std::string build_variant = Common::g_build_variant;
+     if (build_variant == "") {
+@@ -5868,15 +5868,15 @@ void GMainWindow::OnSwitchDiskResources(VideoCore::LoadCallbackStage stage, std:
+ }
+ 
+ void GMainWindow::UpdateWindowTitle() {
+-    const QString full_name = QString::fromUtf8(Common::g_build_fullname);
++    const QString full_name = QString::fromUtf8(Common::g_build_display);
+ 
+     if (game_title.isEmpty()) {
+-        setWindowTitle(QStringLiteral("Tangelo %1").arg(full_name));
++        setWindowTitle(QStringLiteral("Tangelo - %1").arg(full_name));
+     } else {
+-        setWindowTitle(QStringLiteral("Tangelo %1 | %2").arg(full_name, game_title));
+-        render_window->setWindowTitle(
+-            QStringLiteral("Tangelo %1 | %2 | %3").arg(full_name, game_title, tr("Primary Window")));
+-        secondary_window->setWindowTitle(QStringLiteral("Tangelo %1 | %2 | %3")
++        setWindowTitle(QStringLiteral("Tangelo - %1 | %2").arg(full_name, game_title));
++        render_window->setWindowTitle(QStringLiteral("Tangelo - %1 | %2 | %3")
++                                          .arg(full_name, game_title, tr("Primary Window")));
++        secondary_window->setWindowTitle(QStringLiteral("Tangelo - %1 | %2 | %3")
+                                              .arg(full_name, game_title, tr("Secondary Window")));
+     }
+ }
+diff --git a/src/common/scm_rev.cpp.in b/src/common/scm_rev.cpp.in
+index 1b2e63ca6..2691cbc19 100644
+--- a/src/common/scm_rev.cpp.in
++++ b/src/common/scm_rev.cpp.in
+@@ -12,6 +12,8 @@
+ #define BUILD_VERSION "@BUILD_VERSION@"
+ #define BUILD_FULLNAME "@BUILD_FULLNAME@"
+ #define BUILD_VARIANT "@BUILD_VARIANT@"
++#define BUILD_NUMBER "@BUILD_NUMBER@"
++#define BUILD_DISPLAY "@BUILD_DISPLAY@"
+ #define SHADER_CACHE_VERSION "@SHADER_CACHE_VERSION@"
+ 
+ namespace Common {
+@@ -24,6 +26,8 @@ const char g_build_date[]   = BUILD_DATE;
+ const char g_build_fullname[] = BUILD_FULLNAME;
+ const char g_build_version[]  = BUILD_VERSION;
+ const char g_build_variant[]  = BUILD_VARIANT;
++const char g_build_number[]   = BUILD_NUMBER;
++const char g_build_display[]  = BUILD_DISPLAY;
+ const char g_shader_cache_version[] = SHADER_CACHE_VERSION;
+ 
+ } // namespace
+diff --git a/src/common/scm_rev.h b/src/common/scm_rev.h
+index c942e5cf8..0224874a2 100644
+--- a/src/common/scm_rev.h
++++ b/src/common/scm_rev.h
+@@ -14,6 +14,10 @@ extern const char g_build_date[];
+ extern const char g_build_fullname[];
+ extern const char g_build_version[];
+ extern const char g_build_variant[];
++/// Tangelo's build number (commits up to this one), "?" when unknown.
++extern const char g_build_number[];
++/// "Build <number> - <short commit>", what Tangelo shows as its version.
++extern const char g_build_display[];
+ extern const char g_shader_cache_version[];
+ 
+ } // namespace Common
+diff --git a/src/core/tangelo_report.cpp b/src/core/tangelo_report.cpp
+index a72570317..859232a06 100644
+--- a/src/core/tangelo_report.cpp
++++ b/src/core/tangelo_report.cpp
+@@ -120,7 +120,7 @@ std::string MakeGameReport(u64 console_id, u64 started_title, const std::vector<
+     return fmt::format("{{\"console_id\":\"{:016X}\",\"started\":\"{:016X}\","
+                        "\"installed\":[{}]{},\"tangelo\":{},\"platform\":\"{}\"}}",
+                        console_id, started_title, TitleList(installed), folder_part,
+-                       JsonString(Common::g_scm_desc), Platform());
++                       JsonString(Common::g_build_display), Platform());
+ }
+ 
+ std::string GameReportUrl(const std::string& server) {
+-- 
+2.43.0
+
