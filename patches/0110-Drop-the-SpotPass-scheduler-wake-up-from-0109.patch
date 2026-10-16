@@ -1,0 +1,87 @@
+From 3282bc8afdefa7ccad13310a95f5ca834c4bed75 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 16 Oct 2026 20:11:01 +0200
+Subject: [PATCH] Drop the SpotPass scheduler wake-up from 0109
+
+The Badge Arcade hang from the HOME Menu was the policy list: after ndm resumes
+boss, every task run first refreshes the policy list and is dropped when it
+can't be read; our server's list started with an <?xml?> declaration, which
+boss's parser takes as the list. Fixed on the server (build 2026-10-16.19,
+confirmed 2026-10-16 20:10). The wake-up added in 0109 never helped: the task
+had already been dropped, so the scheduler had nothing to run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/svc.cpp | 40 -------------------------------------
+ 2 files changed, 1 insertion(+), 41 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index e2a9fee00..bc6298e80 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-109
++110
+diff --git a/src/core/hle/kernel/svc.cpp b/src/core/hle/kernel/svc.cpp
+index 398f022ae..7e694c102 100644
+--- a/src/core/hle/kernel/svc.cpp
++++ b/src/core/hle/kernel/svc.cpp
+@@ -821,45 +821,6 @@ static void LogBossArbiter(Core::System& system, const Thread* thread, const cha
+              core.GetPC(), core.GetReg(14));
+ }
+ 
+-/// Badge Arcade hang when started from the HOME Menu (2026-10-16, Build 108 logs). Once ndm has
+-/// resumed the SpotPass module (boss), a game's foreground task first makes boss's worker thread
+-/// refresh the policy list. After that refresh the worker only sets its "policy done" event
+-/// (0x00156508) and goes back to waiting on the scheduler's event (0x0014D154); nothing wakes the
+-/// scheduler again, so the game's download never starts and the game waits forever. After its
+-/// background run the worker does signal 0x0014D154 itself. Here: when a boss thread set the
+-/// policy-done event and then waits on the scheduler's event without having signalled it, signal
+-/// it once for it, so the scheduler looks at the queued task again.
+-/// Addresses are those of the current SpotPass module (11.17, PBOS-8.0); with any other layout
+-/// the pattern simply never matches.
+-static void WakeBossSchedulerAfterPolicyRefresh(Core::System& system, AddressArbiter& arbiter,
+-                                                Thread* thread, u32 address, u32 type) {
+-    constexpr u32 PolicyDoneEvent = 0x00156508;
+-    constexpr u32 SchedulerEvent = 0x0014D154;
+-    static std::mutex mutex;
+-    static std::map<u32, bool> pending; // boss thread ID → set policy-done, scheduler not woken
+-    if (!thread || system.Kernel().GetCurrentProcess()->GetName() != "boss") {
+-        return;
+-    }
+-    std::scoped_lock lock{mutex};
+-    if (type == 0 && address == PolicyDoneEvent) {
+-        pending[thread->thread_id] = true;
+-        return;
+-    }
+-    if (type == 0 && address == SchedulerEvent) {
+-        pending[thread->thread_id] = false;
+-        return;
+-    }
+-    if (address != SchedulerEvent || thread->status != ThreadStatus::WaitArb ||
+-        !pending[thread->thread_id]) {
+-        return;
+-    }
+-    pending[thread->thread_id] = false;
+-    LOG_INFO(Service_BOSS, "boss thread {} finished a policy list refresh without waking the "
+-                           "scheduler: waking it",
+-             thread->thread_id);
+-    arbiter.ArbitrateAddress(SharedFrom(thread), ArbitrationType::Signal, SchedulerEvent, -1, 0);
+-}
+-
+ /// Logs what a wait on an invalid handle was about: the waiting thread and, if the handle was
+ /// closed shortly before, who closed it and what it was.
+ static void LogInvalidWaitHandle(Core::System& system, Handle handle, VAddr handles_address,
+@@ -1323,7 +1284,6 @@ Result SVC::ArbitrateAddress(Handle handle, u32 address, u32 type, u32 value, s6
+     } else if (type == 0) {
+         LogBossArbiter(system, current, "signals", address, value, -1);
+     }
+-    WakeBossSchedulerAfterPolicyRefresh(system, *arbiter, current, address, type);
+ 
+     // TODO(Subv): Identify in which specific cases this call should cause a reschedule.
+     system.PrepareReschedule();
+-- 
+2.43.0
+
