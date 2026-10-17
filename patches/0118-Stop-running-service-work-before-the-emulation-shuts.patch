@@ -1,0 +1,392 @@
+From 1fedd94a0eede7676553eba882ba32bba90273e5 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 17 Oct 2026 11:23:18 +0200
+Subject: [PATCH] Stop running service work before the emulation shuts down
+
+Tangelo closed 1-3 s after stopping Mario Golf, Badge Arcade or Swapdoodle
+(access violation in a worker thread). An HLE service's async section
+(RunAsync / RunOnThreadWorker), here http:C waiting for a request that was
+still open, finished after the services, kernel and timing were destroyed
+and then woke its guest thread.
+
+System::Shutdown now first calls KernelSystem::StopAsyncOperations: async
+sections no longer wake guest threads, cancel hooks run, and running
+sections get up to 10 s to finish. http:C cancels its requests: a body
+still waited for is given up, the connection in use is shut down
+(httplib ClientImpl::stop), the progress callback aborts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                         |  2 +-
+ src/core/core.cpp                    |  6 +++
+ src/core/hle/kernel/hle_ipc.h        | 42 +++++++++++++++---
+ src/core/hle/kernel/kernel.cpp       | 33 ++++++++++++++
+ src/core/hle/kernel/kernel.h         | 27 ++++++++++++
+ src/core/hle/service/http/http_c.cpp | 64 ++++++++++++++++++++++++++--
+ src/core/hle/service/http/http_c.h   | 12 ++++++
+ 7 files changed, 174 insertions(+), 12 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 5bc6609e3..415196e47 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-117
++118
+diff --git a/src/core/core.cpp b/src/core/core.cpp
+index 9268b0c25..1181bfd17 100644
+--- a/src/core/core.cpp
++++ b/src/core/core.cpp
+@@ -722,6 +722,12 @@ void System::Shutdown(bool is_deserializing) {
+     // Shutdown emulation session
+     is_powered_on = false;
+ 
++    // Async service work still running (HTTP requests, socket waits) must not wake guest
++    // threads or use services once those are being destroyed.
++    if (kernel) {
++        kernel->StopAsyncOperations();
++    }
++
+     gpu.reset();
+     if (!is_deserializing) {
+         lle_modules.clear();
+diff --git a/src/core/hle/kernel/hle_ipc.h b/src/core/hle/kernel/hle_ipc.h
+index 33511b3c9..912d07718 100644
+--- a/src/core/hle/kernel/hle_ipc.h
++++ b/src/core/hle/kernel/hle_ipc.h
+@@ -9,6 +9,7 @@
+ #include <chrono>
+ #include <future>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+@@ -284,6 +285,18 @@ private:
+         std::future<void> future;
+     };
+ 
++    /// Runs an async section and marks it finished even when it throws.
++    template <typename Body>
++    static void RunGuardedAsyncSection(KernelSystem::AsyncGuard& guard, Body&& body) {
++        struct Finished {
++            KernelSystem::AsyncGuard& guard;
++            ~Finished() {
++                guard.running--;
++            }
++        } finished{guard};
++        body();
++    }
++
+ public:
+     /**
+      * Puts the game thread to sleep and calls the specified async_section asynchronously.
+@@ -305,13 +318,20 @@ public:
+ 
+         if (!Settings::values.deterministic_async_operations && really_async) {
+             kernel.ReportAsyncState(true);
++            auto guard = kernel.GetAsyncGuard();
++            guard->running++;
+             this->SleepClientThread(
+                 "RunAsync", std::chrono::nanoseconds(-1),
+                 std::make_shared<AsyncWakeUpCallback<ResultFunctor>>(
+                     kernel, result_function,
+-                    std::move(std::async(std::launch::async, [this, async_section] {
+-                        s64 sleep_for = async_section(*this);
+-                        this->thread->WakeAfterDelay(sleep_for, true);
++                    std::move(std::async(std::launch::async, [this, async_section, guard] {
++                        RunGuardedAsyncSection(*guard, [&] {
++                            s64 sleep_for = async_section(*this);
++                            std::scoped_lock lock{guard->mutex};
++                            if (guard->alive) {
++                                this->thread->WakeAfterDelay(sleep_for, true);
++                            }
++                        });
+                     }))));
+ 
+         } else {
+@@ -349,10 +369,18 @@ public:
+             kernel.ReportAsyncState(true);
+ 
+             // We use packaged_task so we can retrieve a std::future to pass to AsyncWakeUpCallback
+-            auto task = std::make_shared<std::packaged_task<void()>>([this, async_section] {
+-                s64 sleep_for = async_section(*this);
+-                this->thread->WakeAfterDelay(sleep_for, true);
+-            });
++            auto guard = kernel.GetAsyncGuard();
++            guard->running++;
++            auto task =
++                std::make_shared<std::packaged_task<void()>>([this, async_section, guard] {
++                    RunGuardedAsyncSection(*guard, [&] {
++                        s64 sleep_for = async_section(*this);
++                        std::scoped_lock lock{guard->mutex};
++                        if (guard->alive) {
++                            this->thread->WakeAfterDelay(sleep_for, true);
++                        }
++                    });
++                });
+ 
+             auto future = task->get_future();
+ 
+diff --git a/src/core/hle/kernel/kernel.cpp b/src/core/hle/kernel/kernel.cpp
+index aec8c9d63..bdd3e2324 100644
+--- a/src/core/hle/kernel/kernel.cpp
++++ b/src/core/hle/kernel/kernel.cpp
+@@ -2,6 +2,8 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <chrono>
++#include <thread>
+ #include <boost/serialization/shared_ptr.hpp>
+ #include <boost/serialization/unordered_map.hpp>
+ #include <boost/serialization/vector.hpp>
+@@ -51,6 +53,37 @@ KernelSystem::~KernelSystem() {
+     ResetThreadIDs();
+ };
+ 
++void KernelSystem::AddAsyncCancelHook(std::function<void()> hook) {
++    std::scoped_lock lock{async_cancel_hooks_mutex};
++    async_cancel_hooks.push_back(std::move(hook));
++}
++
++void KernelSystem::StopAsyncOperations() {
++    {
++        std::scoped_lock lock{async_guard->mutex};
++        async_guard->alive = false;
++    }
++    std::vector<std::function<void()>> hooks;
++    {
++        std::scoped_lock lock{async_cancel_hooks_mutex};
++        hooks = std::move(async_cancel_hooks);
++        async_cancel_hooks.clear();
++    }
++    for (auto& hook : hooks) {
++        hook();
++    }
++    // The sections still use their service (an HTTP context, a socket): wait for them before
++    // the services go. HTTP requests end at once when cancelled, a socket read within seconds.
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++    while (async_guard->running > 0 && std::chrono::steady_clock::now() < deadline) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    }
++    if (async_guard->running > 0) {
++        LOG_WARNING(Kernel, "{} async operation(s) still running at shutdown",
++                    async_guard->running.load());
++    }
++}
++
+ ResourceLimitList& KernelSystem::ResourceLimit() {
+     return *resource_limits;
+ }
+diff --git a/src/core/hle/kernel/kernel.h b/src/core/hle/kernel/kernel.h
+index 5a91a37bd..61f1cc9e5 100644
+--- a/src/core/hle/kernel/kernel.h
++++ b/src/core/hle/kernel/kernel.h
+@@ -422,6 +422,29 @@ public:
+         return pending_async_operations != 0;
+     }
+ 
++    /// Shared by the kernel and every running async section (RunAsync, RunOnThreadWorker). An
++    /// async section may still be busy (an HTTP request, a socket wait) when the emulation stops;
++    /// after StopAsyncOperations it no longer wakes its guest thread, whose kernel and timing are
++    /// about to be destroyed (crash 2026-10-17: Tangelo closed 1-3 s after stopping Mario Golf,
++    /// Badge Arcade or Swapdoodle).
++    struct AsyncGuard {
++        std::mutex mutex;
++        bool alive = true;
++        std::atomic<int> running{0};
++    };
++
++    std::shared_ptr<AsyncGuard> GetAsyncGuard() const {
++        return async_guard;
++    }
++
++    /// Called by StopAsyncOperations to make long-running async sections end soon (e.g. the
++    /// HTTP service stops its requests).
++    void AddAsyncCancelHook(std::function<void()> hook);
++
++    /// At shutdown, before the services and the kernel are destroyed: async sections stop waking
++    /// guest threads, the cancel hooks run, and running sections get some seconds to finish.
++    void StopAsyncOperations();
++
+     void UpdateCPUAndMemoryState(u64 title_id, MemoryMode memory_mode,
+                                  New3dsHwCapabilities n3ds_hw_cap);
+ 
+@@ -445,6 +468,10 @@ private:
+ 
+     std::atomic<int> pending_async_operations{};
+ 
++    std::shared_ptr<AsyncGuard> async_guard = std::make_shared<AsyncGuard>();
++    std::mutex async_cancel_hooks_mutex;
++    std::vector<std::function<void()>> async_cancel_hooks;
++
+     // Note: keep the member order below in order to perform correct destruction.
+     // Thread manager is destructed before process list in order to Stop threads and clear thread
+     // info from their parent processes first. Timer manager is destructed after process list
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 5adba9424..dfc3d1b31 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -241,6 +241,10 @@ void Context::MakeRequest() {
+     ASSERT(state == RequestState::NotStarted);
+ 
+     state = RequestState::SendingRequest;
++    if (cancelled) {
++        state = RequestState::Completed;
++        return;
++    }
+ 
+     static const std::unordered_map<RequestMethod, std::string> request_method_strings{
+         {RequestMethod::Get, "GET"},       {RequestMethod::Post, "POST"},
+@@ -284,7 +288,7 @@ void Context::MakeRequest() {
+         // TODO(B3N30): Is there a state that shows response header are available
+         current_download_size_bytes = current;
+         total_download_size_bytes = total;
+-        return true;
++        return !cancelled;
+     };
+ 
+     for (const auto& header : headers) {
+@@ -451,8 +455,10 @@ void Context::LogSoapResult() const {
+ void Context::MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo& url_info,
+                                 std::vector<Context::RequestHeader>& pending_headers) {
+     httplib::Error error{-1};
+-    std::unique_ptr<httplib::Client> client =
+-        std::make_unique<httplib::Client>(url_info.host, url_info.port);
++    std::unique_ptr<httplib::ClientImpl> client =
++        std::make_unique<httplib::ClientImpl>(url_info.host, url_info.port);
++    SetActiveClient(client.get());
++    SCOPE_EXIT({ SetActiveClient(nullptr); });
+ 
+     client->set_header_writer(
+         [this, &pending_headers](httplib::Stream& strm, httplib::Headers& httplib_headers) {
+@@ -507,6 +513,9 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
+         client = std::make_unique<httplib::SSLClient>(url_info.host, url_info.port);
+     }
+ 
++    SetActiveClient(client.get());
++    SCOPE_EXIT({ SetActiveClient(nullptr); });
++
+     // TODO(B3N30): Check for SSLOptions-Bits and set the verify method accordingly
+     // https://www.3dbrew.org/wiki/SSL_Services#SSLOpt
+     // Hack: Since for now RootCerts are not implemented we set the VerifyMode to None.
+@@ -526,6 +535,23 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
+     }
+ }
+ 
++void Context::SetActiveClient(httplib::ClientImpl* client) {
++    std::scoped_lock lock{active_client_mutex};
++    active_client = client;
++    if (client && cancelled) {
++        client->stop();
++    }
++}
++
++void Context::Cancel() {
++    cancelled = true;
++    finish_post_data.Set();
++    std::scoped_lock lock{active_client_mutex};
++    if (active_client) {
++        active_client->stop();
++    }
++}
++
+ bool Context::ContentProvider(size_t offset, size_t length, httplib::DataSink& sink) {
+     if (!post_data_raw.empty()) {
+         sink.write(post_data_raw.data() + offset, length);
+@@ -539,6 +565,9 @@ bool Context::ContentProvider(size_t offset, size_t length, httplib::DataSink& s
+ bool Context::SizedRawContentProvider(size_t offset, size_t length, httplib::DataSink& sink) {
+     if (offset == 0) {
+         finish_post_data.Wait();
++        if (cancelled) {
++            return false;
++        }
+         sized_raw_body.clear();
+         for (const auto& data : post_data) {
+             sized_raw_body += data.second.value;
+@@ -561,6 +590,9 @@ bool Context::SizedRawContentProvider(size_t offset, size_t length, httplib::Dat
+ 
+ bool Context::ChunkedContentProvider(size_t offset, httplib::DataSink& sink) {
+     finish_post_data.Wait();
++    if (cancelled) {
++        return false;
++    }
+ 
+     switch (post_data_type) {
+     case PostDataType::AsciiForm:
+@@ -2583,8 +2615,32 @@ std::shared_ptr<HTTP_C> GetService(Core::System& system) {
+     return system.ServiceManager().GetService<HTTP_C>("http:C");
+ }
+ 
++void HTTP_C::CancelAllRequests() {
++    std::size_t running = 0;
++    for (auto& [handle, context] : contexts) {
++        if (context.request_future.valid() &&
++            context.request_future.wait_for(std::chrono::seconds(0)) !=
++                std::future_status::ready) {
++            ++running;
++        }
++        context.Cancel();
++    }
++    if (running > 0) {
++        LOG_INFO(Service_HTTP, "Emulation stopping: {} running request(s) stopped", running);
++    }
++}
++
+ void InstallInterfaces(Core::System& system) {
+     auto& service_manager = system.ServiceManager();
+-    std::make_shared<HTTP_C>()->InstallAsService(service_manager);
++    auto http = std::make_shared<HTTP_C>();
++    http->InstallAsService(service_manager);
++    // Requests still running when the emulation stops would otherwise wake game threads (and
++    // use this service) after they are gone: Tangelo closed 1-3 s after stopping a game that
++    // had a request open (Mario Golf, Badge Arcade, Swapdoodle, 2026-10-17).
++    system.Kernel().AddAsyncCancelHook([weak = std::weak_ptr<HTTP_C>(http)] {
++        if (const auto service = weak.lock()) {
++            service->CancelAllRequests();
++        }
++    });
+ }
+ } // namespace Service::HTTP
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index 5cf4a0926..c4f2e9c35 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -7,6 +7,7 @@
+ #include <chrono>
+ #include <future>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <string>
+ #include <unordered_map>
+@@ -322,6 +323,14 @@ public:
+     httplib::Response response;
+     Common::Event finish_post_data;
+ 
++    /// Stops a request that is still running (emulation stopping): a body still waited for is
++    /// given up, a connection in progress is shut down.
++    void Cancel();
++    std::atomic<bool> cancelled{false};
++    std::mutex active_client_mutex;
++    httplib::ClientImpl* active_client = nullptr; ///< The request's client while it is sent.
++    void SetActiveClient(httplib::ClientImpl* client);
++
+     void ParseAsciiPostData();
+     std::string ParseMultipartFormData();
+     void MakeRequest();
+@@ -370,6 +379,9 @@ private:
+ 
+ class HTTP_C final : public ServiceFramework<HTTP_C, SessionData> {
+ public:
++    /// Stops every running request (shutdown, see KernelSystem::StopAsyncOperations).
++    void CancelAllRequests();
++
+     HTTP_C();
+ 
+     const ClCertAData& GetClCertA() const {
+-- 
+2.43.0
+

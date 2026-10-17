@@ -1,0 +1,107 @@
+From dce1bd0b16080a7beeb5bd072b48b0b986f0adfc Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 16 Oct 2026 23:08:40 +0200
+Subject: [PATCH] Log UDP sends and receives with their addresses
+
+Smash's Pia NAT check sends its messages and the server answers, but the
+game never sees an answer (error 018-0201). Sends, receives (with source
+address) and polls are now logged at Service_SOC:Debug (Logging tab:
+"Internet and network"), and Bind logs the address it binds to.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                       |  2 +-
+ src/core/hle/service/soc/soc_u.cpp | 34 +++++++++++++++++++++++-------
+ 2 files changed, 27 insertions(+), 9 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 4699eb3cc..5bc6609e3 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-116
++117
+diff --git a/src/core/hle/service/soc/soc_u.cpp b/src/core/hle/service/soc/soc_u.cpp
+index 600681cd9..d33365bca 100644
+--- a/src/core/hle/service/soc/soc_u.cpp
++++ b/src/core/hle/service/soc/soc_u.cpp
+@@ -69,8 +69,10 @@
+ SERIALIZE_EXPORT_IMPL(Service::SOC::SOC_U)
+ 
+ // Change according the debugging needs
+-#define LOG_SEND_RECV LOG_TRACE
+-#define LOG_POLL LOG_TRACE
++// Debug (Configure > Logging > "Internet and network"): sends, receives and polls with the
++// addresses, e.g. to see whether a game's UDP answers arrive (Smash's NAT check, 2026-10-16).
++#define LOG_SEND_RECV LOG_DEBUG
++#define LOG_POLL LOG_DEBUG
+ 
+ namespace Service::SOC {
+ 
+@@ -876,6 +878,15 @@ void SOC_U::Socket(Kernel::HLERequestContext& ctx) {
+     rb.Push(static_cast<s32>(ret));
+ }
+ 
++/// "a.b.c.d:port" of a 3DS sockaddr (len, family, port and address in network order).
++static std::string CtrAddrString(const u8* data, std::size_t size) {
++    if (!data || size < 8) {
++        return "-";
++    }
++    const u16 port = static_cast<u16>(data[2] << 8 | data[3]);
++    return fmt::format("{}.{}.{}.{}:{}", data[4], data[5], data[6], data[7], port);
++}
++
+ void SOC_U::Bind(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u32 socket_handle = rp.Pop<u32>();
+@@ -899,8 +910,8 @@ void SOC_U::Bind(Kernel::HLERequestContext& ctx) {
+     if (ret != 0)
+         ret = TranslateError(GET_ERRNO);
+ 
+-    LOG_DEBUG(Service_SOC, "called, pid={}, fd={}, ret={}", pid, socket_handle,
+-              static_cast<s32>(ret));
++    LOG_DEBUG(Service_SOC, "called, pid={}, fd={}, address {}, ret={}", pid, socket_handle,
++              CtrAddrString(sock_addr_buf.data(), sock_addr_buf.size()), static_cast<s32>(ret));
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+@@ -1236,6 +1247,9 @@ s32 SOC_U::SendToImpl(SocketHolder& holder, u32 len, u32 flags, u32 addr_len,
+     if (ret == SOCKET_ERROR_VALUE)
+         ret = TranslateError(send_error);
+ 
++    LOG_SEND_RECV(Service_SOC, "sendto fd={} to {} len={} ret={}", holder.socket_fd,
++                  addr_len > 0 ? CtrAddrString(dest_addr_buff, addr_len) : std::string("-"), len,
++                  ret);
+     return ret;
+ }
+ 
+@@ -1390,8 +1404,10 @@ void SOC_U::RecvFromOther(Kernel::HLERequestContext& ctx) {
+ #else
+             (void)this;
+ #endif
+-            LOG_SEND_RECV(Service_SOC, "called, fd={}, ret={}", async_data->socket_handle,
+-                          static_cast<s32>(async_data->ret));
++            LOG_SEND_RECV(Service_SOC, "recvfrom (small) fd={} ret={} from {}",
++                          async_data->socket_handle, static_cast<s32>(async_data->ret),
++                          CtrAddrString(async_data->addr_buff.data(),
++                                        async_data->addr_buff.size()));
+ 
+             IPC::RequestBuilder rb(ctx, 0x07, 2, 4);
+             rb.Push(ResultSuccess);
+@@ -1512,8 +1528,10 @@ void SOC_U::RecvFrom(Kernel::HLERequestContext& ctx) {
+             // Write only the data we received to avoid overwriting parts of the buffer with zeros
+             async_data->output_buff.resize(total_received);
+ 
+-            LOG_SEND_RECV(Service_SOC, "called, fd={}, ret={}", async_data->socket_handle,
+-                          static_cast<s32>(async_data->ret));
++            LOG_SEND_RECV(Service_SOC, "recvfrom fd={} ret={} from {}", async_data->socket_handle,
++                          static_cast<s32>(async_data->ret),
++                          CtrAddrString(async_data->addr_buff.data(),
++                                        async_data->addr_buff.size()));
+ 
+             IPC::RequestBuilder rb(ctx, 0x08, 3, 4);
+             rb.Push(ResultSuccess);
+-- 
+2.43.0
+

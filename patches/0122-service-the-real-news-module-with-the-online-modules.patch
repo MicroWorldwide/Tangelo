@@ -1,0 +1,41 @@
+From 237448870997096fce7eefaa0ecfe3f2801b2bbc Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 17 Oct 2026 14:19:00 +0200
+Subject: [PATCH] service: the real news module with the online modules
+
+With the real BOSS module, SpotPass letters only reach the Notifications applet when the real
+news module runs: the HLE news service gets nothing from it. Tested 17 Oct 2026 with 0120
+(BOSS extdata on the NAND): Badge Arcade letters arrive in Notifications. NEWS now loads with
+the other online modules (FRD, NDM, NIM, BOSS...); without its title on the NAND the HLE
+version is used as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                     | 2 +-
+ src/core/hle/service/service.cpp | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 9289ddcee..9f54fe313 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-121
++122
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index 8e3e82cb3..ab4a3c34a 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -89,7 +89,7 @@ const std::array<ServiceModuleInfo, 41> service_module_map{
+      {"MIC", 0x00040130'00002002, MIC::InstallInterfaces, false},
+      {"MVD", 0x00040130'20004102, MVD::InstallInterfaces, false},
+      {"NDM", 0x00040130'00002B02, NDM::InstallInterfaces, true},
+-     {"NEWS", 0x00040130'00003502, NEWS::InstallInterfaces, false},
++     {"NEWS", 0x00040130'00003502, NEWS::InstallInterfaces, true},
+      {"NFC", 0x00040130'00004002, NFC::InstallInterfaces, false},
+      {"NIM", 0x00040130'00002C02, NIM::InstallInterfaces, true},
+      {"NS", 0x00040130'00008002, APT::InstallInterfaces, false},
+-- 
+2.43.0
+

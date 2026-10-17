@@ -1,0 +1,62 @@
+From 4bf1384982b38396c001c34dda925ac56a985772 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 17 Oct 2026 14:32:42 +0200
+Subject: [PATCH] ptm: log the whole notification LED pattern and how long it
+ is lit
+
+Tested with 0121 (17 Oct 2026): the real news module sets a blue pattern when a SpotPass
+letter arrives and the emulated LED lights blue for about 2 seconds. The log now shows the
+brightness of all 32 steps, the step length and how long the LED is lit (or that it stays
+on), so what the LED shows can be checked against what the module asked for.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                     |  2 +-
+ src/core/hle/service/ptm/ptm.cpp | 23 +++++++++++++++++++++--
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 9f54fe313..190a18037 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-122
++123
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index 41c8c8ff5..6ea43c5c3 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -289,8 +289,27 @@ std::string DescribeLed(const MCU::InfoLedPattern& p) {
+     if (r == 0 && g == 0 && b == 0) {
+         return "off";
+     }
+-    return fmt::format("max RGB {:02X}{:02X}{:02X}, {} tick(s) per step, last step repeated {}", r,
+-                       g, b, p.header.ticks_per_index, p.header.last_index_repeat_times);
++    // How long it is lit: steps of ticks_per_index / 512 s; the last step is repeated
++    // last_index_repeat_times more times (0xFF = forever).
++    std::size_t last_lit = 0;
++    std::string steps;
++    for (std::size_t i = 0; i < MCU::InfoLedPattern::PATTERN_INDEX_COUNT; i++) {
++        const u32 level = std::max({p.r[i], p.g[i], p.b[i]});
++        if (level != 0) {
++            last_lit = i;
++        }
++        steps += fmt::format("{}{:X}", i ? "," : "", level);
++    }
++    const std::size_t last = MCU::InfoLedPattern::PATTERN_INDEX_COUNT - 1;
++    const bool stays_on = std::max({p.r[last], p.g[last], p.b[last]}) != 0 &&
++                          p.header.last_index_repeat_times == 0xFF;
++    const double step_s = p.header.ticks_per_index / 512.0;
++    return fmt::format("max RGB {:02X}{:02X}{:02X}, {} tick(s) ({:.2f} s) per step, last step "
++                       "repeated {}, lit for {} ({}); brightness per step {}",
++                       r, g, b, p.header.ticks_per_index, step_s,
++                       p.header.last_index_repeat_times,
++                       stays_on ? std::string("ever") : fmt::format("{:.1f} s", (last_lit + 1) * step_s),
++                       stays_on ? "stays on" : "then off", steps);
+ }
+ } // namespace
+ 
+-- 
+2.43.0
+

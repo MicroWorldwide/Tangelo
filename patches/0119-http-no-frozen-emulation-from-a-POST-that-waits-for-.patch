@@ -1,0 +1,90 @@
+From 1c4bac3cef01f78316cb0f81bdda8df15468de9f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 17 Oct 2026 12:52:15 +0200
+Subject: [PATCH] http: no frozen emulation from a POST that waits for its body
+
+Tangelo froze about 30 or 90 s into a session, right after NetPass's
+StreetPass relay POST (cecd, api.netpass.cafe/spr): cecd takes over a
+second between BeginRequest and its chunked post data, so GetRequestState
+started the request as a POST without a body (patch from 2026-10-08 for
+the eShop), the post data was then refused, and the request waited for
+its body forever. Closing the context waits for the request, which froze
+the emulation.
+
+- chunked POSTs are no longer started early by GetRequestState
+- CloseContext stops a request that is still running before removing it
+- CancelConnection stops the request (was a stub)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                         |  2 +-
+ src/core/hle/service/http/http_c.cpp | 25 ++++++++++++++++++++-----
+ 2 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 415196e47..078fa0fe5 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-118
++119
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index dfc3d1b31..d5eaad001 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -956,7 +956,16 @@ void HTTP_C::CloseContext(Kernel::HLERequestContext& ctx) {
+     // TODO(Subv): What happens if you try to close a context that's currently being used?
+     // TODO(Subv): Make sure that only the session that created the context can close it.
+ 
+-    // Note that this will block if a request is still in progress
++    // Erasing waits for a request still in progress. One that waits for post data that will
++    // never come now (the game closes it) would wait forever and freeze the emulation
++    // (NetPass's /spr POST, 2026-10-17), so a running request is stopped first.
++    if (itr->second.request_future.valid() &&
++        itr->second.request_future.wait_for(std::chrono::seconds(0)) !=
++            std::future_status::ready) {
++        LOG_INFO(Service_HTTP, "Context {} closed while its request runs: request stopped",
++                 context_handle);
++        itr->second.Cancel();
++    }
+     contexts.erase(itr);
+     session_data->num_http_contexts--;
+ 
+@@ -968,14 +977,15 @@ void HTTP_C::CancelConnection(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u32 context_handle = rp.Pop<u32>();
+ 
+-    LOG_WARNING(Service_HTTP, "(STUBBED) called, handle={}", context_handle);
++    LOG_DEBUG(Service_HTTP, "called, handle={}", context_handle);
+ 
+     const auto* session_data = EnsureSessionInitialized(ctx, rp);
+     if (!session_data) {
+         return;
+     }
+ 
+-    [[maybe_unused]] Context& http_context = GetContext(context_handle);
++    // Stops the request: a body still waited for is given up, the connection is shut down.
++    GetContext(context_handle).Cancel();
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+     rb.Push(ResultSuccess);
+@@ -986,8 +996,13 @@ void HTTP_C::StartAbandonedPost(Context& http_context, bool force) {
+         http_context.post_data_added) {
+         return;
+     }
+-    if (!force && std::chrono::steady_clock::now() - http_context.post_pending_since <
+-                      std::chrono::seconds(1)) {
++    // A chunked POST gets its body later with SendPostData* + NotifyFinishSendPostData: only
++    // start it early when the game asks for the answer (force). NetPass's cecd needs over a
++    // second between BeginRequest and its post data (2026-10-17); started early, the post data
++    // was refused and the request waited forever.
++    if (!force && (http_context.chunked_request ||
++                   std::chrono::steady_clock::now() - http_context.post_pending_since <
++                       std::chrono::seconds(1))) {
+         return;
+     }
+     LOG_WARNING(Service_HTTP, "POST {} began without post data and none followed: sent with an "
+-- 
+2.43.0
+

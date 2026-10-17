@@ -1,0 +1,90 @@
+From cdd7b8146cc468e9ed528f4f5c3b98e802d7430d Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 17 Oct 2026 14:18:35 +0200
+Subject: [PATCH] ptm: log who sets the notification LED and to what
+
+The real news module sets the blue LED through ptm:sysm SetInfoLEDPattern. These calls were
+not logged, so a LED that does not blink could not be told apart from a module that never asks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                     |  2 +-
+ src/core/hle/service/ptm/ptm.cpp | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 52bd8e43a..9289ddcee 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-120
++121
+diff --git a/src/core/hle/service/ptm/ptm.cpp b/src/core/hle/service/ptm/ptm.cpp
+index 6348de493..41c8c8ff5 100644
+--- a/src/core/hle/service/ptm/ptm.cpp
++++ b/src/core/hle/service/ptm/ptm.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <algorithm>
++#include <string>
+ #include "common/archives.h"
+ #include "common/common_paths.h"
+ #include "common/file_util.h"
+@@ -15,6 +16,8 @@
+ #include "core/file_sys/file_backend.h"
+ #include "core/hle/kernel/event.h"
+ #include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/process.h"
++#include "core/hle/kernel/thread.h"
+ #include "core/hle/kernel/shared_page.h"
+ #include "core/hle/service/mcu/mcu_rtc.h"
+ #include "core/hle/service/ptm/ptm.h"
+@@ -267,9 +270,34 @@ void Module::Interface::CheckNew3DS(Kernel::HLERequestContext& ctx) {
+     Service::PTM::CheckNew3DS(rb);
+ }
+ 
++namespace {
++// Who set the notification LED and to what (blue = SpotPass news, green = StreetPass,
++// orange = a friend online, all zero = off), for tests of the emulated LED.
++std::string LedCaller(Kernel::HLERequestContext& ctx) {
++    auto thread = ctx.ClientThread();
++    auto process = thread ? thread->owner_process.lock() : nullptr;
++    return process && process->codeset ? process->codeset->name : std::string("?");
++}
++
++std::string DescribeLed(const MCU::InfoLedPattern& p) {
++    u32 r = 0, g = 0, b = 0;
++    for (std::size_t i = 0; i < MCU::InfoLedPattern::PATTERN_INDEX_COUNT; i++) {
++        r = std::max<u32>(r, p.r[i]);
++        g = std::max<u32>(g, p.g[i]);
++        b = std::max<u32>(b, p.b[i]);
++    }
++    if (r == 0 && g == 0 && b == 0) {
++        return "off";
++    }
++    return fmt::format("max RGB {:02X}{:02X}{:02X}, {} tick(s) per step, last step repeated {}", r,
++                       g, b, p.header.ticks_per_index, p.header.last_index_repeat_times);
++}
++} // namespace
++
+ void Module::Interface::SetInfoLEDPattern(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     auto pat = rp.PopRaw<MCU::InfoLedPattern>();
++    LOG_INFO(Service_PTM, "Notification LED set by {}: {}", LedCaller(ctx), DescribeLed(pat));
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+ 
+@@ -285,6 +313,8 @@ void Module::Interface::SetInfoLEDPattern(Kernel::HLERequestContext& ctx) {
+ void Module::Interface::SetInfoLEDPatternHeader(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     auto head = rp.PopRaw<MCU::InfoLedPattern::Header>();
++    LOG_INFO(Service_PTM, "Notification LED header set by {}: {} tick(s) per step, repeat {}",
++             LedCaller(ctx), head.ticks_per_index, head.last_index_repeat_times);
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,155 @@
+From 52d2f439f18266bb5f26150db050e4a39ce80fec Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 17 Oct 2026 13:37:18 +0200
+Subject: [PATCH] fs: BOSS extdata on the NAND (the news module's SpotPass
+ storage)
+
+With the real news module (LLE NEWS) Badge Arcade stopped with 004-6006:
+the news module registers NAND extdata 00048000/F0000009 as its SpotPass
+storage, and the SpotPass module opens it through the BOSS extdata
+archive (0x12345678) with media type NAND. Tangelo always looked for BOSS
+extdata on the SD card, so the letter couldn't be stored and the whole
+download (the play info carrying it) failed.
+
+BossExtSaveData with media type NAND now uses the NAND's shared extdata
+folder, and the news module's storage is created when it's missing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                              |  2 +-
+ src/core/file_sys/archive_extsavedata.cpp | 26 ++++++++++++++++++++---
+ src/core/file_sys/archive_extsavedata.h   |  6 +++++-
+ src/core/hle/service/fs/archive.cpp       | 16 ++++++++++++--
+ src/core/hle/service/fs/archive.h         |  5 +++++
+ 5 files changed, 48 insertions(+), 7 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 078fa0fe5..52bd8e43a 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-119
++120
+diff --git a/src/core/file_sys/archive_extsavedata.cpp b/src/core/file_sys/archive_extsavedata.cpp
+index 503f64494..30bcab9d8 100644
+--- a/src/core/file_sys/archive_extsavedata.cpp
++++ b/src/core/file_sys/archive_extsavedata.cpp
+@@ -261,9 +261,9 @@ Path ConstructExtDataBinaryPath(u32 media_type, u32 high, u32 low) {
+ }
+ 
+ ArchiveFactory_ExtSaveData::ArchiveFactory_ExtSaveData(const std::string& mount_location,
+-                                                       ExtSaveDataType type_)
+-    : type(type_),
+-      mount_point(GetExtDataContainerPath(mount_location, type_ == ExtSaveDataType::Shared)) {
++                                                       ExtSaveDataType type_, bool nand_container)
++    : type(type_), mount_point(GetExtDataContainerPath(
++                       mount_location, type_ == ExtSaveDataType::Shared || nand_container)) {
+     LOG_DEBUG(Service_FS, "Directory {} set as base for ExtSaveData.", mount_point);
+ }
+ 
+@@ -343,6 +343,26 @@ ResultVal<std::unique_ptr<ArchiveBackend>> ArchiveFactory_ExtSaveData::Open(cons
+             }
+         }
+ 
++        if (!FileUtil::Exists(fullpath) && type == ExtSaveDataType::Boss &&
++            path.GetType() == LowPathType::Binary &&
++            path.AsBinary().size() == sizeof(ExtSaveDataArchivePath)) {
++            ExtSaveDataArchivePath path_data;
++            std::memcpy(&path_data, path.AsBinary().data(), sizeof(path_data));
++            // The news module's SpotPass storage (it registers 00048000/F0000009 with BOSS). A
++            // console made by Tangelo doesn't have it yet; without it SpotPass can't store a
++            // notification, the whole download fails and Badge Arcade shows 004-6006.
++            if (path_data.media_type == static_cast<u32>(Service::FS::MediaType::NAND) &&
++                path_data.save_high == 0x00048000 && path_data.save_low == 0xF0000009) {
++                LOG_INFO(Service_FS, "Creating missing SpotPass storage of the news module "
++                                     "(NAND extdata 00048000/F0000009)");
++                if (FormatAsExtData(path, FileSys::ArchiveFormatInfo(), 0, program_id, 0,
++                                    std::nullopt)
++                        .IsError()) {
++                    LOG_ERROR(Service_FS, "Failed to create NAND extdata 00048000/F0000009");
++                }
++            }
++        }
++
+         if (!FileUtil::Exists(fullpath)) {
+             // TODO(Subv): Verify the archive behavior of SharedExtSaveData compared to ExtSaveData.
+             // ExtSaveData seems to return FS_NotFound (120) when the archive doesn't exist.
+diff --git a/src/core/file_sys/archive_extsavedata.h b/src/core/file_sys/archive_extsavedata.h
+index 6eb1d231a..3a0b4e8ee 100644
+--- a/src/core/file_sys/archive_extsavedata.h
++++ b/src/core/file_sys/archive_extsavedata.h
+@@ -29,7 +29,11 @@ enum class ExtSaveDataType {
+ /// File system interface to the ExtSaveData archive
+ class ArchiveFactory_ExtSaveData final : public ArchiveFactory, public ArticCacheProvider {
+ public:
+-    ArchiveFactory_ExtSaveData(const std::string& mount_point, ExtSaveDataType type_);
++    /// nand_container: extdata in the NAND's shared container (data/<id>/extdata/). Used for the
++    /// BOSS extdata of system modules on the NAND (the news module's SpotPass storage
++    /// 00048000/F0000009, 2026-10-17).
++    ArchiveFactory_ExtSaveData(const std::string& mount_point, ExtSaveDataType type_,
++                               bool nand_container = false);
+ 
+     std::string GetName() const override {
+         return "ExtSaveData";
+diff --git a/src/core/hle/service/fs/archive.cpp b/src/core/hle/service/fs/archive.cpp
+index bc1001283..bfa405de6 100644
+--- a/src/core/hle/service/fs/archive.cpp
++++ b/src/core/hle/service/fs/archive.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cstddef>
++#include <cstring>
+ #include <memory>
+ #include <system_error>
+ #include <type_traits>
+@@ -60,9 +61,18 @@ ResultVal<ArchiveHandle> ArchiveManager::OpenArchive(ArchiveIdCode id_code,
+     if (itr == id_code_map.end()) {
+         return FileSys::ResultNotFound;
+     }
++    ArchiveFactory* factory = itr->second.get();
++    if (id_code == ArchiveIdCode::BossExtSaveData && nand_boss_extsavedata &&
++        archive_path.GetType() == FileSys::LowPathType::Binary &&
++        archive_path.AsBinary().size() >= 4) {
++        u32 media_type;
++        std::memcpy(&media_type, archive_path.AsBinary().data(), sizeof(media_type));
++        if (media_type == static_cast<u32>(MediaType::NAND)) {
++            factory = nand_boss_extsavedata.get();
++        }
++    }
+ 
+-    CASCADE_RESULT(std::unique_ptr<ArchiveBackend> res,
+-                   itr->second->Open(archive_path, program_id));
++    CASCADE_RESULT(std::unique_ptr<ArchiveBackend> res, factory->Open(archive_path, program_id));
+ 
+     // This should never even happen in the first place with 64-bit handles,
+     while (handle_map.count(next_handle) != 0) {
+@@ -406,6 +416,8 @@ void ArchiveManager::RegisterArchiveTypes() {
+     auto bossextsavedata_factory = std::make_unique<FileSys::ArchiveFactory_ExtSaveData>(
+         sdmc_directory, FileSys::ExtSaveDataType::Boss);
+     RegisterArchiveType(std::move(bossextsavedata_factory), ArchiveIdCode::BossExtSaveData);
++    nand_boss_extsavedata = std::make_unique<FileSys::ArchiveFactory_ExtSaveData>(
++        nand_directory, FileSys::ExtSaveDataType::Boss, true);
+ 
+     auto nand_rw = std::make_unique<FileSys::ArchiveFactory_NAND>(nand_directory,
+                                                                   FileSys::NANDArchiveType::RW);
+diff --git a/src/core/hle/service/fs/archive.h b/src/core/hle/service/fs/archive.h
+index 03f641216..09ad7c4c9 100644
+--- a/src/core/hle/service/fs/archive.h
++++ b/src/core/hle/service/fs/archive.h
+@@ -337,6 +337,11 @@ private:
+      */
+     std::unordered_map<ArchiveIdCode, std::unique_ptr<ArchiveFactory>> id_code_map;
+ 
++    /// BOSS extdata on the NAND (media type NAND in the archive path): system modules' SpotPass
++    /// storage, e.g. the news module's 00048000/F0000009. The BossExtSaveData factory in
++    /// id_code_map is the SD card's.
++    std::unique_ptr<ArchiveFactory> nand_boss_extsavedata;
++
+     /**
+      * Map of active archive handles to archive objects
+      */
+-- 
+2.43.0
+
