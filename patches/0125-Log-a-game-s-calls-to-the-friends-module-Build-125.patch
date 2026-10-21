@@ -1,0 +1,88 @@
+From 0fb151dc126ab7a10d6cd983c92f6de40d906f0b Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 21 Oct 2026 23:24:52 +0200
+Subject: [PATCH] Log a game's calls to the friends module (Build 125)
+
+Animal Crossing: New Leaf: a friend's open gate didn't show in the visitor's
+list. The game publishes and reads "join me" through the real friends module
+(UpdateMyPresence, GetFriendPresence), and those calls weren't visible in the
+log. Calls between a game (program ID 00040000...) and the friends module,
+requests and replies, are now logged on Service.FRD Debug with up to 11
+parameter words (the whole join part of UpdateMyPresence).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/ipc.cpp | 23 +++++++++++++++++++----
+ 2 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index fc902f4f9..d136d6a71 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-124
++125
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 253ac2d85..8d6200d02 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -48,9 +48,15 @@ void LogFailedReply(const std::string& server, const std::string& client, u32 he
+ // SpotPass download can be followed (which game asked for what, what boss answered). With the
+ // online LLE modules boss logs nothing itself; before this, only failed replies were visible.
+ // Repeats of the same call are cut down (the first 20, then every 100th).
++// The same for a game's calls to the real friends module (frd:u), on Service.FRD Debug: how a
++// game publishes "join me" (UpdateMyPresence 0x001E: join availability, matchmake system,
++// gathering ID, game mode, owner, group) and reads its friends' (GetFriendPresence 0x0012).
++// Added 2026-10-21 for ACNL: a friend's open gate didn't show in the visitor's list.
+ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst,
+                         const std::array<u32, IPC::COMMAND_BUFFER_LENGTH>& cmd_buf,
+-                        std::size_t untranslated_size, std::size_t command_size, bool reply) {
++                        std::size_t untranslated_size, std::size_t command_size, bool reply,
++                        Common::Log::Class log_class = Common::Log::Class::Service_BOSS,
++                        std::size_t max_params = 4) {
+     static std::mutex mutex;
+     static std::map<std::tuple<std::string, std::string, u32, u32>, u64> counts;
+     const u32 header = cmd_buf[0];
+@@ -69,7 +75,7 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+     const auto level = ndm_boss && !reply && command <= 0x0004 ? Common::Log::Level::Info
+                                                                : Common::Log::Level::Debug;
+     if (reply) {
+-        LOG_GENERIC(Common::Log::Class::Service_BOSS, Common::Log::Level::Debug,
++        LOG_GENERIC(log_class, Common::Log::Level::Debug,
+                     "{} -> {}: reply to command 0x{:04X}: 0x{:08X}", src.GetName(), dst.GetName(),
+                     command, result);
+         return;
+@@ -97,10 +103,10 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+     }
+     // The first plain parameters (e.g. the ndm daemon masks and states, boss task options).
+     std::string params;
+-    for (std::size_t i = 1; i < untranslated_size && i <= 4; ++i) {
++    for (std::size_t i = 1; i < untranslated_size && i <= max_params; ++i) {
+         params += fmt::format("{}{:08X}", i == 1 ? " params " : " ", cmd_buf[i]);
+     }
+-    LOG_GENERIC(Common::Log::Class::Service_BOSS, level,
++    LOG_GENERIC(log_class, level,
+                 "{} -> {}: command 0x{:04X} (header 0x{:08X}){}{}{}", src.GetName(), dst.GetName(),
+                 command, header, task.empty() ? "" : " task ", task, params);
+ }
+@@ -155,6 +161,15 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+         LogBossCall(memory, *src_process, *dst_process, cmd_buf, untranslated_size, command_size,
+                     reply);
+     }
++    // A game (program ID 00040000...) and the friends module, both ways.
++    const auto is_game = [](const Process& process) {
++        return process.codeset && (process.codeset->program_id >> 32) == 0x00040000;
++    };
++    if ((dst_process->GetName() == "friends" && is_game(*src_process)) ||
++        (src_process->GetName() == "friends" && is_game(*dst_process))) {
++        LogBossCall(memory, *src_process, *dst_process, cmd_buf, untranslated_size, command_size,
++                    reply, Common::Log::Class::Service_FRD, 11);
++    }
+ 
+     const bool should_record = kernel.GetIPCRecorder().IsEnabled();
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,50 @@
+From 023a8ba53c8abd8c1284b2701f1942f90cd08cbb Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 19 Oct 2026 18:48:02 +0200
+Subject: [PATCH] httplib: no body after 304 Not Modified
+
+Every SpotPass file the server answered with 304 (not changed since the last download) failed
+after exactly 5 seconds with "Request failed: 4: Failed to read connection" (Hans: Badge
+Arcade data_v131.dat each start; Eric 18 Oct: EU_BGM1, news_v131.dat, dstdatList.bin,
+tournament, extdata). nginx sends the 304 without Content-Length on a kept-alive connection
+(the console asks for keep-alive), and httplib 0.14 then read the "body" until the connection
+closed, which only ended with its 5 s read timeout. 304 and 1xx answers have no body.
+
+Reproduced and checked with a keep-alive request to a server answering 304: before, error 4
+after 5.01 s; after, status 304 at once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                | 2 +-
+ externals/httplib/httplib.h | 7 ++++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 190a18037..fc902f4f9 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-123
++124
+diff --git a/externals/httplib/httplib.h b/externals/httplib/httplib.h
+index 4073afcab..716919964 100644
+--- a/externals/httplib/httplib.h
++++ b/externals/httplib/httplib.h
+@@ -7293,7 +7293,12 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
+   }
+ 
+   // Body
+-  if ((res.status != 204) && req.method != "HEAD" && req.method != "CONNECT") {
++  // Tangelo: 304 Not Modified (and 1xx) never carry a body. nginx sends a 304 without
++  // Content-Length on a kept-alive connection, so reading "until the connection closes" waited
++  // for the 5 s read timeout and turned every SpotPass "not modified" into Error::Read.
++  if ((res.status != 204) && (res.status != 304) &&
++      !(res.status >= 100 && res.status < 200) && req.method != "HEAD" &&
++      req.method != "CONNECT") {
+     auto redirect = 300 < res.status && res.status < 400 && follow_location_;
+ 
+     if (req.response_handler && !redirect) {
+-- 
+2.43.0
+
