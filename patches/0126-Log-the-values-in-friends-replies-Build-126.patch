@@ -1,0 +1,63 @@
+From d4ee2635e0029e613d5160888ba42e9b143fdb0e Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 21 Oct 2026 23:56:03 +0200
+Subject: [PATCH] Log the values in friends replies (Build 126)
+
+Build 125's log showed that Animal Crossing: New Leaf never publishes or
+reads presence for its visitor list: it asks GetFriendKeyList (0x0011) and
+the game server's friend notifications. Replies from the friends module to a
+game now show the words after the result, and GetFriendKeyList's reply lists
+the friends' PIDs, so it shows whether the host is in the visitor's list.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/ipc.cpp | 23 +++++++++++++++++++++--
+ 2 files changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index d136d6a71..0a3e7b042 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-125
++126
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 8d6200d02..0d0b436cb 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -75,9 +75,28 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+     const auto level = ndm_boss && !reply && command <= 0x0004 ? Common::Log::Level::Info
+                                                                : Common::Log::Level::Debug;
+     if (reply) {
++        // Friends replies: the words after the result too (e.g. GetFriendKeyList's count).
++        std::string values;
++        if (log_class == Common::Log::Class::Service_FRD) {
++            for (std::size_t i = 2; i < untranslated_size && i <= 6; ++i) {
++                values += fmt::format(" {:08X}", cmd_buf[i]);
++            }
++            // GetFriendKeyList: the friends' PIDs (FriendKey = u32 PID, u32, u64 friend code,
++            // in the reply's static buffer).
++            if (command == 0x0011 && untranslated_size >= 3 && untranslated_size + 1 < command_size &&
++                IPC::GetDescriptorType(cmd_buf[untranslated_size]) == IPC::StaticBuffer) {
++                const u32 count = std::min<u32>(cmd_buf[2], 16);
++                values += ", PIDs";
++                for (u32 k = 0; k < count; ++k) {
++                    u32 pid = 0;
++                    memory.ReadBlock(src, cmd_buf[untranslated_size + 1] + k * 16, &pid, 4);
++                    values += fmt::format(" {}", pid);
++                }
++            }
++        }
+         LOG_GENERIC(log_class, Common::Log::Level::Debug,
+-                    "{} -> {}: reply to command 0x{:04X}: 0x{:08X}", src.GetName(), dst.GetName(),
+-                    command, result);
++                    "{} -> {}: reply to command 0x{:04X}: 0x{:08X}{}{}", src.GetName(),
++                    dst.GetName(), command, result, values.empty() ? "" : ", then", values);
+         return;
+     }
+     // A task ID (up to 8 characters) in the request's first mapped buffer, e.g. StartTask,
+-- 
+2.43.0
+
