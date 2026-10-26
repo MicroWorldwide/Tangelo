@@ -1,0 +1,72 @@
+From 2cb4b76b611e22a5a59e970d327a04650b12f8e9 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 26 Oct 2026 18:42:26 +0100
+Subject: [PATCH] Collapse repeated unmapped-access log lines (Build 127)
+
+A game stuck reading a bad address (an error applet reading address 0,
+seen across the weekend game logs) logged the same "unmapped Read" line
+~175,000 times in a few seconds, making logs 20-40 MB. UnmappedAccess
+now shows the full message for the first few occurrences at one PC, then
+one summary line per 100,000 with the suppressed count; a different PC
+starts a fresh burst, so a genuine new fault is never hidden.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER        |  2 +-
+ src/core/memory.cpp | 25 ++++++++++++++++++++++++-
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 0a3e7b042..c75acbe2f 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-126
++127
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index c1dbbd00b..3edb75d07 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <array>
++#include <atomic>
+ #include <csignal>
+ #include <cstring>
+ #include <boost/serialization/array.hpp>
+@@ -576,7 +577,29 @@ void MemorySystem::UnmappedAccess(const VAddr vaddr, const T value, bool read) {
+         GDBStub::Break(SIGSEGV);
+     }
+ #endif
+-    LOG_ERROR(HW_Memory, "{}", message);
++    // A game stuck in a bad loop (e.g. an error applet reading address 0) can repeat the same
++    // unmapped access ~175,000 times in a few seconds, flooding the log and making it 20-40 MB
++    // (seen across the weekend game logs, 2026-10-26). The individual lines carry no extra
++    // information once the first few are out, so repeats of the same PC are collapsed: the full
++    // message for the first few, then one summary line per burst of REPORT_EVERY with how many
++    // were suppressed. A different PC starts a fresh burst, so a real new fault is never hidden.
++    {
++        static std::atomic<u32> last_pc{~0u};
++        static std::atomic<u64> run{0};
++        constexpr u64 SHOW_FIRST = 8;    // full lines before suppressing
++        constexpr u64 REPORT_EVERY = 100000;
++        const u32 pc = impl->GetPC();
++        if (last_pc.exchange(pc) != pc) {
++            run.store(0);
++        }
++        const u64 n = run.fetch_add(1);
++        if (n < SHOW_FIRST) {
++            LOG_ERROR(HW_Memory, "{}", message);
++        } else if ((n - SHOW_FIRST) % REPORT_EVERY == 0) {
++            LOG_ERROR(HW_Memory, "{} (repeated; {} suppressed so far at this PC)", message,
++                      n - SHOW_FIRST + 1);
++        }
++    }
+     if (Settings::values.enable_exception_handler) {
+         Core::LogException(impl->system, read ? Core::ExceptionType::UnmappedRead
+                                               : Core::ExceptionType::UnmappedWrite);
+-- 
+2.43.0
+
