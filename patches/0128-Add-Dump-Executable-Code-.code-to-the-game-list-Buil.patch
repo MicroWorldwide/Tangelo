@@ -1,0 +1,137 @@
+From d36afb17d2d5db83842232a840a2244b33400456 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Mon, 26 Oct 2026 19:19:47 +0100
+Subject: [PATCH] Add "Dump Executable Code (.code)" to the game list (Build
+ 128)
+
+Right-clicking a game now offers "Dump Executable Code (.code)", which
+writes the decrypted ExeFS .code section to <user>/dump/code/<title
+id>.code and opens the folder. The loader already decrypts with the
+console's own keys, so nothing secret leaves the machine. It is for
+reading a game's own constants (e.g. the NEX access key and game-server
+ID a custom server needs) without extra tools; use it on games that
+still have no game server (002-0110 in the services log). Qt frontend
+only (calls AppLoader::ReadCode).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER               |  2 +-
+ src/citra_qt/citra_qt.cpp  | 31 +++++++++++++++++++++++++++++++
+ src/citra_qt/citra_qt.h    |  1 +
+ src/citra_qt/game_list.cpp |  4 ++++
+ src/citra_qt/game_list.h   |  1 +
+ 5 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index c75acbe2f..a949a93df 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-127
++128
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index f9e6272ca..0ede08355 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -2278,6 +2278,7 @@ void GMainWindow::ConnectWidgetEvents() {
+             &GMainWindow::OnGameListRemovePlayTimeData);
+     connect(game_list, &GameList::CreateShortcut, this, &GMainWindow::OnGameListCreateShortcut);
+     connect(game_list, &GameList::DumpRomFSRequested, this, &GMainWindow::OnGameListDumpRomFS);
++    connect(game_list, &GameList::DumpCodeRequested, this, &GMainWindow::OnGameListDumpCode);
+     connect(game_list, &GameList::AddDirectory, this, &GMainWindow::OnGameListAddDirectory);
+     connect(game_list_placeholder, &GameListPlaceholder::AddDirectory, this,
+             &GMainWindow::OnGameListAddDirectory);
+@@ -3482,6 +3483,36 @@ void GMainWindow::OnGameListDumpRomFS(QString game_path, u64 program_id) {
+     future_watcher->setFuture(future);
+ }
+ 
++void GMainWindow::OnGameListDumpCode(QString game_path, u64 program_id) {
++    // Writes the game's decrypted executable (the ExeFS .code section) to
++    // <user>/dump/code/<title id>.code. The loader already decrypts it with the console's own
++    // keys, so nothing secret leaves the machine. Used to read a game's own constants (e.g. the
++    // NEX access key and game-server ID a custom server needs) without extra tools.
++    const auto dir = fmt::format("{}code", FileUtil::GetUserPath(FileUtil::UserPath::DumpDir));
++    FileUtil::CreateFullPath(dir + "/");
++    const auto target = fmt::format("{}/{:016X}.code", dir, program_id);
++
++    std::unique_ptr<Loader::AppLoader> loader = Loader::GetLoader(game_path.toStdString());
++    std::vector<u8> code;
++    if (!loader || loader->ReadCode(code) != Loader::ResultStatus::Success || code.empty()) {
++        QMessageBox::critical(
++            this, QStringLiteral("Tangelo"),
++            tr("Could not read the executable code.\nRefer to the log for details."));
++        return;
++    }
++
++    FileUtil::IOFile file(target, "wb");
++    if (!file.IsOpen() || file.WriteBytes(code.data(), code.size()) != code.size()) {
++        QMessageBox::critical(this, QStringLiteral("Tangelo"),
++                              tr("Could not write the executable code to %1.")
++                                  .arg(QString::fromStdString(target)));
++        return;
++    }
++    file.Close();
++    LOG_INFO(Frontend, "Dumped {} bytes of executable code to {}", code.size(), target);
++    QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(dir)));
++}
++
+ void GMainWindow::OnGameListOpenDirectory(const QString& directory) {
+     QString path;
+     if (directory == QStringLiteral("INSTALLED")) {
+diff --git a/src/citra_qt/citra_qt.h b/src/citra_qt/citra_qt.h
+index 5c6674562..e30d20dde 100644
+--- a/src/citra_qt/citra_qt.h
++++ b/src/citra_qt/citra_qt.h
+@@ -250,6 +250,7 @@ private slots:
+     void OnGameListCreateShortcut(u64 program_id, const std::string& game_path,
+                                   GameListShortcutTarget target);
+     void OnGameListDumpRomFS(QString game_path, u64 program_id);
++    void OnGameListDumpCode(QString game_path, u64 program_id);
+     void OnGameListOpenDirectory(const QString& directory);
+     void OnGameListAddDirectory();
+     void OnGameListShowList(bool show);
+diff --git a/src/citra_qt/game_list.cpp b/src/citra_qt/game_list.cpp
+index 1c8211fc5..ab0ea395b 100644
+--- a/src/citra_qt/game_list.cpp
++++ b/src/citra_qt/game_list.cpp
+@@ -681,6 +681,7 @@ void GameList::AddGamePopup(QMenu& context_menu, const QString& path, const QStr
+     QAction* open_mods_location = open_menu->addAction(tr("Mods Location"));
+ 
+     QAction* dump_romfs = context_menu.addAction(tr("Dump RomFS"));
++    QAction* dump_code = context_menu.addAction(tr("Dump Executable Code (.code)"));
+ 
+     QMenu* shader_menu = context_menu.addMenu(tr("Disk Shader Cache"));
+     QAction* open_shader_cache_location = shader_menu->addAction(tr("Open Shader Cache Location"));
+@@ -773,6 +774,7 @@ void GameList::AddGamePopup(QMenu& context_menu, const QString& path, const QStr
+     open_texture_load_location->setEnabled(is_application);
+     open_mods_location->setEnabled(is_application);
+     dump_romfs->setEnabled(is_application);
++    dump_code->setEnabled(is_application);
+ 
+ #ifdef ENABLE_OPENGL
+     delete_opengl_disk_shader_cache->setEnabled(opengl_cache_exists);
+@@ -844,6 +846,8 @@ void GameList::AddGamePopup(QMenu& context_menu, const QString& path, const QStr
+     });
+     connect(dump_romfs, &QAction::triggered, this,
+             [this, path, program_id] { emit DumpRomFSRequested(path, program_id); });
++    connect(dump_code, &QAction::triggered, this,
++            [this, path, program_id] { emit DumpCodeRequested(path, program_id); });
+     connect(remove_play_time_data, &QAction::triggered,
+             [this, program_id]() { emit RemovePlayTimeRequested(program_id); });
+ #ifdef ENABLE_DEVELOPER_OPTIONS
+diff --git a/src/citra_qt/game_list.h b/src/citra_qt/game_list.h
+index ef3477ca1..0ea867ba0 100644
+--- a/src/citra_qt/game_list.h
++++ b/src/citra_qt/game_list.h
+@@ -103,6 +103,7 @@ signals:
+     void RemovePlayTimeRequested(u64 program_id);
+     void OpenPerGameGeneralRequested(const QString file);
+     void DumpRomFSRequested(QString game_path, u64 program_id);
++    void DumpCodeRequested(QString game_path, u64 program_id);
+     void OpenDirectory(const QString& directory);
+     void AddDirectory();
+     void ShowList(bool show);
+-- 
+2.43.0
+

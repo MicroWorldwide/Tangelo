@@ -1,0 +1,119 @@
+From 354198b25d03509b4d51f627e5f67f5376b5a0e1 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 28 Oct 2026 21:20:00 +0100
+Subject: [PATCH] am: GetTicketList lists the titles that have a ticket (Build
+ 129)
+
+The eShop's "Redownloadable software" and "Downloaded titles" pages stayed
+at 0 after buying a game from the eShop stand-in, although NIM had
+imported its ticket into nand/dbs/ticket.db.
+
+The eShop builds both pages from am GetNumTickets + GetTicketList (title
+IDs with a ticket), leaves out what is installed, and only then asks the
+shop for the titles' names (ninja titles/id_pair, never requested). Our
+GetTicketList (from Citra/Azahar) had the ticket code under #ifdef
+todotodo and wrote the installed-title list instead, while GetNumTickets
+counted ticket files. So a bought title that isn't installed was never
+in the list, and the count and the list described different things.
+
+Both now use one list: every title with a ticket file first, then every
+installed title without one (so programs that look for an installed
+title's ticket still find it, as before), without duplicates.
+GetTicketList also honours its start index now.
+GetNumTickets logs both counts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RviaZPoa1UVijC76MwVyTM
+---
+ BUILD-NUMBER                   |  2 +-
+ src/core/hle/service/am/am.cpp | 56 ++++++++++++++++++++++------------
+ 2 files changed, 37 insertions(+), 21 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index a949a93..b0d7324 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-128
++129
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index 92efe1c..6edd1dd 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -3124,13 +3124,40 @@ void Module::Interface::DeleteTicket(Kernel::HLERequestContext& ctx) {
+     rb.Push(ResultSuccess);
+ }
+ 
++// The title IDs AM reports as "having a ticket" (GetNumTickets / GetTicketList): every title
++// with a ticket in nand/dbs/ticket.db, then every installed title without one. Installed titles
++// stay in the list as before (many are installed without a ticket in an emulator, and programs
++// that look for a title's ticket keep finding it); the real tickets are what was missing: the
++// eShop builds "Redownloadable software" (tickets minus installed titles) and "Downloaded
++// titles" from this list, so a bought title that isn't installed now never showed up.
++static std::vector<u64> TicketTitleIDs(const std::multimap<u64, u64>& tickets,
++                                       const std::array<std::vector<u64_le>, 3>& titles) {
++    std::vector<u64> ids;
++    std::set<u64> seen;
++    for (const auto& [title_id, ticket_id] : tickets) {
++        if (seen.insert(title_id).second) {
++            ids.push_back(title_id);
++        }
++    }
++    for (const auto& title_list : titles) {
++        for (const u64 title_id : title_list) {
++            if (seen.insert(title_id).second) {
++                ids.push_back(title_id);
++            }
++        }
++    }
++    return ids;
++}
++
+ void Module::Interface::GetNumTickets(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+-    LOG_DEBUG(Service_AM, "");
+-
+     std::scoped_lock lock(am->am_lists_mutex);
+-    u32 ticket_count = static_cast<u32>(am->am_ticket_list.size());
++    const auto ids = TicketTitleIDs(am->am_ticket_list, am->am_title_list);
++    u32 ticket_count = static_cast<u32>(ids.size());
++
++    LOG_DEBUG(Service_AM, "{} title(s) with a ticket ({} ticket file(s))", ticket_count,
++              am->am_ticket_list.size());
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 0);
+     rb.Push(ResultSuccess);
+@@ -3147,23 +3174,12 @@ void Module::Interface::GetTicketList(Kernel::HLERequestContext& ctx) {
+ 
+     u32 tickets_written = 0;
+     std::scoped_lock lock(am->am_lists_mutex);
+-#ifdef todotodo
+-    auto it = am->am_ticket_list.begin();
+-    std::advance(it, std::min(static_cast<size_t>(ticket_index), am->am_ticket_list.size()));
+-
+-    for (; it != am->am_ticket_list.end() && tickets_written < ticket_list_count;
+-         it++, tickets_written++) {
+-        ticket_tids_out.Write(&it->first, tickets_written * sizeof(u64), sizeof(u64));
+-    }
+-#else
+-    for (const auto& title_list : am->am_title_list) {
+-        const auto tickets_to_write =
+-            std::min(static_cast<u32>(title_list.size()), ticket_list_count - tickets_written);
+-        ticket_tids_out.Write(title_list.data(), tickets_written * sizeof(u64),
+-                              tickets_to_write * sizeof(u64));
+-        tickets_written += tickets_to_write;
+-    }
+-#endif
++    const auto ids = TicketTitleIDs(am->am_ticket_list, am->am_title_list);
++    for (std::size_t i = ticket_index; i < ids.size() && tickets_written < ticket_list_count;
++         i++, tickets_written++) {
++        const u64 title_id = ids[i];
++        ticket_tids_out.Write(&title_id, tickets_written * sizeof(u64), sizeof(u64));
++    }
+ 
+     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
+     rb.Push(ResultSuccess);
+-- 
+2.43.0
+
