@@ -1,0 +1,54 @@
+From 3d6f52a82ba06b73504de8a821601abe305e7df5 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Wed, 28 Oct 2026 23:26:46 +0100
+Subject: [PATCH] cecd: give a new box's OutBox index its empty header (Build
+ 130)
+
+With the built-in StreetPass service (online LLE modules off), Nintendogs +
+Cats registering StreetPass created its InBox and OutBox, then opened
+OutBox__/OBIndex_____ to read it. This HLE opens every file with create,
+so it made an empty file and answered size 0; the game then asked for the
+index again (SetData option 0) about 600 times and crashed (undefined
+instruction, stack overflow) before writing its MBoxInfo.
+
+An OutBox index that is empty when opened now gets the 8-byte header the
+real module writes: magic 'gg' (0x6767), 0 messages.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                       |  2 +-
+ src/core/hle/service/cecd/cecd.cpp | 10 ++++++++++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index b0d7324..fd03ab2 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-129
++130
+diff --git a/src/core/hle/service/cecd/cecd.cpp b/src/core/hle/service/cecd/cecd.cpp
+index b4d9189..8ae9e92 100644
+--- a/src/core/hle/service/cecd/cecd.cpp
++++ b/src/core/hle/service/cecd/cecd.cpp
+@@ -119,6 +119,16 @@ void Module::Interface::Open(Kernel::HLERequestContext& ctx) {
+             rb.Push<u32>(0); // No file size
+         } else {
+             session_data->file = std::move(file_result).Unwrap();
++            if (path_type == CecDataPathType::OutboxIndex && session_data->file->GetSize() == 0) {
++                // A new box's OutBox index: the file was only just created (this HLE opens
++                // every file with create). Give it the empty index header the real module
++                // writes ('gg', 0 messages); a game that reads 0 bytes here (Nintendogs + Cats)
++                // keeps asking for the index until it crashes.
++                const std::array<u8, sizeof(CecOBIndexHeader)> empty_index{0x67, 0x67};
++                session_data->file->Write(0, empty_index.size(), true, false,
++                                          empty_index.data());
++                LOG_INFO(Service_CECD, "New OutBox index for box {:08x}", ncch_program_id);
++            }
+             rb.Push(ResultSuccess);
+             rb.Push<u32>(static_cast<u32>(session_data->file->GetSize())); // Return file size
+         }
+-- 
+2.43.0
+
