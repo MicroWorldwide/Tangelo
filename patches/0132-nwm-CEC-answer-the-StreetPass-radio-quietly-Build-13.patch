@@ -1,0 +1,130 @@
+From 84ab87998783b709b7eac1e4e55a6b860cd1114b Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 29 Oct 2026 20:03:13 +0100
+Subject: [PATCH] nwm::CEC: answer the StreetPass radio quietly (Build 132)
+
+Once a game has StreetPass on (Nintendogs + Cats with 0131), the real
+StreetPass module keeps looking for 3DS consoles nearby through nwm::CEC,
+which Tangelo doesn't implement: about 1,060 "unknown / unimplemented
+function" lines in a short session (0x0002 846 times, 0x001D/0x000A/0x0006/
+0x001C about 50 each, SendProbeRequest and a few others).
+
+An emulator has no 3DS radio (StreetPass goes over the internet with
+NetPass), so every nwm::CEC command now gets the same reply as before
+(success, no data = nobody nearby) from a handler that logs each command
+once at info level and the rest at debug level.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                         |  2 +-
+ src/core/hle/service/nwm/nwm_cec.cpp | 58 +++++++++++++++++++++++++++-
+ src/core/hle/service/nwm/nwm_cec.h   |  3 ++
+ 3 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index a57f6ce..94361d4 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-131
++132
+diff --git a/src/core/hle/service/nwm/nwm_cec.cpp b/src/core/hle/service/nwm/nwm_cec.cpp
+index 3e446a9..a9d0f04 100644
+--- a/src/core/hle/service/nwm/nwm_cec.cpp
++++ b/src/core/hle/service/nwm/nwm_cec.cpp
+@@ -2,20 +2,76 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <array>
++#include <atomic>
+ #include "common/archives.h"
++#include "common/logging/log.h"
++#include "core/hle/ipc_helpers.h"
+ #include "core/hle/service/nwm/nwm_cec.h"
+ 
+ SERIALIZE_EXPORT_IMPL(Service::NWM::NWM_CEC)
+ 
+ namespace Service::NWM {
+ 
++// nwm::CEC is the radio half of StreetPass: the real StreetPass module (cecd) uses it to look
++// for 3DS consoles nearby. An emulator has no 3DS radio (StreetPass in Tangelo goes over the
++// internet with NetPass), so every command is answered as on a console with nobody around:
++// success and no data, as before, but logged once per command instead of on every poll (the
++// module polls 0x0002 hundreds of times a minute once a game has StreetPass on).
+ NWM_CEC::NWM_CEC() : ServiceFramework("nwm::CEC") {
+     static const FunctionInfo functions[] = {
+         // clang-format off
+-        {0x000D, nullptr, "SendProbeRequest"},
++        {0x0001, &NWM_CEC::NobodyNearby, "0x0001"},
++        {0x0002, &NWM_CEC::NobodyNearby, "0x0002 (poll)"},
++        {0x0003, &NWM_CEC::NobodyNearby, "0x0003"},
++        {0x0004, &NWM_CEC::NobodyNearby, "0x0004"},
++        {0x0005, &NWM_CEC::NobodyNearby, "0x0005"},
++        {0x0006, &NWM_CEC::NobodyNearby, "0x0006 (event handle)"},
++        {0x0007, &NWM_CEC::NobodyNearby, "0x0007"},
++        {0x0008, &NWM_CEC::NobodyNearby, "0x0008"},
++        {0x0009, &NWM_CEC::NobodyNearby, "0x0009"},
++        {0x000A, &NWM_CEC::NobodyNearby, "0x000A"},
++        {0x000B, &NWM_CEC::NobodyNearby, "0x000B"},
++        {0x000C, &NWM_CEC::NobodyNearby, "0x000C"},
++        {0x000D, &NWM_CEC::NobodyNearby, "SendProbeRequest"},
++        {0x000E, &NWM_CEC::NobodyNearby, "0x000E"},
++        {0x000F, &NWM_CEC::NobodyNearby, "0x000F"},
++        {0x0010, &NWM_CEC::NobodyNearby, "0x0010"},
++        {0x0011, &NWM_CEC::NobodyNearby, "0x0011"},
++        {0x0012, &NWM_CEC::NobodyNearby, "0x0012"},
++        {0x0013, &NWM_CEC::NobodyNearby, "0x0013"},
++        {0x0014, &NWM_CEC::NobodyNearby, "0x0014"},
++        {0x0015, &NWM_CEC::NobodyNearby, "0x0015"},
++        {0x0016, &NWM_CEC::NobodyNearby, "0x0016"},
++        {0x0017, &NWM_CEC::NobodyNearby, "0x0017"},
++        {0x0018, &NWM_CEC::NobodyNearby, "0x0018"},
++        {0x0019, &NWM_CEC::NobodyNearby, "0x0019"},
++        {0x001A, &NWM_CEC::NobodyNearby, "0x001A"},
++        {0x001B, &NWM_CEC::NobodyNearby, "0x001B"},
++        {0x001C, &NWM_CEC::NobodyNearby, "0x001C"},
++        {0x001D, &NWM_CEC::NobodyNearby, "0x001D"},
++        {0x001E, &NWM_CEC::NobodyNearby, "0x001E"},
++        {0x001F, &NWM_CEC::NobodyNearby, "0x001F"},
+         // clang-format on
+     };
+     RegisterHandlers(functions);
+ }
+ 
++void NWM_CEC::NobodyNearby(Kernel::HLERequestContext& ctx) {
++    const u32 command = ctx.CommandHeader().command_id.Value();
++    static std::array<std::atomic<bool>, 0x20> logged{};
++    if (command < logged.size() && !logged[command].exchange(true)) {
++        LOG_INFO(Service_NWM,
++                 "nwm::CEC command 0x{:04X} (StreetPass radio): answered as nobody nearby; "
++                 "further calls are logged at debug level",
++                 command);
++    } else {
++        LOG_DEBUG(Service_NWM, "nwm::CEC command 0x{:04X}", command);
++    }
++    // Same reply as before (success, no data), which the StreetPass module takes as an empty
++    // scan.
++    IPC::RequestBuilder rb(ctx, 1, 0);
++    rb.Push(ResultSuccess);
++}
++
+ } // namespace Service::NWM
+diff --git a/src/core/hle/service/nwm/nwm_cec.h b/src/core/hle/service/nwm/nwm_cec.h
+index 8b4c7f9..409ea68 100644
+--- a/src/core/hle/service/nwm/nwm_cec.h
++++ b/src/core/hle/service/nwm/nwm_cec.h
+@@ -13,6 +13,9 @@ public:
+     NWM_CEC();
+ 
+ private:
++    /// Answers a local-wireless StreetPass command the way a 3DS with nobody nearby would.
++    void NobodyNearby(Kernel::HLERequestContext& ctx);
++
+     SERVICE_SERIALIZATION_SIMPLE
+ };
+ 
+-- 
+2.43.0
+

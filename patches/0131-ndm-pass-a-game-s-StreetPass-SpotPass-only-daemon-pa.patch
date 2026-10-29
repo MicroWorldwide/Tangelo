@@ -1,0 +1,54 @@
+From f49b7004b3de5319d88ab5721acb0ca315712fc6 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 29 Oct 2026 19:09:27 +0100
+Subject: [PATCH] ndm: pass a game's StreetPass/SpotPass-only daemon pause on
+ unchanged (Build 131)
+
+Nintendogs + Cats with the online LLE modules on said "StreetPass cannot be
+activated" for the photo, message and present, although its StreetPass box
+(00030b00) was complete. Before it touches its box the game asks NDM to
+pause StreetPass only (ndm:u SuspendDaemons, mask 0x1). Since 0111 Tangelo
+strips the StreetPass and SpotPass bits from a game's pause, which left mask
+0; the real NDM refuses that (0xD8E06BED) and the game gives up.
+
+A pause or resume whose mask has nothing but the StreetPass/SpotPass bits now
+goes to NDM unchanged; requests that also pause other daemons are still cut
+down as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                | 2 +-
+ src/core/hle/kernel/ipc.cpp | 6 +++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index fd03ab2..a57f6ce 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-130
++131
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 0d0b436..1842dfc 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -163,10 +163,14 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+     // let them run again. Started from the game list there's neither, so SpotPass and StreetPass
+     // never run in the background. A game's request keeps pausing nim only; its matching
+     // ResumeDaemons (0x0007) is cut down the same way so NDM's pause counts stay balanced.
++    // A request for StreetPass and/or SpotPass only is passed on unchanged: the real NDM refuses
++    // an empty mask (0xD8E06BED), and a game that pauses just StreetPass (Nintendogs + Cats, mask
++    // 0x1) does so while it sets up or edits its own StreetPass box, then resumes it; with the
++    // refusal it reported "StreetPass cannot be activated" (2026-10-29).
+     if (!reply && dst_process->GetName() == "ndm" &&
+         (header.raw == 0x00060040 || header.raw == 0x00070040) &&
+         src_process->codeset && (src_process->codeset->program_id >> 32) == 0x00040000 &&
+-        (cmd_buf[1] & 0x3) != 0) {
++        (cmd_buf[1] & 0x3) != 0 && (cmd_buf[1] & ~0x3u) != 0) {
+         LOG_INFO(Service_BOSS,
+                  "{} asks NDM to {} background daemons 0x{:X}: leaving SpotPass and "
+                  "StreetPass running (0x{:X})",
+-- 
+2.43.0
+

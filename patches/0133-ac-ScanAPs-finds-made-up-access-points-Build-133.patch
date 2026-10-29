@@ -1,0 +1,250 @@
+From fba5a8287f62b5da375a5fe8f4fd9b5c563d294d Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 29 Oct 2026 20:04:14 +0100
+Subject: [PATCH] ac: ScanAPs finds made-up access points (Build 133)
+
+The Denpa Men 2 (and other games that collect what they find around them)
+scan for Wi-Fi access points with ac:u ScanAPs (0x001D), which Tangelo left
+unimplemented, so they never found anything.
+
+ScanAPs now answers with access points in the GetCurrentAPInfo layout
+(0x34 each: SSID length, SSID, BSSID at 0x24, channel at 0x2C, signal at
+0x2E) and their number in word 2. Field use from Denpa Men 2's code: it
+makes its Denpa Men from the BSSID, skips one whose signal byte is below
+0xA0 and skips locally administered BSSIDs.
+
+The list comes from <sysdata>/access_points.txt when it exists (one per
+line: SSID;BSSID[;signal], '#' comments). Without it there are 8 made-up
+ones with real router vendor prefixes, the same all day and new the next
+day, as for a console carried around.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                     |   2 +-
+ src/core/hle/service/ac/ac.cpp   | 129 +++++++++++++++++++++++++++++++
+ src/core/hle/service/ac/ac.h     |  14 ++++
+ src/core/hle/service/ac/ac_i.cpp |   2 +-
+ src/core/hle/service/ac/ac_u.cpp |   2 +-
+ 5 files changed, 146 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 94361d4..6a4573e 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-132
++133
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 9d08dac..0cdc490 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -4,11 +4,18 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cctype>
++#include <cstdlib>
+ #include <cstring>
++#include <ctime>
++#include <fstream>
++#include <string>
+ #include <string_view>
+ #include <vector>
++#include <fmt/format.h>
+ #include "common/archives.h"
+ #include "common/common_types.h"
++#include "common/file_util.h"
+ #include "common/logging/log.h"
+ #include "common/settings.h"
+ #include "core/core.h"
+@@ -36,6 +43,93 @@ constexpr std::string_view NintendoZoneSSID = "NintendoSpotPass1";
+ bool IsNintendoZoneMode() {
+     return Settings::values.nintendo_zone_mode.GetValue();
+ }
++
++/// One access point as ScanAPs reports it (0x34 bytes, the GetCurrentAPInfo layout):
++/// 0x00 u32 SSID length, 0x04 SSID (32 bytes), 0x24 BSSID (6 bytes), 0x2C u16 channel,
++/// 0x2E u8 signal strength, 0x2F u8 unknown (kept 0). Field use seen in The Denpa Men 2
++/// (00040000000EAF00): it makes its Denpa Men from the BSSID, skips an access point whose
++/// signal byte is below its threshold (0xA0), and skips a locally administered BSSID
++/// (first byte bit 1).
++struct ScannedAP {
++    std::string ssid;
++    std::array<u8, 6> bssid{};
++    u8 channel = 1;
++    u8 signal = 0xE0;
++};
++
++/// Real vendor prefixes (OUIs) for the made-up access points, so their BSSIDs look like
++/// ordinary routers (universally administered: games skip locally administered ones).
++constexpr std::array<std::array<u8, 3>, 8> VendorPrefixes{{
++    {0x00, 0x1D, 0x7E}, {0x00, 0x24, 0x01}, {0x00, 0x1F, 0x33}, {0xC8, 0x3A, 0x35},
++    {0x00, 0x14, 0xBF}, {0x00, 0x26, 0x5A}, {0x00, 0x1E, 0x58}, {0x00, 0x0F, 0xB5},
++}};
++
++/// The access points ScanAPs finds. From <sysdata>/access_points.txt when it exists, one per
++/// line "SSID;BSSID[;signal]" (BSSID as 6 hex bytes, ':' or '-' between them allowed; '#'
++/// starts a comment). Otherwise 8 made-up ones that change every day, so a game that collects
++/// them (The Denpa Men) finds new ones each day as on a console carried around.
++std::vector<ScannedAP> AccessPointsAround() {
++    std::vector<ScannedAP> found;
++    const std::string path =
++        FileUtil::GetUserPath(FileUtil::UserPath::SysDataDir) + "access_points.txt";
++    std::ifstream file(path);
++    std::string line;
++    while (file && std::getline(file, line) && found.size() < 32) {
++        if (line.empty() || line[0] == '#') {
++            continue;
++        }
++        const auto first = line.find(';');
++        if (first == std::string::npos) {
++            continue;
++        }
++        ScannedAP ap;
++        ap.ssid = line.substr(0, std::min<std::size_t>(first, 32));
++        const auto second = line.find(';', first + 1);
++        std::string mac = line.substr(first + 1, second == std::string::npos
++                                                     ? std::string::npos
++                                                     : second - first - 1);
++        std::string hex;
++        for (char c : mac) {
++            if (std::isxdigit(static_cast<unsigned char>(c))) {
++                hex.push_back(c);
++            }
++        }
++        if (hex.size() != 12) {
++            continue;
++        }
++        for (std::size_t i = 0; i < 6; ++i) {
++            ap.bssid[i] = static_cast<u8>(std::stoul(hex.substr(i * 2, 2), nullptr, 16));
++        }
++        if (second != std::string::npos) {
++            ap.signal = static_cast<u8>(std::clamp(std::atoi(line.c_str() + second + 1), 0, 255));
++        }
++        ap.channel = static_cast<u8>(1 + (found.size() * 5) % 11);
++        found.push_back(std::move(ap));
++    }
++    if (!found.empty()) {
++        return found;
++    }
++
++    // No list: 8 made-up access points, the same all day and different the next day.
++    const std::time_t now = std::time(nullptr);
++    const std::tm* local = std::localtime(&now);
++    u32 seed = static_cast<u32>((local->tm_year + 1900) * 10000 + (local->tm_mon + 1) * 100 +
++                                local->tm_mday);
++    const auto next = [&seed] {
++        seed = seed * 1103515245u + 12345u;
++        return static_cast<u8>(seed >> 16);
++    };
++    for (int i = 0; i < 8; ++i) {
++        ScannedAP ap;
++        const auto& vendor = VendorPrefixes[next() % VendorPrefixes.size()];
++        ap.bssid = {vendor[0], vendor[1], vendor[2], next(), next(), next()};
++        ap.ssid = fmt::format("Tangelo-{:02X}{:02X}", ap.bssid[4], ap.bssid[5]);
++        ap.channel = static_cast<u8>(1 + (i * 5) % 11);
++        ap.signal = static_cast<u8>(0xB0 + next() % 0x50);
++        found.push_back(std::move(ap));
++    }
++    return found;
++}
+ } // namespace
+ 
+ void Module::Interface::CreateDefaultConfig(Kernel::HLERequestContext& ctx) {
+@@ -410,6 +504,41 @@ void Module::Interface::GetCurrentAPInfo(Kernel::HLERequestContext& ctx) {
+               ac->ac_connected, IsNintendoZoneMode());
+ }
+ 
++void Module::Interface::ScanAPs(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 size = rp.Pop<u32>();
++    rp.PopPID();
++
++    constexpr std::size_t APInfoSize = 0x34;
++    const auto around = AccessPointsAround();
++    const std::size_t count = std::min(around.size(), static_cast<std::size_t>(size / APInfoSize));
++    std::vector<u8> buffer(size, 0);
++    for (std::size_t i = 0; i < count; ++i) {
++        const ScannedAP& ap = around[i];
++        u8* entry = buffer.data() + i * APInfoSize;
++        const u32 ssid_length = static_cast<u32>(std::min<std::size_t>(ap.ssid.size(), 32));
++        std::memcpy(entry, &ssid_length, sizeof(ssid_length));
++        std::memcpy(entry + 0x4, ap.ssid.data(), ssid_length);
++        std::memcpy(entry + 0x24, ap.bssid.data(), ap.bssid.size());
++        const u16 channel = ap.channel;
++        std::memcpy(entry + 0x2C, &channel, sizeof(channel));
++        entry[0x2E] = ap.signal;
++    }
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
++    rb.Push(ResultSuccess);
++    rb.Push<u32>(static_cast<u32>(count));
++    rb.PushStaticBuffer(std::move(buffer), 0);
++
++    LOG_INFO(Service_AC, "ScanAPs: {} access point(s) around (buffer for {})", count,
++             size / APInfoSize);
++    for (std::size_t i = 0; i < count; ++i) {
++        const auto& b = around[i].bssid;
++        LOG_DEBUG(Service_AC, "  {} {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} signal {}",
++                  around[i].ssid, b[0], b[1], b[2], b[3], b[4], b[5], around[i].signal);
++    }
++}
++
+ void Module::Interface::GetNZoneApNumService(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u32 size = rp.Pop<u32>();
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index e6c1497..fd4abea 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -249,6 +249,20 @@ public:
+          */
+         void GetCurrentAPInfo(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::ScanAPs service function (0x001D)
++         *  Inputs:
++         *      1 : Size of the output buffer (count x 0x34)
++         *      2 : ProcessID header (0x20)
++         *      3 : ProcessID
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2 : Number of access points found
++         *      3-4 : Static buffer (id 0) with the AP info structures (same layout as
++         *            GetCurrentAPInfo)
++         */
++        void ScanAPs(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::GetNZoneApNumService service function (0x0011)
+          *  Inputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index 7d6d785..9f3d1c0 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -27,7 +27,7 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x0014, &AC_I::GetConnectingLocation, "GetConnectingLocation"},
+         {0x0019, &AC_I::CloseAllAsync, "CloseAllAsync"},
+         {0x001A, &AC_I::GetCloseResult, "GetCloseAllResult"},
+-        {0x001D, nullptr, "ScanAPs"},
++        {0x001D, &AC_I::ScanAPs, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0025, &AC_I::SetNetworkArea, "SetNetworkArea"},
+         {0x0026, &AC_I::SetInfraPriority, "SetInfraPriority"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 9bb74a8..0b39c0b 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -27,7 +27,7 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x0014, &AC_U::GetConnectingLocation, "GetConnectingLocation"},
+         {0x0019, &AC_U::CloseAllAsync, "CloseAllAsync"},
+         {0x001A, &AC_U::GetCloseResult, "GetCloseAllResult"},
+-        {0x001D, nullptr, "ScanAPs"},
++        {0x001D, &AC_U::ScanAPs, "ScanAPs"},
+         {0x0024, nullptr, "AddDenyApType"},
+         {0x0025, &AC_U::SetNetworkArea, "SetNetworkArea"},
+         {0x0026, &AC_U::SetInfraPriority, "SetInfraPriority"},
+-- 
+2.43.0
+
