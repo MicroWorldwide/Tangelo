@@ -1,0 +1,1218 @@
+From ec9cbad32a087b243d8d4b02c661c13974758a8f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 29 Oct 2026 21:35:42 +0100
+Subject: [PATCH] ZipPass: StreetPass Games overview (Build 136)
+
+ZipPass > StreetPass Games... shows every game's StreetPass box without
+starting System Settings: game name and icon (from the game list, found
+through sysdata/cecIds.txt or the box's title ID), StreetPass ID, inbox
+and outbox counts (with ZipPass messages still waiting for room), last
+opened, last received, and a status that points out half-made boxes
+(missing MBoxInfo, inbox or outbox, a folder not in MBoxList, or a
+listed box without a folder).
+
+Per game: a Share tick, Open Box Folder (also on double-click), Empty
+Inbox and Remove StreetPass Data (folder deleted and taken out of
+MBoxList____, like System Settings does). For the whole folder: Open CEC
+Folder and Zip CEC Folder (every file and folder, under CEC/ in the
+zip). Viewing works while a game runs; emptying and removing only when
+no game is running.
+
+Unticked games are kept on this console: <user>/zippass/not_shared.txt
+lists them, and ZipPass export now leaves them out. The built-in NetPass
+client will use the same list.
+
+Core: listStreetPassBoxes, clearStreetPassInbox, removeStreetPassBox,
+zipStreetPassFolder, isStreetPassShared/setStreetPassShared in
+zip_pass.cpp (under the ZipPass lock), with tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                         |   2 +-
+ src/citra_qt/CMakeLists.txt          |   2 +
+ src/citra_qt/citra_qt.cpp            |  19 ++
+ src/citra_qt/citra_qt.h              |   1 +
+ src/citra_qt/game_list.cpp           |  22 ++
+ src/citra_qt/game_list.h             |  10 +
+ src/citra_qt/main.ui                 |   7 +
+ src/citra_qt/streetpass_overview.cpp | 341 ++++++++++++++++++++++++++
+ src/citra_qt/streetpass_overview.h   |  60 +++++
+ src/core/zip_pass.cpp                | 350 +++++++++++++++++++++++++++
+ src/core/zip_pass.h                  |  54 +++++
+ src/tests/core/zip_pass.cpp          | 123 ++++++++++
+ 12 files changed, 990 insertions(+), 1 deletion(-)
+ create mode 100644 src/citra_qt/streetpass_overview.cpp
+ create mode 100644 src/citra_qt/streetpass_overview.h
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index c8b255f..7296f25 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-135
++136
+diff --git a/src/citra_qt/CMakeLists.txt b/src/citra_qt/CMakeLists.txt
+index 6689315..1af22d0 100644
+--- a/src/citra_qt/CMakeLists.txt
++++ b/src/citra_qt/CMakeLists.txt
+@@ -187,6 +187,8 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
+     qt_image_interface.cpp
+     qt_image_interface.h
+     setting_qkeys.h
++    streetpass_overview.cpp
++    streetpass_overview.h
+     uisettings.cpp
+     uisettings.h
+     user_data_migration.cpp
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index cbd111f..f3591ea 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -69,6 +69,7 @@
+ #endif
+ #include "citra_qt/dumping/dumping_dialog.h"
+ #include "citra_qt/game_list.h"
++#include "citra_qt/streetpass_overview.h"
+ #include "citra_qt/hotkeys.h"
+ #include "citra_qt/loading_screen.h"
+ #include "citra_qt/movie/movie_play_dialog.h"
+@@ -2344,6 +2345,7 @@ void GMainWindow::ConnectMenuEvents() {
+     connect_menu(ui->action_Export_ZipPass, &GMainWindow::OnExportZipPass);
+     connect_menu(ui->action_Import_ZipPass, &GMainWindow::OnImportZipPass);
+     connect_menu(ui->action_Clear_StreetPass_Config, &GMainWindow::OnClearStreetPassConfig);
++    connect_menu(ui->action_StreetPass_Games, &GMainWindow::OnStreetPassGames);
+     connect_menu(ui->action_Previous_Amiibo, &GMainWindow::OnPreviousAmiibo);
+     connect_menu(ui->action_Load_Amiibo, &GMainWindow::OnLoadAmiibo);
+     connect_menu(ui->action_Remove_Amiibo, &GMainWindow::OnRemoveAmiibo);
+@@ -4508,6 +4510,23 @@ void GMainWindow::OnExportZipPass() {
+ 	}
+ }
+ 
++void GMainWindow::OnStreetPassGames() {
++    // The game list's names and icons, looked up by title ID (the window tries the games seen
++    // writing to a box first, then the box owner's title ID).
++    auto titles = std::make_shared<std::map<u64, GameList::TitleEntry>>(game_list->GetTitles());
++    StreetPassOverview dialog(
++        this,
++        [titles](u64 title_id) -> StreetPassOverview::GameInfo {
++            const auto it = titles->find(title_id);
++            if (it == titles->end()) {
++                return {};
++            }
++            return {it->second.name, it->second.icon};
++        },
++        emulation_running);
++    dialog.exec();
++}
++
+ void GMainWindow::OnClearStreetPassConfig() {
+ 	Core::clearStreetPassConfig();
+ 	
+diff --git a/src/citra_qt/citra_qt.h b/src/citra_qt/citra_qt.h
+index 393d8fd..b95f918 100644
+--- a/src/citra_qt/citra_qt.h
++++ b/src/citra_qt/citra_qt.h
+@@ -277,6 +277,7 @@ private slots:
+     void OnExportZipPass();
+     void OnImportZipPass();
+     void OnClearStreetPassConfig();
++    void OnStreetPassGames();
+     void OnLoadAmiibo();
+     void OnRemoveAmiibo();
+     void OnOpenCitraFolder();
+diff --git a/src/citra_qt/game_list.cpp b/src/citra_qt/game_list.cpp
+index ab0ea39..7060c3a 100644
+--- a/src/citra_qt/game_list.cpp
++++ b/src/citra_qt/game_list.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
++#include <functional>
+ #include <QActionGroup>
+ #include <QApplication>
+ #include <QDir>
+@@ -1223,6 +1224,27 @@ void GameList::RemoveFavorite(u64 program_id) {
+     }
+ }
+ 
++std::map<u64, GameList::TitleEntry> GameList::GetTitles() const {
++    std::map<u64, TitleEntry> titles;
++    std::function<void(const QStandardItem*)> walk = [&](const QStandardItem* item) {
++        if (item == nullptr) {
++            return;
++        }
++        if (item->type() == static_cast<int>(GameListItemType::Game)) {
++            const u64 program_id = item->data(GameListItemPath::ProgramIdRole).toULongLong();
++            if (!titles.contains(program_id)) {
++                titles[program_id] = {item->data(GameListItemPath::TitleRole).toString(),
++                                      item->icon()};
++            }
++        }
++        for (int row = 0; row < item->rowCount(); ++row) {
++            walk(item->child(row, 0));
++        }
++    };
++    walk(item_model->invisibleRootItem());
++    return titles;
++}
++
+ QString GameList::FindGameByProgramID(u64 program_id, int role) {
+     return FindGameByProgramID(item_model->invisibleRootItem(), program_id, role);
+ }
+diff --git a/src/citra_qt/game_list.h b/src/citra_qt/game_list.h
+index 0ea867b..ed3063a 100644
+--- a/src/citra_qt/game_list.h
++++ b/src/citra_qt/game_list.h
+@@ -4,8 +4,11 @@
+ 
+ #pragma once
+ 
++#include <map>
++
+ #include <QMenu>
+ #include <QPushButton>
++#include <QIcon>
+ #include <QString>
+ #include <QVector>
+ #include <QWidget>
+@@ -86,6 +89,13 @@ public:
+ 
+     QString FindGameByProgramID(u64 program_id, int role);
+ 
++    struct TitleEntry {
++        QString name;
++        QIcon icon;
++    };
++    /// Name and icon of every game in the list (installed and in the game folders) by title ID.
++    std::map<u64, TitleEntry> GetTitles() const;
++
+     void RefreshGameDirectory();
+ 
+     void ToggleFavorite(u64 program_id);
+diff --git a/src/citra_qt/main.ui b/src/citra_qt/main.ui
+index cbcb9d6..e97f3e1 100644
+--- a/src/citra_qt/main.ui
++++ b/src/citra_qt/main.ui
+@@ -86,6 +86,8 @@
+      <property name="title">
+       <string>ZipPass</string>
+      </property>
++     <addaction name="action_StreetPass_Games"/>
++     <addaction name="separator"/>
+      <addaction name="action_Export_ZipPass"/>
+      <addaction name="action_Import_ZipPass"/>
+      <addaction name="action_Clear_StreetPass_Config"/>
+@@ -890,6 +892,11 @@
+     <string>Import ZipPass Data</string>
+    </property>
+   </action>
++  <action name="action_StreetPass_Games">
++   <property name="text">
++    <string>StreetPass Games...</string>
++   </property>
++  </action>
+   <action name="action_Clear_StreetPass_Config">
+    <property name="text">
+     <string>Clear StreetPass Configuration</string>
+diff --git a/src/citra_qt/streetpass_overview.cpp b/src/citra_qt/streetpass_overview.cpp
+new file mode 100644
+index 0000000..256efd3
+--- /dev/null
++++ b/src/citra_qt/streetpass_overview.cpp
+@@ -0,0 +1,341 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv3 or any later version
++// Refer to the LICENSE.txt file included.
++
++#include <cstdlib>
++#include <QColor>
++#include <QDateTime>
++#include <QDesktopServices>
++#include <QDialogButtonBox>
++#include <QFileDialog>
++#include <QHBoxLayout>
++#include <QHeaderView>
++#include <QLabel>
++#include <QMessageBox>
++#include <QPushButton>
++#include <QTreeWidget>
++#include <QUrl>
++#include <QVBoxLayout>
++#include <fmt/format.h>
++#include "citra_qt/streetpass_overview.h"
++#include "common/file_util.h"
++#include "core/zip_pass.h"
++
++namespace {
++
++enum Column {
++    ColumnShared,
++    ColumnGame,
++    ColumnCecId,
++    ColumnInbox,
++    ColumnOutbox,
++    ColumnLastOpened,
++    ColumnLastReceived,
++    ColumnStatus,
++    ColumnCount,
++};
++
++constexpr int CecIdRole = Qt::UserRole + 1;
++
++QString StatusText(const Core::StreetPassBox& box) {
++    if (box.IsComplete()) {
++        return QObject::tr("Set up");
++    }
++    if (!box.has_folder) {
++        return QObject::tr("Listed, but the box folder is missing");
++    }
++    QStringList missing;
++    if (!box.in_box_list) {
++        missing << QObject::tr("not in MBoxList");
++    }
++    if (!box.has_box_info) {
++        missing << QStringLiteral("MBoxInfo");
++    }
++    if (!box.has_inbox) {
++        missing << QObject::tr("inbox");
++    }
++    if (!box.has_outbox) {
++        missing << QObject::tr("outbox");
++    }
++    return QObject::tr("Incomplete: %1").arg(missing.join(QStringLiteral(", ")));
++}
++
++QString Count(bool present, u32 messages, u32 max) {
++    if (!present) {
++        return QStringLiteral("–");
++    }
++    return max != 0 ? QStringLiteral("%1 / %2").arg(messages).arg(max) : QString::number(messages);
++}
++
++} // namespace
++
++StreetPassOverview::StreetPassOverview(QWidget* parent, GameLookup lookup_, bool game_running_)
++    : QDialog(parent), lookup(std::move(lookup_)), game_running(game_running_) {
++    setWindowTitle(tr("StreetPass Games"));
++    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
++    resize(980, 460);
++
++    auto* intro = new QLabel(
++        tr("Every game that has set up StreetPass on this console. Untick a game to keep its "
++           "StreetPass on this console: it is left out of ZipPass exports (and later out of "
++           "NetPass). Double-click a game to open its box folder."));
++    intro->setWordWrap(true);
++
++    tree = new QTreeWidget;
++    tree->setColumnCount(ColumnCount);
++    tree->setHeaderLabels({tr("Share"), tr("Game"), tr("StreetPass ID"), tr("Inbox"),
++                           tr("Outbox"), tr("Last opened"), tr("Last received"), tr("Status")});
++    tree->setRootIsDecorated(false);
++    tree->setUniformRowHeights(true);
++    tree->setSortingEnabled(true);
++    tree->setIconSize(QSize(24, 24));
++    tree->header()->setStretchLastSection(true);
++
++    summary = new QLabel;
++    summary->setWordWrap(true);
++
++    open_button = new QPushButton(tr("Open Box Folder"));
++    empty_button = new QPushButton(tr("Empty Inbox..."));
++    remove_button = new QPushButton(tr("Remove StreetPass Data..."));
++    auto* cec_button = new QPushButton(tr("Open CEC Folder"));
++    auto* zip_button = new QPushButton(tr("Zip CEC Folder..."));
++    auto* refresh_button = new QPushButton(tr("Refresh"));
++
++    auto* box_buttons = new QHBoxLayout;
++    box_buttons->addWidget(open_button);
++    box_buttons->addWidget(empty_button);
++    box_buttons->addWidget(remove_button);
++    box_buttons->addStretch();
++    box_buttons->addWidget(cec_button);
++    box_buttons->addWidget(zip_button);
++    box_buttons->addWidget(refresh_button);
++
++    auto* close = new QDialogButtonBox(QDialogButtonBox::Close);
++
++    auto* layout = new QVBoxLayout(this);
++    layout->addWidget(intro);
++    layout->addWidget(tree, 1);
++    layout->addWidget(summary);
++    layout->addLayout(box_buttons);
++    layout->addWidget(close);
++
++    connect(close, &QDialogButtonBox::rejected, this, &QDialog::reject);
++    connect(tree, &QTreeWidget::itemChanged, this, &StreetPassOverview::OnItemChanged);
++    connect(tree, &QTreeWidget::itemSelectionChanged, this, &StreetPassOverview::UpdateButtons);
++    connect(tree, &QTreeWidget::itemDoubleClicked, this,
++            [this](QTreeWidgetItem*, int column) {
++                if (column != ColumnShared) {
++                    OpenSelectedFolder();
++                }
++            });
++    connect(open_button, &QPushButton::clicked, this, &StreetPassOverview::OpenSelectedFolder);
++    connect(empty_button, &QPushButton::clicked, this, &StreetPassOverview::EmptySelectedInbox);
++    connect(remove_button, &QPushButton::clicked, this, &StreetPassOverview::RemoveSelectedBox);
++    connect(cec_button, &QPushButton::clicked, this, &StreetPassOverview::OpenCecFolder);
++    connect(zip_button, &QPushButton::clicked, this, &StreetPassOverview::ZipCecFolder);
++    connect(refresh_button, &QPushButton::clicked, this, &StreetPassOverview::Refresh);
++
++    Refresh();
++}
++
++StreetPassOverview::GameInfo StreetPassOverview::FindGame(const Core::StreetPassBox& box) const {
++    if (!lookup) {
++        return {};
++    }
++    // Games seen writing to the box first, then the usual title ID forms of the box owner.
++    std::vector<u64> candidates = box.title_ids;
++    const u32 cec = static_cast<u32>(std::strtoul(box.cec_id.c_str(), nullptr, 16));
++    for (const u32 low : {box.program_id, cec}) {
++        if (low != 0) {
++            candidates.push_back(0x0004000000000000ULL | low);
++        }
++    }
++    for (const u64 title_id : candidates) {
++        GameInfo info = lookup(title_id);
++        if (!info.name.isEmpty()) {
++            return info;
++        }
++    }
++    return {};
++}
++
++void StreetPassOverview::Refresh() {
++    const QString selected = SelectedCecId();
++    filling = true;
++    tree->setSortingEnabled(false);
++    tree->clear();
++
++    const auto boxes = Core::listStreetPassBoxes();
++    int complete = 0;
++    int shared = 0;
++    for (const auto& box : boxes) {
++        const GameInfo game = FindGame(box);
++        auto* item = new QTreeWidgetItem;
++        const QString cec_id = QString::fromStdString(box.cec_id);
++        item->setData(ColumnShared, CecIdRole, cec_id);
++        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
++        item->setCheckState(ColumnShared, box.shared ? Qt::Checked : Qt::Unchecked);
++        item->setText(ColumnGame, game.name.isEmpty() ? tr("(not in the game list)") : game.name);
++        item->setIcon(ColumnGame, game.icon);
++        if (!box.title_ids.empty()) {
++            item->setToolTip(ColumnGame,
++                             QString::fromStdString(fmt::format("{:016X}", box.title_ids.front())));
++        }
++        item->setText(ColumnCecId, cec_id);
++        QString inbox = Count(box.has_inbox, box.inbox_messages, box.inbox_max);
++        if (box.parked_messages > 0) {
++            inbox += tr(" (+%1 waiting)").arg(box.parked_messages);
++        }
++        item->setText(ColumnInbox, inbox);
++        item->setText(ColumnOutbox, Count(box.has_outbox, box.outbox_messages, box.outbox_max));
++        item->setText(ColumnLastOpened, box.last_opened.empty()
++                                            ? QStringLiteral("–")
++                                            : QString::fromStdString(box.last_opened));
++        item->setText(ColumnLastReceived, box.last_received.empty()
++                                              ? QStringLiteral("–")
++                                              : QString::fromStdString(box.last_received));
++        item->setText(ColumnStatus, StatusText(box));
++        if (!box.IsComplete()) {
++            item->setForeground(ColumnStatus, QColor(0xC0, 0x50, 0x00));
++        }
++        tree->addTopLevelItem(item);
++        if (cec_id == selected) {
++            item->setSelected(true);
++        }
++        complete += box.IsComplete() ? 1 : 0;
++        shared += box.shared ? 1 : 0;
++    }
++
++    tree->setSortingEnabled(true);
++    tree->sortByColumn(ColumnGame, Qt::AscendingOrder);
++    for (int column = 0; column < ColumnCount - 1; ++column) {
++        tree->resizeColumnToContents(column);
++    }
++    filling = false;
++
++    QString text = boxes.empty()
++                       ? tr("No StreetPass boxes yet. A game creates its box when you turn "
++                            "StreetPass on in it.")
++                       : tr("%1 game(s): %2 set up, %3 shared. Box list: %4")
++                             .arg(boxes.size())
++                             .arg(complete)
++                             .arg(shared)
++                             .arg(QString::fromStdString(Core::getStreetPassPath()));
++    if (game_running) {
++        text += tr("\nA game is running: emptying or removing boxes is only possible after "
++                   "stopping it.");
++    }
++    summary->setText(text);
++    UpdateButtons();
++}
++
++void StreetPassOverview::UpdateButtons() {
++    const bool has_selection = !SelectedCecId().isEmpty();
++    open_button->setEnabled(has_selection);
++    empty_button->setEnabled(has_selection && !game_running);
++    remove_button->setEnabled(has_selection && !game_running);
++}
++
++QString StreetPassOverview::SelectedCecId() const {
++    const auto items = tree->selectedItems();
++    return items.isEmpty() ? QString() : items.front()->data(ColumnShared, CecIdRole).toString();
++}
++
++void StreetPassOverview::OnItemChanged(QTreeWidgetItem* item, int column) {
++    if (filling || column != ColumnShared) {
++        return;
++    }
++    Core::setStreetPassShared(item->data(ColumnShared, CecIdRole).toString().toStdString(),
++                              item->checkState(ColumnShared) == Qt::Checked);
++}
++
++void StreetPassOverview::OpenSelectedFolder() {
++    const QString cec_id = SelectedCecId();
++    if (cec_id.isEmpty()) {
++        return;
++    }
++    const QString path =
++        QString::fromStdString(Core::getStreetPassPath() + "/" + cec_id.toStdString());
++    if (!FileUtil::IsDirectory(path.toStdString())) {
++        QMessageBox::warning(this, windowTitle(),
++                             tr("The box folder of %1 doesn't exist.").arg(cec_id));
++        return;
++    }
++    QDesktopServices::openUrl(QUrl::fromLocalFile(path));
++}
++
++void StreetPassOverview::EmptySelectedInbox() {
++    const QString cec_id = SelectedCecId();
++    if (cec_id.isEmpty() ||
++        QMessageBox::question(this, windowTitle(),
++                              tr("Delete every message in the inbox of %1?\nThe game won't show "
++                                 "them any more. This can't be undone.")
++                                  .arg(tree->selectedItems().front()->text(ColumnGame)),
++                              QMessageBox::Yes | QMessageBox::No,
++                              QMessageBox::No) != QMessageBox::Yes) {
++        return;
++    }
++    const int result = Core::clearStreetPassInbox(cec_id.toStdString());
++    if (result == -4) {
++        QMessageBox::critical(this, windowTitle(), tr("Stop the running game first."));
++    } else if (result < 0) {
++        QMessageBox::critical(this, windowTitle(),
++                              tr("Could not empty the inbox.\nRefer to the log for details."));
++    }
++    Refresh();
++}
++
++void StreetPassOverview::RemoveSelectedBox() {
++    const QString cec_id = SelectedCecId();
++    if (cec_id.isEmpty() ||
++        QMessageBox::question(
++            this, windowTitle(),
++            tr("Remove the StreetPass data of %1?\nIts box folder is deleted and it's taken out "
++               "of the StreetPass list, like System Settings' \"Delete StreetPass data\". The "
++               "game will ask to set StreetPass up again. This can't be undone; use Zip CEC "
++               "Folder first to keep a copy.")
++                .arg(tree->selectedItems().front()->text(ColumnGame)),
++            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
++        return;
++    }
++    const int result = Core::removeStreetPassBox(cec_id.toStdString());
++    if (result == -4) {
++        QMessageBox::critical(this, windowTitle(), tr("Stop the running game first."));
++    } else if (result < 0) {
++        QMessageBox::critical(this, windowTitle(),
++                              tr("Could not remove the box.\nRefer to the log for details."));
++    }
++    Refresh();
++}
++
++void StreetPassOverview::OpenCecFolder() {
++    const std::string path = Core::getStreetPassPath();
++    if (!FileUtil::IsDirectory(path)) {
++        QMessageBox::warning(this, windowTitle(),
++                             tr("There is no CEC folder yet (no game has set up StreetPass)."));
++        return;
++    }
++    QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(path)));
++}
++
++void StreetPassOverview::ZipCecFolder() {
++    const QString suggested = QString::fromStdString(
++        FileUtil::GetUserPath(FileUtil::UserPath::UserDir) + "CEC-" +
++        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmm")).toStdString() +
++        ".zip");
++    const QString path = QFileDialog::getSaveFileName(this, tr("Zip CEC Folder"), suggested,
++                                                      tr("Zip file (*.zip)"));
++    if (path.isEmpty()) {
++        return;
++    }
++    const int files = Core::zipStreetPassFolder(path.toStdString());
++    if (files < 0) {
++        QMessageBox::critical(this, windowTitle(),
++                              tr("Could not write the zip file.\nRefer to the log for details."));
++        return;
++    }
++    QMessageBox::information(this, windowTitle(),
++                             tr("%1 file(s) from the CEC folder zipped to:\n%2")
++                                 .arg(files)
++                                 .arg(path));
++}
+diff --git a/src/citra_qt/streetpass_overview.h b/src/citra_qt/streetpass_overview.h
+new file mode 100644
+index 0000000..40a7f11
+--- /dev/null
++++ b/src/citra_qt/streetpass_overview.h
+@@ -0,0 +1,60 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv3 or any later version
++// Refer to the LICENSE.txt file included.
++
++#pragma once
++
++#include <functional>
++#include <QDialog>
++#include <QIcon>
++#include <QString>
++#include "common/common_types.h"
++
++class QLabel;
++class QPushButton;
++class QTreeWidget;
++class QTreeWidgetItem;
++
++namespace Core {
++struct StreetPassBox;
++}
++
++/// ZipPass > StreetPass Games: every game's StreetPass box at a glance (what System Settings'
++/// StreetPass Management shows, without starting it), with a "share" tick per game, the box
++/// folders one click away and a button to zip the whole CEC folder.
++class StreetPassOverview : public QDialog {
++    Q_OBJECT
++
++public:
++    struct GameInfo {
++        QString name;
++        QIcon icon;
++    };
++    /// Looks up a game by title ID in the game list; returns an empty name when it isn't there.
++    using GameLookup = std::function<GameInfo(u64 title_id)>;
++
++    StreetPassOverview(QWidget* parent, GameLookup lookup, bool game_running);
++
++private:
++    void Refresh();
++    void UpdateButtons();
++    QString SelectedCecId() const;
++    GameInfo FindGame(const Core::StreetPassBox& box) const;
++
++    void OnItemChanged(QTreeWidgetItem* item, int column);
++    void OpenSelectedFolder();
++    void EmptySelectedInbox();
++    void RemoveSelectedBox();
++    void OpenCecFolder();
++    void ZipCecFolder();
++
++    GameLookup lookup;
++    bool game_running;
++    bool filling = false;
++
++    QTreeWidget* tree = nullptr;
++    QLabel* summary = nullptr;
++    QPushButton* open_button = nullptr;
++    QPushButton* empty_button = nullptr;
++    QPushButton* remove_button = nullptr;
++};
+diff --git a/src/core/zip_pass.cpp b/src/core/zip_pass.cpp
+index f3d2b6c..2c92b48 100644
+--- a/src/core/zip_pass.cpp
++++ b/src/core/zip_pass.cpp
+@@ -4,9 +4,12 @@
+ #include <array>
+ #include <cctype>
+ #include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <ctime>
+ #include <map>
++#include <set>
++#include <sstream>
+ #include <mutex>
+ #include <vector>
+ #include <zip.h>
+@@ -163,6 +166,135 @@ int ZipPassChecks(bool automatic = false) {
+     return 0;
+ }
+ 
++using MBoxInfoHeader = Service::CECD::Module::CecMBoxInfoHeader;
++using MBoxListHeader = Service::CECD::Module::CecMBoxListHeader;
++
++constexpr u16 MBoxInfoMagic = 0x6363; // 'cc'
++constexpr u16 MBoxListMagic = 0x6868; // 'hh'
++
++std::string ToLower(std::string text) {
++    std::transform(text.begin(), text.end(), text.begin(),
++                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++    return text;
++}
++
++std::string GetMBoxListPath() {
++    return GetCecPath() + DIR_SEP + "MBoxList____";
++}
++
++std::string GetNotSharedPath() {
++    return GetZipPassPath("not_shared.txt");
++}
++
++template <typename T>
++bool ReadHeader(const std::string& path, T& out) {
++    FileUtil::IOFile file(path, "rb");
++    if (!file.IsOpen() || file.GetSize() < sizeof(T)) {
++        return false;
++    }
++    return file.ReadBytes(&out, sizeof(T)) == sizeof(T);
++}
++
++std::string FormatTime(const MBoxInfoHeader::Time& time) {
++    if (time.year == 0 || time.month == 0 || time.month > 12 || time.day == 0 || time.day > 31) {
++        return {};
++    }
++    return fmt::format("{:04}-{:02}-{:02} {:02}:{:02}", u32{time.year}, time.month, time.day,
++                       time.hour, time.minute);
++}
++
++/// The CEC IDs listed in MBoxList____, in list order (empty if the file is missing or broken).
++std::vector<std::string> ReadMBoxList() {
++    MBoxListHeader list{};
++    if (!ReadHeader(GetMBoxListPath(), list) || list.magic != MBoxListMagic) {
++        return {};
++    }
++    std::vector<std::string> ids;
++    const std::size_t count = std::min<std::size_t>(list.num_boxes, list.box_names.size());
++    for (std::size_t i = 0; i < count; ++i) {
++        const auto& raw = list.box_names[i];
++        std::string name(reinterpret_cast<const char*>(raw.data()),
++                         strnlen(reinterpret_cast<const char*>(raw.data()), raw.size()));
++        ids.push_back(ToLower(name));
++    }
++    return ids;
++}
++
++std::set<std::string> ReadNotShared() {
++    std::set<std::string> ids;
++    std::string text;
++    if (!FileUtil::ReadFileToString(true, GetNotSharedPath(), text)) {
++        return ids;
++    }
++    std::istringstream lines(text);
++    std::string line;
++    while (std::getline(lines, line)) {
++        line.erase(std::remove_if(line.begin(), line.end(),
++                                  [](unsigned char c) { return std::isspace(c); }),
++                   line.end());
++        if (IsHexTitleId(line)) {
++            ids.insert(ToLower(line));
++        }
++    }
++    return ids;
++}
++
++/// sysdata/cecIds.txt: "<16-hex title ID>:<8-hex CEC ID>" lines that Tangelo writes the first
++/// time a game writes its outbox. A game's CEC ID isn't always part of its title ID (Nintendogs
++/// + Cats Toy Poodle 0004000000031600 uses box 00030b00), so this names the boxes.
++std::map<std::string, std::vector<u64>> ReadCecIdTitles() {
++    std::map<std::string, std::vector<u64>> titles;
++    std::string text;
++    if (!FileUtil::ReadFileToString(
++            true, FileUtil::GetUserPath(FileUtil::UserPath::SysDataDir) + "cecIds.txt", text)) {
++        return titles;
++    }
++    std::istringstream lines(text);
++    std::string line;
++    while (std::getline(lines, line)) {
++        if (!line.empty() && line.back() == '\r') {
++            line.pop_back();
++        }
++        line = ToLower(line);
++        if (line.size() != 25 || line[16] != ':' || line.starts_with("#") ||
++            !IsHexTitleId(line.substr(17, 8))) {
++            continue;
++        }
++        const u64 title_id = std::strtoull(line.substr(0, 16).c_str(), nullptr, 16);
++        auto& list = titles[line.substr(17, 8)];
++        if (std::find(list.begin(), list.end(), title_id) == list.end()) {
++            list.push_back(title_id);
++        }
++    }
++    return titles;
++}
++
++bool AddTreeToZip(zip_t* za, const FileUtil::FSTEntry& dir, const std::string& zip_dir,
++                  int& files) {
++    for (const auto& entry : dir.children) {
++        const std::string zip_path = zip_dir + "/" + entry.virtualName;
++        if (entry.isDirectory) {
++            if (zip_dir_add(za, zip_path.c_str(), ZIP_FL_ENC_UTF_8) < 0) {
++                return false;
++            }
++            if (!AddTreeToZip(za, entry, zip_path, files)) {
++                return false;
++            }
++            continue;
++        }
++        std::string real_path = entry.physicalName;
++#ifdef ANDROID
++        real_path = AndroidUtils::TranslateFilePath(real_path);
++#endif
++        if (!AddFileToZip(za, zip_path, FileUtil::SanitizePath(real_path))) {
++            LOG_WARNING(Frontend, "StreetPass zip: could not add {}", entry.physicalName);
++            continue;
++        }
++        files++;
++    }
++    return true;
++}
++
+ } // namespace
+ 
+ bool isEmulationRunning() {
+@@ -186,6 +318,11 @@ int exportZipPass(std::string path) {
+         if (!FileUtil::IsDirectory(title_path) || !IsHexTitleId(title_id)) {
+             return true;
+         }
++        if (!isStreetPassShared(title_id)) {
++            LOG_INFO(Frontend, "ZipPass export: {} is kept on this console (not shared)",
++                     title_id);
++            return true;
++        }
+ 
+         const auto on_message = [za, &title_id](u64*, const std::string& box_dir,
+                                                 const std::string& name) -> bool {
+@@ -550,4 +687,217 @@ int clearStreetPassConfig() {
+     return 0;
+ }
+ 
++std::string getStreetPassPath() {
++    return GetCecPath();
++}
++
++std::vector<StreetPassBox> listStreetPassBoxes() {
++    std::lock_guard lock(zip_pass_mutex);
++    const std::string cec = GetCecPath();
++    const std::vector<std::string> listed = ReadMBoxList();
++    const std::set<std::string> not_shared = ReadNotShared();
++    const auto cec_titles = ReadCecIdTitles();
++
++    std::set<std::string> ids(listed.begin(), listed.end());
++    FileUtil::ForeachDirectoryEntry(
++        nullptr, cec, [&ids](u64*, const std::string& directory, const std::string& name) {
++            if (IsHexTitleId(name) && FileUtil::IsDirectory(directory + DIR_SEP + name)) {
++                ids.insert(ToLower(name));
++            }
++            return true;
++        });
++
++    std::vector<StreetPassBox> boxes;
++    for (const std::string& id : ids) {
++        StreetPassBox box;
++        box.cec_id = id;
++        box.path = cec + DIR_SEP + id;
++        box.in_box_list = std::find(listed.begin(), listed.end(), id) != listed.end();
++        box.has_folder = FileUtil::IsDirectory(box.path);
++        box.shared = !not_shared.contains(id);
++        if (const auto it = cec_titles.find(id); it != cec_titles.end()) {
++            box.title_ids = it->second;
++        }
++
++        MBoxInfoHeader info{};
++        if (ReadHeader(box.path + DIR_SEP + "MBoxInfo____", info) && info.magic == MBoxInfoMagic) {
++            box.has_box_info = true;
++            box.program_id = info.program_id;
++            box.last_opened = FormatTime(info.last_accessed);
++            box.last_received = FormatTime(info.last_received);
++        }
++        BoxInfoHeader inbox{};
++        if (ReadHeader(box.path + DIR_SEP + "InBox___" + DIR_SEP + "BoxInfo_____", inbox) &&
++            inbox.magic == BoxInfoMagic) {
++            box.has_inbox = true;
++            box.inbox_messages = inbox.message_num;
++            box.inbox_max = inbox.max_message_num;
++        }
++        BoxInfoHeader outbox{};
++        if (ReadHeader(box.path + DIR_SEP + "OutBox__" + DIR_SEP + "BoxInfo_____", outbox) &&
++            outbox.magic == BoxInfoMagic) {
++            box.has_outbox = true;
++            box.outbox_messages = outbox.message_num;
++            box.outbox_max = outbox.max_message_num;
++        }
++        const std::string parked = GetZipPassPath("inboxes/" + id + "/");
++        if (FileUtil::IsDirectory(parked)) {
++            box.parked_messages = CountFiles(parked);
++        }
++        boxes.push_back(std::move(box));
++    }
++    return boxes;
++}
++
++int clearStreetPassInbox(const std::string& cec_id_in) {
++    std::lock_guard lock(zip_pass_mutex);
++    const std::string cec_id = ToLower(cec_id_in);
++    if (!IsHexTitleId(cec_id)) {
++        return -1;
++    }
++    if (isEmulationRunning()) {
++        return -4;
++    }
++    const std::string inbox = GetInboxPath(cec_id);
++    const std::string box_info_path = inbox + DIR_SEP + "BoxInfo_____";
++    FileUtil::IOFile box_file(box_info_path, "rb");
++    BoxInfoHeader info{};
++    if (!ReadBoxInfo(box_file, info)) {
++        LOG_WARNING(Frontend, "StreetPass: no valid inbox for {}", cec_id);
++        return -1;
++    }
++    box_file.Close();
++
++    int removed = 0;
++    FileUtil::ForeachDirectoryEntry(
++        nullptr, inbox, [&removed](u64*, const std::string& directory, const std::string& name) {
++            if (IsMessageFileName(name) && FileUtil::Delete(directory + DIR_SEP + name)) {
++                removed++;
++            }
++            return true;
++        });
++
++    // An empty box: header only, no message entries.
++    info.message_num = 0;
++    info.box_size = 0;
++    info.box_info_size = sizeof(BoxInfoHeader);
++    FileUtil::IOFile out(box_info_path, "wb");
++    if (!out.IsOpen() || out.WriteBytes(&info, sizeof(info)) != sizeof(info)) {
++        LOG_ERROR(Frontend, "StreetPass: failed to reset {}", box_info_path);
++        return -1;
++    }
++    out.Close();
++
++    const std::string parked = GetZipPassPath("inboxes/" + cec_id + "/");
++    if (FileUtil::IsDirectory(parked)) {
++        removed += static_cast<int>(CountFiles(parked));
++        FileUtil::DeleteDirRecursively(parked);
++    }
++    LOG_INFO(Frontend, "StreetPass: emptied the inbox of {} ({} message(s))", cec_id, removed);
++    return removed;
++}
++
++int removeStreetPassBox(const std::string& cec_id_in) {
++    std::lock_guard lock(zip_pass_mutex);
++    const std::string cec_id = ToLower(cec_id_in);
++    if (!IsHexTitleId(cec_id)) {
++        return -1;
++    }
++    if (isEmulationRunning()) {
++        return -4;
++    }
++
++    // Take it out of MBoxList____ first, keeping the other entries in order.
++    const std::string list_path = GetMBoxListPath();
++    MBoxListHeader list{};
++    if (ReadHeader(list_path, list) && list.magic == MBoxListMagic) {
++        const std::size_t count = std::min<std::size_t>(list.num_boxes, list.box_names.size());
++        std::size_t kept = 0;
++        decltype(list.box_names) names{};
++        for (std::size_t i = 0; i < count; ++i) {
++            const auto& raw = list.box_names[i];
++            const std::string name(reinterpret_cast<const char*>(raw.data()),
++                                   strnlen(reinterpret_cast<const char*>(raw.data()), raw.size()));
++            if (ToLower(name) != cec_id) {
++                names[kept++] = raw;
++            }
++        }
++        if (kept != count) {
++            list.box_names = names;
++            list.num_boxes = static_cast<u16>(kept);
++            FileUtil::IOFile out(list_path, "rb+");
++            if (!out.IsOpen() || out.WriteBytes(&list, sizeof(list)) != sizeof(list)) {
++                LOG_ERROR(Frontend, "StreetPass: failed to update {}", list_path);
++                return -1;
++            }
++        }
++    }
++
++    const std::string box = GetCecPath() + DIR_SEP + cec_id;
++    if (FileUtil::IsDirectory(box) && !FileUtil::DeleteDirRecursively(box)) {
++        LOG_ERROR(Frontend, "StreetPass: failed to delete {}", box);
++        return -1;
++    }
++    const std::string parked = GetZipPassPath("inboxes/" + cec_id + "/");
++    if (FileUtil::IsDirectory(parked)) {
++        FileUtil::DeleteDirRecursively(parked);
++    }
++    LOG_INFO(Frontend, "StreetPass: removed the box of {}", cec_id);
++    return 0;
++}
++
++int zipStreetPassFolder(const std::string& path) {
++    std::lock_guard lock(zip_pass_mutex);
++    const std::string cec = GetCecPath();
++    if (!FileUtil::IsDirectory(cec)) {
++        LOG_ERROR(Frontend, "StreetPass zip: no CEC folder at {}", cec);
++        return -1;
++    }
++    int err = 0;
++    zip_t* za = zip_open(path.c_str(), ZIP_CREATE | ZIP_TRUNCATE, &err);
++    if (za == nullptr) {
++        LOG_ERROR(Frontend, "StreetPass zip: cannot create {} (libzip error {})", path, err);
++        return -1;
++    }
++    FileUtil::FSTEntry root;
++    FileUtil::ScanDirectoryTree(cec, root, 16);
++    int files = 0;
++    const bool ok = zip_dir_add(za, "CEC", ZIP_FL_ENC_UTF_8) >= 0 &&
++                    AddTreeToZip(za, root, "CEC", files);
++    if (!ok || zip_close(za) < 0) {
++        LOG_ERROR(Frontend, "StreetPass zip: failed to write {}: {}", path, zip_strerror(za));
++        zip_discard(za);
++        return -1;
++    }
++    LOG_INFO(Frontend, "StreetPass zip: {} file(s) to {}", files, path);
++    return files;
++}
++
++bool isStreetPassShared(const std::string& cec_id) {
++    std::lock_guard lock(zip_pass_mutex);
++    return !ReadNotShared().contains(ToLower(cec_id));
++}
++
++void setStreetPassShared(const std::string& cec_id_in, bool shared) {
++    std::lock_guard lock(zip_pass_mutex);
++    const std::string cec_id = ToLower(cec_id_in);
++    if (!IsHexTitleId(cec_id)) {
++        return;
++    }
++    std::set<std::string> ids = ReadNotShared();
++    if (shared ? ids.erase(cec_id) == 0 : !ids.insert(cec_id).second) {
++        return; // no change
++    }
++    std::string text = "# StreetPass games kept on this console (not exported by ZipPass, not\n"
++                       "# sent by NetPass). One CEC ID per line; edit in ZipPass > StreetPass "
++                       "Games.\n";
++    for (const auto& id : ids) {
++        text += id + "\n";
++    }
++    FileUtil::CreateFullPath(GetZipPassPath(""));
++    FileUtil::WriteStringToFile(true, GetNotSharedPath(), text);
++    LOG_INFO(Frontend, "StreetPass: {} is {}", cec_id,
++             shared ? "shared again" : "kept on this console");
++}
++
+ } // namespace Core
+diff --git a/src/core/zip_pass.h b/src/core/zip_pass.h
+index 646dcfe..a047f62 100644
+--- a/src/core/zip_pass.h
++++ b/src/core/zip_pass.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <string>
++#include <vector>
++#include "common/common_types.h"
+ 
+ namespace Core {
+ 
+@@ -31,4 +33,56 @@ int clearStreetPassConfig();
+ /// Whether a game is currently running, so ZipPass must not touch the StreetPass boxes.
+ bool isEmulationRunning();
+ 
++/// One game's StreetPass box, for the StreetPass overview (ZipPass > StreetPass Games).
++struct StreetPassBox {
++    std::string cec_id;        ///< 8 lowercase hex digits: the box folder name / MBoxList entry
++    std::string path;          ///< the box folder (set even when it doesn't exist)
++    bool in_box_list = false;  ///< listed in CEC/MBoxList____
++    bool has_folder = false;   ///< CEC/<cec id>/ exists
++    bool has_box_info = false; ///< MBoxInfo____ present and valid
++    bool has_inbox = false;    ///< InBox___/BoxInfo_____ present and valid
++    bool has_outbox = false;   ///< OutBox__/BoxInfo_____ present and valid
++    u32 program_id = 0;        ///< low 32 bits of the owner's title ID (from MBoxInfo____)
++    std::vector<u64> title_ids; ///< games seen writing to this box (sysdata/cecIds.txt)
++    std::string last_opened;   ///< "YYYY-MM-DD HH:MM" (MBoxInfo last accessed), "" if never
++    std::string last_received; ///< "YYYY-MM-DD HH:MM" (MBoxInfo last received), "" if never
++    u32 inbox_messages = 0;
++    u32 inbox_max = 0;
++    u32 outbox_messages = 0;
++    u32 outbox_max = 0;
++    std::size_t parked_messages = 0; ///< ZipPass messages waiting for room in the inbox
++    bool shared = true;              ///< not on the "keep on this console" list
++
++    /// Set up completely: listed, with its info file and both boxes.
++    bool IsComplete() const {
++        return in_box_list && has_folder && has_box_info && has_inbox && has_outbox;
++    }
++};
++
++/// The CEC folder in the emulated NAND (sysdata/00010026/00000000/CEC).
++std::string getStreetPassPath();
++
++/// Every StreetPass box: the ones in MBoxList____ plus any other box folder, sorted by CEC ID.
++/// Read-only, so it can be used while a game runs.
++std::vector<StreetPassBox> listStreetPassBoxes();
++
++/// Deletes the messages in one game's inbox (and its parked ZipPass messages) and resets the
++/// inbox's BoxInfo_____. Returns the number of messages removed, -1 on failure, -4 while a game
++/// runs.
++int clearStreetPassInbox(const std::string& cec_id);
++
++/// Removes one game's StreetPass box: deletes its folder and takes it out of MBoxList____ (what
++/// System Settings' "delete StreetPass data" does for one game). The game asks to set StreetPass
++/// up again next time. Returns 0, -1 on failure, -4 while a game runs.
++int removeStreetPassBox(const std::string& cec_id);
++
++/// Writes the whole CEC folder (every box, MBoxList____, empty folders too) to a .zip with
++/// paths starting at "CEC/". Returns the number of files added, or -1 on failure.
++int zipStreetPassFolder(const std::string& path);
++
++/// Whether a game's StreetPass is shared (ZipPass export; later the built-in NetPass client).
++/// Games are shared unless switched off; the list is kept in <user>/zippass/not_shared.txt.
++bool isStreetPassShared(const std::string& cec_id);
++void setStreetPassShared(const std::string& cec_id, bool shared);
++
+ } // namespace Core
+diff --git a/src/tests/core/zip_pass.cpp b/src/tests/core/zip_pass.cpp
+index 2d13b77..744934a 100644
+--- a/src/tests/core/zip_pass.cpp
++++ b/src/tests/core/zip_pass.cpp
+@@ -230,3 +230,126 @@ TEST_CASE("ZipPass environment checks", "[core][zippass]") {
+         CHECK(Core::importZipPass(zip) == -2);
+     }
+ }
++
++namespace {
++
++using MBoxInfoHeader = Service::CECD::Module::CecMBoxInfoHeader;
++using MBoxListHeader = Service::CECD::Module::CecMBoxListHeader;
++
++void WriteMBoxList(const ZipPassFixture& fx, const std::vector<std::string>& ids) {
++    MBoxListHeader list{};
++    list.magic = 0x6868;
++    list.version = 1;
++    list.num_boxes = static_cast<u16>(ids.size());
++    for (std::size_t i = 0; i < ids.size(); ++i) {
++        std::memcpy(list.box_names[i].data(), ids[i].data(), ids[i].size());
++    }
++    FileUtil::CreateFullPath(fx.Cec());
++    FileUtil::IOFile file(fx.Cec() + "MBoxList____", "wb");
++    file.WriteBytes(&list, sizeof(list));
++}
++
++void WriteMBoxInfo(const ZipPassFixture& fx, const std::string& id, u32 program_id) {
++    MBoxInfoHeader info{};
++    info.magic = 0x6363;
++    info.program_id = program_id;
++    info.last_accessed = {2026, 10, 29, 21, 30, 0, 0, 0, 0};
++    FileUtil::CreateFullPath(fx.Cec() + id + "/");
++    FileUtil::IOFile file(fx.Cec() + id + "/MBoxInfo____", "wb");
++    file.WriteBytes(&info, sizeof(info));
++}
++
++MBoxListHeader ReadMBoxList(const ZipPassFixture& fx) {
++    MBoxListHeader list{};
++    FileUtil::IOFile file(fx.Cec() + "MBoxList____", "rb");
++    file.ReadBytes(&list, sizeof(list));
++    return list;
++}
++
++} // namespace
++
++TEST_CASE("StreetPass overview lists the boxes", "[core][zippass][streetpass]") {
++    ZipPassFixture fx;
++    fx.WriteOutboxMessage();
++    fx.WriteBoxInfo(1, 10);
++    // The outbox needs its own BoxInfo_____ to count as set up.
++    FileUtil::Copy(fx.Inbox() + "BoxInfo_____", fx.Outbox() + "BoxInfo_____");
++    WriteMBoxInfo(fx, TitleDir, TitleId);
++    WriteMBoxList(fx, {TitleDir, "00030b00"});
++    FileUtil::CreateFullPath(fx.Cec() + "000b8b00/"); // a folder that isn't in the list
++
++    const auto boxes = Core::listStreetPassBoxes();
++    REQUIRE(boxes.size() == 3);
++    // Sorted by CEC ID: 00030b00 < 000b8b00 < 0018af00.
++    CHECK(boxes[0].cec_id == "00030b00");
++    CHECK(boxes[0].in_box_list);
++    CHECK_FALSE(boxes[0].has_folder);
++
++    CHECK(boxes[1].cec_id == "000b8b00");
++    CHECK_FALSE(boxes[1].in_box_list);
++    CHECK(boxes[1].has_folder);
++    CHECK_FALSE(boxes[1].IsComplete());
++
++    CHECK(boxes[2].cec_id == TitleDir);
++    CHECK(boxes[2].IsComplete());
++    CHECK(boxes[2].inbox_messages == 1);
++    CHECK(boxes[2].inbox_max == 10);
++    CHECK(boxes[2].program_id == TitleId);
++    CHECK(boxes[2].last_opened == "2026-10-29 21:30");
++    CHECK(boxes[2].last_received.empty());
++    CHECK(boxes[2].shared);
++}
++
++TEST_CASE("StreetPass games that aren't shared stay out of ZipPass exports",
++          "[core][zippass][streetpass]") {
++    ZipPassFixture fx;
++    fx.WriteOutboxMessage();
++    fx.WriteBoxInfo(0, 2);
++    const std::string zip = fx.root + "test.pass.zip";
++
++    Core::setStreetPassShared(TitleDir, false);
++    CHECK_FALSE(Core::isStreetPassShared(TitleDir));
++    CHECK(Core::exportZipPass(zip) == 0);
++
++    Core::setStreetPassShared(TitleDir, true);
++    CHECK(Core::isStreetPassShared(TitleDir));
++    CHECK(Core::exportZipPass(zip) == 1);
++}
++
++TEST_CASE("StreetPass overview empties an inbox and removes a box",
++          "[core][zippass][streetpass]") {
++    ZipPassFixture fx;
++    fx.WriteBoxInfo(1, 10);
++    FileUtil::WriteStringToFile(false, fx.Inbox() + "_AAAAAAAAAAA", std::string(MessageSize, 'x'));
++    WriteMBoxList(fx, {"00020800", TitleDir, "00030b00"});
++
++    CHECK(Core::clearStreetPassInbox(TitleDir) == 1);
++    CHECK(fx.Messages(fx.Inbox()).empty());
++    const BoxInfoHeader info = fx.ReadBoxInfo();
++    CHECK(info.message_num == 0);
++    CHECK(info.box_size == 0);
++    CHECK(info.box_info_size == sizeof(BoxInfoHeader));
++    CHECK(info.max_message_num == 10); // limits kept
++    CHECK(FileUtil::GetSize(fx.Inbox() + "BoxInfo_____") == sizeof(BoxInfoHeader));
++
++    CHECK(Core::removeStreetPassBox(TitleDir) == 0);
++    CHECK_FALSE(FileUtil::IsDirectory(fx.Cec() + TitleDir));
++    const MBoxListHeader list = ReadMBoxList(fx);
++    CHECK(list.num_boxes == 2);
++    CHECK(std::string(reinterpret_cast<const char*>(list.box_names[0].data())) == "00020800");
++    CHECK(std::string(reinterpret_cast<const char*>(list.box_names[1].data())) == "00030b00");
++    CHECK(list.box_names[2][0] == 0);
++
++    CHECK(Core::removeStreetPassBox("not-hex!") == -1);
++}
++
++TEST_CASE("StreetPass overview zips the CEC folder", "[core][zippass][streetpass]") {
++    ZipPassFixture fx;
++    fx.WriteOutboxMessage();
++    fx.WriteBoxInfo(0, 2);
++    WriteMBoxList(fx, {TitleDir});
++    const std::string zip = fx.root + "cec.zip";
++    // MBoxList____, the inbox BoxInfo_____ and the outbox message.
++    CHECK(Core::zipStreetPassFolder(zip) == 3);
++    CHECK(FileUtil::GetSize(zip) > 0);
++}
+-- 
+2.43.0
+

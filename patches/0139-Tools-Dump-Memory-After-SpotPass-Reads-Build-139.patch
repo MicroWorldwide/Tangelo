@@ -1,0 +1,245 @@
+From e3c86e45ad4947252f280f05265752c0165361ad Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 30 Oct 2026 23:52:54 +0100
+Subject: [PATCH] Tools: Dump Memory After SpotPass Reads (Build 139)
+
+Nintendogs + Cats reads a downloaded SpotPass neighbour at no fixed
+moment (37 s, 95 s and 213 s after start in the 30 Oct tests) and checks
+and stores it right after, so a hand-timed Tools > Dump Process Memory
+came too early or too late.
+
+Tools > Dump Memory After SpotPass Reads (a tick, off at every start):
+while it is on, the kernel watches a game's ReadNsData (boss:U
+0x00280102) and, when the SpotPass module answers it with success,
+tells the frontend (Kernel::SetSpotPassReadCallback). 3 seconds after
+the last such read the game's memory is dumped like Dump Process Memory,
+as dump/memory/<title id>-<date-time>-after-nsdata-<NsData ID>.bin and
+.txt, without dialogs (a status bar message and a Frontend Info log
+line instead). Several reads in a row give one dump.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/citra_qt/citra_qt.cpp   | 44 ++++++++++++++++++++++++++++++++++++-
+ src/citra_qt/citra_qt.h     |  6 +++++
+ src/citra_qt/main.ui        | 12 ++++++++++
+ src/core/hle/kernel/ipc.cpp | 36 ++++++++++++++++++++++++++++++
+ src/core/hle/kernel/ipc.h   |  8 +++++++
+ 6 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 93e7803..897bdc8 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-138
++139
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index 0d5d299..2409181 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -2422,6 +2422,34 @@ void GMainWindow::ConnectMenuEvents() {
+     connect_menu(ui->action_Dump_Process_Memory, &GMainWindow::OnDumpProcessMemory);
+     connect(ui->action_Start_SpotPass_Now, &QAction::toggled, this,
+             [](bool checked) { Kernel::SetStartSpotPassTasksNow(checked); });
++    // Tools > Dump Memory After SpotPass Reads: 3 s after a game has read SpotPass data (the
++    // last read, if it reads several in a row), its memory is dumped like Dump Process Memory,
++    // as <title id>-<date-time>-after-nsdata-<id>.bin, without dialogs.
++    spotpass_dump_timer.setSingleShot(true);
++    spotpass_dump_timer.setInterval(3000);
++    connect(&spotpass_dump_timer, &QTimer::timeout, this, [this] {
++        DumpProcessMemory(true, spotpass_dump_tag);
++    });
++    connect(ui->action_Dump_After_SpotPass_Read, &QAction::toggled, this, [this](bool checked) {
++        if (!checked) {
++            Kernel::SetSpotPassReadCallback({});
++            spotpass_dump_timer.stop();
++            return;
++        }
++        Kernel::SetSpotPassReadCallback([this](u64 program_id, u32 ns_data_id) {
++            LOG_INFO(Frontend,
++                     "SpotPass: {:016X} read NsData {:08X}; dumping its memory in 3 seconds",
++                     program_id, ns_data_id);
++            const std::string tag = fmt::format("-after-nsdata-{:08X}", ns_data_id);
++            QMetaObject::invokeMethod(
++                this,
++                [this, tag] {
++                    spotpass_dump_tag = tag;
++                    spotpass_dump_timer.start(); // restarts on every read
++                },
++                Qt::QueuedConnection);
++        });
++    });
+     connect_menu(ui->action_Dump_Video, &GMainWindow::OnDumpVideo);
+ 
+     // Tools debug
+@@ -4755,6 +4783,10 @@ void GMainWindow::OnSaveMovie() {
+ }
+ 
+ void GMainWindow::OnDumpProcessMemory() {
++    DumpProcessMemory(false, {});
++}
++
++void GMainWindow::DumpProcessMemory(bool automatic, const std::string& tag) {
+     // Writes the memory of the running game (every readable region of each application process)
+     // to <user>/dump/memory/<title id>-<date-time>.bin, with a .txt list of the regions next to it
+     // (address, size, file offset). Some games only build settings such as their NEX game-server ID
+@@ -4766,7 +4798,8 @@ void GMainWindow::OnDumpProcessMemory() {
+     const auto dir = fmt::format("{}memory", FileUtil::GetUserPath(FileUtil::UserPath::DumpDir));
+     FileUtil::CreateFullPath(dir + "/");
+     const std::string stamp =
+-        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")).toStdString();
++        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")).toStdString() +
++        tag;
+ 
+     std::vector<std::string> written;
+     u64 total = 0;
+@@ -4817,6 +4850,15 @@ void GMainWindow::OnDumpProcessMemory() {
+         }
+     }
+ 
++    if (automatic) { // Tools > Dump Memory After SpotPass Reads: no dialogs while playing
++        if (!written.empty()) {
++            statusBar()->showMessage(
++                tr("Dumped game memory after a SpotPass read: %1")
++                    .arg(QString::fromStdString(written.front())),
++                10000);
++        }
++        return;
++    }
+     if (written.empty()) {
+         QMessageBox::critical(this, QStringLiteral("Tangelo"),
+                               tr("No running game found to dump.\nRefer to the log for details."));
+diff --git a/src/citra_qt/citra_qt.h b/src/citra_qt/citra_qt.h
+index b95f918..f404f9b 100644
+--- a/src/citra_qt/citra_qt.h
++++ b/src/citra_qt/citra_qt.h
+@@ -411,6 +411,12 @@ private:
+     bool auto_muted = false;
+     QTimer mouse_hide_timer;
+ 
++    /// automatic: no dialogs (Tools > Dump Memory After SpotPass Reads); tag goes after the
++    /// date-time in the file names.
++    void DumpProcessMemory(bool automatic, const std::string& tag);
++    QTimer spotpass_dump_timer;
++    std::string spotpass_dump_tag;
++
+     // Movie
+     bool movie_record_on_start = false;
+     QString movie_record_path;
+diff --git a/src/citra_qt/main.ui b/src/citra_qt/main.ui
+index 336e1f1..49a6cac 100644
+--- a/src/citra_qt/main.ui
++++ b/src/citra_qt/main.ui
+@@ -302,6 +302,7 @@
+     <addaction name="action_Dump_Video"/>
+     <addaction name="action_Dump_Process_Memory"/>
+     <addaction name="action_Start_SpotPass_Now"/>
++    <addaction name="action_Dump_After_SpotPass_Read"/>
+     <addaction name="separator"/>
+     <addaction name="action_Compress_ROM_File"/>
+     <addaction name="action_Decompress_ROM_File"/>
+@@ -615,6 +616,17 @@
+     <string>While ticked, a game's SpotPass task starts as soon as the game names it (usually when it starts), instead of at its next scheduled time</string>
+    </property>
+   </action>
++  <action name="action_Dump_After_SpotPass_Read">
++   <property name="checkable">
++    <bool>true</bool>
++   </property>
++   <property name="text">
++    <string>Dump Memory After SpotPass Reads</string>
++   </property>
++   <property name="toolTip">
++    <string>While ticked, the game's memory is dumped (like Dump Process Memory, without dialogs) 3 seconds after it reads SpotPass data</string>
++   </property>
++  </action>
+   <action name="action_Dump_Process_Memory">
+    <property name="enabled">
+     <bool>false</bool>
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 704063f..825c88f 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -142,8 +142,19 @@ std::map<std::pair<u64, std::string>, std::chrono::steady_clock::time_point> sta
+ /// Game threads whose request was turned into StartTaskImmediate, with the command they sent,
+ /// so the reply goes back under the command the game expects.
+ std::map<u32, u32> rewritten_requests;
++
++std::mutex spotpass_read_mutex;
++SpotPassReadCallback spotpass_read_callback;
++/// Game threads waiting for a ReadNsData reply -> the NsData ID they asked for.
++std::map<u32, u32> pending_ns_data_reads;
+ } // namespace
+ 
++void SetSpotPassReadCallback(SpotPassReadCallback callback) {
++    std::scoped_lock lock{spotpass_read_mutex};
++    spotpass_read_callback = std::move(callback);
++    pending_ns_data_reads.clear();
++}
++
+ void SetStartSpotPassTasksNow(bool enabled) {
+     start_spotpass_tasks_now = enabled;
+     std::scoped_lock lock{start_now_mutex};
+@@ -241,6 +252,31 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+         }
+     }
+ 
++    // Tools > Dump Memory After SpotPass Reads: a game's ReadNsData (boss:U 0x00280102: NsData
++    // ID, u64 offset, size, output buffer) and boss's successful answer. Nintendogs + Cats reads
++    // a downloaded neighbour at no fixed moment (37 s, 95 s, 213 s after start in the 30 Oct
++    // tests), and checks and stores it right after; a memory dump taken a few seconds later
++    // shows what it made of it.
++    if (!reply && header.raw == 0x00280102 && dst_process->GetName() == "boss" &&
++        is_app(*src_process)) {
++        std::scoped_lock lock{spotpass_read_mutex};
++        if (spotpass_read_callback) {
++            pending_ns_data_reads[src_thread->GetThreadId()] = cmd_buf[1];
++        }
++    }
++    if (reply && (header.raw >> 16) == 0x0028 && src_process->GetName() == "boss" &&
++        is_app(*dst_process)) {
++        std::scoped_lock lock{spotpass_read_mutex};
++        const auto it = pending_ns_data_reads.find(dst_thread->GetThreadId());
++        if (it != pending_ns_data_reads.end()) {
++            const u32 ns_data_id = it->second;
++            pending_ns_data_reads.erase(it);
++            if (spotpass_read_callback && header.normal_params_size >= 1 && cmd_buf[1] == 0) {
++                spotpass_read_callback(dst_process->codeset->program_id, ns_data_id);
++            }
++        }
++    }
++
+     // Background SpotPass and StreetPass while a game runs (test, 2026-10-16). Games ask NDM to
+     // pause the background daemons when they start (ndm:u SuspendDaemons, mask bit 0 = StreetPass
+     // (cecd), bit 1 = SpotPass (boss), bit 2 = nim); on a console the HOME Menu and sleep mode
+diff --git a/src/core/hle/kernel/ipc.h b/src/core/hle/kernel/ipc.h
+index 7991dbc..e3a27e8 100644
+--- a/src/core/hle/kernel/ipc.h
++++ b/src/core/hle/kernel/ipc.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <functional>
++
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -54,6 +56,12 @@ void LogFailedReply(const std::string& server, const std::string& client, u32 he
+ /// next scheduled time (Nintendogs + Cats: every 12 hours).
+ void SetStartSpotPassTasksNow(bool enabled);
+ bool GetStartSpotPassTasksNow();
++
++/// Called (on the emulation thread, with the kernel lock held: just queue work) each time the
++/// SpotPass module answers a game's ReadNsData (boss:U 0x0028) with success: the game's program
++/// ID and the NsData ID it read. Tools > Dump Memory After SpotPass Reads uses it. Empty = off.
++using SpotPassReadCallback = std::function<void(u64 program_id, u32 ns_data_id)>;
++void SetSpotPassReadCallback(SpotPassReadCallback callback);
+ } // namespace Kernel
+ 
+ BOOST_CLASS_EXPORT_KEY(Kernel::MappedBufferContext)
+-- 
+2.43.0
+

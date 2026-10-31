@@ -1,0 +1,192 @@
+From c1e8b518247e3268aafba43b0e5ef6efd7120b3f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 29 Oct 2026 21:18:57 +0100
+Subject: [PATCH] Tools: Dump Process Memory (Build 135)
+
+Some games only put together their NEX settings (game-server ID and
+access key) while they run, so the key can't be read from the .code
+dump. Governor of Poker is one: its engine reads game_id/access_key from
+a settings list filled in at run time, and neither value is in its code
+or RomFS.
+
+Tools > Dump Process Memory (enabled while a game runs) writes every
+readable memory region of each running game (title IDs 00040000xxxxxxxx;
+not system modules or applets) to
+<user>/dump/memory/<title id>-<date-time>.bin, with a .txt list of the
+regions (address, size, offset in the file, state, permissions). It
+reads under the HLE lock, so it can be used while the game runs. Dump
+after the game has tried to go online. Nothing leaves the machine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER              |  2 +-
+ src/citra_qt/citra_qt.cpp | 80 +++++++++++++++++++++++++++++++++++++++
+ src/citra_qt/citra_qt.h   |  1 +
+ src/citra_qt/main.ui      | 12 ++++++
+ 4 files changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 405e2af..c8b255f 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-134
++135
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index 0ede083..cbd111f 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -106,6 +106,8 @@
+ #include "core/file_sys/archive_extsavedata.h"
+ #include "core/file_sys/archive_source_sd_savedata.h"
+ #include "core/frontend/applets/default_applets.h"
++#include "core/hle/kernel/process.h"
++#include "core/hle/kernel/vm_manager.h"
+ #include "core/hle/service/am/am.h"
+ #include "core/hle/service/apt/applet_manager.h"
+ #include "core/hle/service/apt/apt.h"
+@@ -2414,6 +2416,7 @@ void GMainWindow::ConnectMenuEvents() {
+         }
+     });
+     connect_menu(ui->action_Capture_Screenshot, &GMainWindow::OnCaptureScreenshot);
++    connect_menu(ui->action_Dump_Process_Memory, &GMainWindow::OnDumpProcessMemory);
+     connect_menu(ui->action_Dump_Video, &GMainWindow::OnDumpVideo);
+ 
+     // Tools debug
+@@ -2483,6 +2486,7 @@ void GMainWindow::UpdateMenuState() {
+ 	ui->action_Clear_StreetPass_Config->setEnabled(!emulation_running);
+ 
+     ui->action_Capture_Screenshot->setEnabled(emulation_running);
++    ui->action_Dump_Process_Memory->setEnabled(emulation_running);
+     ui->action_Advance_Frame->setEnabled(emulation_running && is_paused);
+ 
+     if (emulation_running && is_paused) {
+@@ -4728,6 +4732,82 @@ void GMainWindow::OnSaveMovie() {
+     }
+ }
+ 
++void GMainWindow::OnDumpProcessMemory() {
++    // Writes the memory of the running game (every readable region of each application process)
++    // to <user>/dump/memory/<title id>-<date-time>.bin, with a .txt list of the regions next to it
++    // (address, size, file offset). Some games only build settings such as their NEX game-server ID
++    // and access key while they run (Governor of Poker), so they can't be read from the .code dump;
++    // dump after the game has tried to go online. Nothing leaves the machine.
++    if (!emulation_running) {
++        return;
++    }
++    const auto dir = fmt::format("{}memory", FileUtil::GetUserPath(FileUtil::UserPath::DumpDir));
++    FileUtil::CreateFullPath(dir + "/");
++    const std::string stamp =
++        QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")).toStdString();
++
++    std::vector<std::string> written;
++    u64 total = 0;
++    {
++        std::scoped_lock lock{system.Kernel().GetHLELock()};
++        for (const auto& process : system.Kernel().GetProcessList()) {
++            if (!process || !process->codeset) {
++                continue;
++            }
++            const u64 program_id = process->codeset->program_id;
++            if ((program_id >> 32) != 0x00040000) { // games only, not system modules or applets
++                continue;
++            }
++            const auto base = fmt::format("{}/{:016X}-{}", dir, program_id, stamp);
++            FileUtil::IOFile bin(base + ".bin", "wb");
++            FileUtil::IOFile map(base + ".txt", "w");
++            if (!bin.IsOpen() || !map.IsOpen()) {
++                continue;
++            }
++            const std::string header = fmt::format(
++                "Tangelo memory dump of {} ({:016X}), process {}\n"
++                "address    size       file offset  state  permissions\n",
++                process->codeset->name, program_id, process->process_id);
++            map.WriteString(header);
++            std::vector<u8> buffer;
++            u64 offset = 0;
++            for (const auto& [address, vma] : process->vm_manager.vma_map) {
++                if (vma.type != Kernel::VMAType::BackingMemory ||
++                    vma.meminfo_state == Kernel::MemoryState::IO ||
++                    (static_cast<u8>(vma.permissions) &
++                     static_cast<u8>(Kernel::VMAPermission::Read)) == 0 ||
++                    vma.size == 0) {
++                    continue;
++                }
++                buffer.resize(vma.size);
++                system.Memory().ReadBlock(*process, vma.base, buffer.data(), buffer.size());
++                bin.WriteBytes(buffer.data(), buffer.size());
++                map.WriteString(fmt::format("{:08X}   {:08X}   {:08X}     {:<6} {}\n", vma.base,
++                                            vma.size, offset,
++                                            static_cast<int>(vma.meminfo_state),
++                                            static_cast<int>(vma.permissions)));
++                offset += vma.size;
++            }
++            total += offset;
++            written.push_back(base + ".bin");
++            LOG_INFO(Frontend, "Dumped {} bytes of process memory of {:016X} to {}.bin", offset,
++                     program_id, base);
++        }
++    }
++
++    if (written.empty()) {
++        QMessageBox::critical(this, QStringLiteral("Tangelo"),
++                              tr("No running game found to dump.\nRefer to the log for details."));
++        return;
++    }
++    QMessageBox::information(
++        this, QStringLiteral("Tangelo"),
++        tr("Dumped %1 MB of game memory to:\n%2")
++            .arg(total / (1024 * 1024))
++            .arg(QString::fromStdString(written.front())));
++    QDesktopServices::openUrl(QUrl::fromLocalFile(QString::fromStdString(dir)));
++}
++
+ void GMainWindow::OnCaptureScreenshot() {
+     if (!emu_thread) [[unlikely]] {
+         return;
+diff --git a/src/citra_qt/citra_qt.h b/src/citra_qt/citra_qt.h
+index e30d20d..393d8fd 100644
+--- a/src/citra_qt/citra_qt.h
++++ b/src/citra_qt/citra_qt.h
+@@ -308,6 +308,7 @@ private slots:
+     void OnCloseMovie();
+     void OnSaveMovie();
+     void OnCaptureScreenshot();
++    void OnDumpProcessMemory();
+     void OnDumpVideo();
+     void OnCompressFile();
+     void OnDecompressFile();
+diff --git a/src/citra_qt/main.ui b/src/citra_qt/main.ui
+index 3be58dd..cbcb9d6 100644
+--- a/src/citra_qt/main.ui
++++ b/src/citra_qt/main.ui
+@@ -298,6 +298,7 @@
+     <addaction name="separator"/>
+     <addaction name="action_Capture_Screenshot"/>
+     <addaction name="action_Dump_Video"/>
++    <addaction name="action_Dump_Process_Memory"/>
+     <addaction name="separator"/>
+     <addaction name="action_Compress_ROM_File"/>
+     <addaction name="action_Decompress_ROM_File"/>
+@@ -600,6 +601,17 @@
+     <string>Advance Frame</string>
+    </property>
+   </action>
++  <action name="action_Dump_Process_Memory">
++   <property name="enabled">
++    <bool>false</bool>
++   </property>
++   <property name="text">
++    <string>Dump Process Memory</string>
++   </property>
++   <property name="toolTip">
++    <string>Writes the running game's memory to dump/memory (to read settings a game only builds while it runs, such as a NEX access key)</string>
++   </property>
++  </action>
+   <action name="action_Capture_Screenshot">
+    <property name="enabled">
+     <bool>false</bool>
+-- 
+2.43.0
+

@@ -1,0 +1,220 @@
+From 2440d7800bf6fb47d5b4685ac0ce0dfe3a4c1f71 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 30 Oct 2026 21:14:43 +0100
+Subject: [PATCH] Tools: Start SpotPass Tasks Right Away (Build 137)
+
+The real SpotPass module (boss) runs a game's tasks on the game's own
+schedule; Nintendogs + Cats checks for a SpotPass neighbour every 12
+hours, so testing a new file on the server meant waiting half a day.
+
+Tools > Start SpotPass Tasks Right Away (a tick, off at every start):
+while it is on, a game's own boss:U request that names one of its tasks
+(StartTask 0x001C, UpdateTaskInterval 0x0017, UpdateTaskCount 0x0018) is
+passed to boss as StartTaskImmediate (0x001D0042: size, task ID buffer)
+for the same task, and boss's reply goes back to the game under the
+command it sent. All of them answer with just a result. Nintendogs
+names its task once at start (UpdateTaskCount task_EU), so: tick the
+option, start the game, and the task runs straight away. The task count
+or interval the game sent is dropped that one time (it sends it again
+at its next start). Each task is started this way at most once a
+minute. Logged on Service.BOSS Info: "SpotPass: <game> names its task
+<id> ...: starting it right away" and boss's answer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                |  2 +-
+ src/citra_qt/citra_qt.cpp   |  3 ++
+ src/citra_qt/main.ui        | 12 ++++++
+ src/core/hle/kernel/ipc.cpp | 84 +++++++++++++++++++++++++++++++++++++
+ src/core/hle/kernel/ipc.h   |  7 ++++
+ 5 files changed, 107 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 7296f25..065fd3e 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-136
++137
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index f3591ea..0d5d299 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -107,6 +107,7 @@
+ #include "core/file_sys/archive_extsavedata.h"
+ #include "core/file_sys/archive_source_sd_savedata.h"
+ #include "core/frontend/applets/default_applets.h"
++#include "core/hle/kernel/ipc.h"
+ #include "core/hle/kernel/process.h"
+ #include "core/hle/kernel/vm_manager.h"
+ #include "core/hle/service/am/am.h"
+@@ -2419,6 +2420,8 @@ void GMainWindow::ConnectMenuEvents() {
+     });
+     connect_menu(ui->action_Capture_Screenshot, &GMainWindow::OnCaptureScreenshot);
+     connect_menu(ui->action_Dump_Process_Memory, &GMainWindow::OnDumpProcessMemory);
++    connect(ui->action_Start_SpotPass_Now, &QAction::toggled, this,
++            [](bool checked) { Kernel::SetStartSpotPassTasksNow(checked); });
+     connect_menu(ui->action_Dump_Video, &GMainWindow::OnDumpVideo);
+ 
+     // Tools debug
+diff --git a/src/citra_qt/main.ui b/src/citra_qt/main.ui
+index e97f3e1..336e1f1 100644
+--- a/src/citra_qt/main.ui
++++ b/src/citra_qt/main.ui
+@@ -301,6 +301,7 @@
+     <addaction name="action_Capture_Screenshot"/>
+     <addaction name="action_Dump_Video"/>
+     <addaction name="action_Dump_Process_Memory"/>
++    <addaction name="action_Start_SpotPass_Now"/>
+     <addaction name="separator"/>
+     <addaction name="action_Compress_ROM_File"/>
+     <addaction name="action_Decompress_ROM_File"/>
+@@ -603,6 +604,17 @@
+     <string>Advance Frame</string>
+    </property>
+   </action>
++  <action name="action_Start_SpotPass_Now">
++   <property name="checkable">
++    <bool>true</bool>
++   </property>
++   <property name="text">
++    <string>Start SpotPass Tasks Right Away</string>
++   </property>
++   <property name="toolTip">
++    <string>While ticked, a game's SpotPass task starts as soon as the game names it (usually when it starts), instead of at its next scheduled time</string>
++   </property>
++  </action>
+   <action name="action_Dump_Process_Memory">
+    <property name="enabled">
+     <bool>false</bool>
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 1842dfc..704063f 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -3,6 +3,9 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <set>
+ #include <map>
+ #include <mutex>
+ #include <tuple>
+@@ -130,6 +133,28 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+                 command, header, task.empty() ? "" : " task ", task, params);
+ }
+ 
++namespace {
++std::atomic<bool> start_spotpass_tasks_now{false};
++std::mutex start_now_mutex;
++/// (program ID, task ID) -> when it was last started this way, so a game that names its task
++/// over and over doesn't restart it each time (at most once a minute).
++std::map<std::pair<u64, std::string>, std::chrono::steady_clock::time_point> started_now;
++/// Game threads whose request was turned into StartTaskImmediate, with the command they sent,
++/// so the reply goes back under the command the game expects.
++std::map<u32, u32> rewritten_requests;
++} // namespace
++
++void SetStartSpotPassTasksNow(bool enabled) {
++    start_spotpass_tasks_now = enabled;
++    std::scoped_lock lock{start_now_mutex};
++    started_now.clear();
++    LOG_INFO(Service_BOSS, "SpotPass: start tasks right away {}", enabled ? "on" : "off");
++}
++
++bool GetStartSpotPassTasksNow() {
++    return start_spotpass_tasks_now;
++}
++
+ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem& memory,
+                               std::shared_ptr<Thread> src_thread,
+                               std::shared_ptr<Thread> dst_thread, VAddr src_address,
+@@ -157,6 +182,65 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+         LogFailedReply(src_process->GetName(), dst_process->GetName(), header.raw, cmd_buf[1]);
+     }
+ 
++    // Tools > Start SpotPass Tasks Right Away. A game names its SpotPass task to the real
++    // SpotPass module now and then; Nintendogs + Cats does it once at start (UpdateTaskCount
++    // task_EU) and otherwise waits for the module's 12-hour schedule. While the option is on,
++    // such a request becomes StartTaskImmediate (boss:U 0x001D0042: size, task ID buffer) for the
++    // same task, and its reply goes back under the game's own command. All three requests answer
++    // with just a result. UpdateTaskCount/UpdateTaskInterval's value is dropped that once (the
++    // game sets it again at its next start).
++    const auto is_app = [](const Process& process) {
++        return process.codeset && (process.codeset->program_id >> 32) == 0x00040000;
++    };
++    if (!reply && start_spotpass_tasks_now && dst_process->GetName() == "boss" &&
++        is_app(*src_process) &&
++        (header.raw == 0x001C0042 || header.raw == 0x00170082 || header.raw == 0x00180082)) {
++        const std::size_t desc_index = header.raw == 0x001C0042 ? 2 : 3;
++        const u32 desc = cmd_buf[desc_index];
++        const u32 size = desc >> 4;
++        std::string task;
++        if (IPC::GetDescriptorType(desc) == IPC::MappedBuffer && size > 0 && size <= 8) {
++            char buffer[9]{};
++            memory.ReadBlock(*src_process, cmd_buf[desc_index + 1], buffer, size);
++            task = buffer;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        bool start = !task.empty();
++        if (start) {
++            std::scoped_lock lock{start_now_mutex};
++            auto& last = started_now[{src_process->codeset->program_id, task}];
++            start = last == std::chrono::steady_clock::time_point{} ||
++                    now - last > std::chrono::minutes(1);
++            if (start) {
++                last = now;
++                rewritten_requests[src_thread->GetThreadId()] = header.raw;
++            }
++        }
++        if (start) {
++            LOG_INFO(Service_BOSS,
++                     "SpotPass: {} names its task {} (command 0x{:04X}): starting it right away "
++                     "(StartTaskImmediate)",
++                     src_process->GetName(), task, header.raw >> 16);
++            cmd_buf[0] = 0x001D0042;
++            cmd_buf[2] = cmd_buf[desc_index];
++            cmd_buf[3] = cmd_buf[desc_index + 1];
++            header.raw = cmd_buf[0];
++            untranslated_size = 1u + header.normal_params_size;
++            command_size = untranslated_size + header.translate_params_size;
++        }
++    }
++    if (reply && src_process->GetName() == "boss" && (header.raw >> 16) == 0x001D) {
++        std::scoped_lock lock{start_now_mutex};
++        if (const auto it = rewritten_requests.find(dst_thread->GetThreadId());
++            it != rewritten_requests.end()) {
++            LOG_INFO(Service_BOSS, "SpotPass: StartTaskImmediate for {} answered 0x{:08X}",
++                     dst_process->GetName(), header.normal_params_size >= 1 ? cmd_buf[1] : 0);
++            cmd_buf[0] = (it->second & 0xFFFF0000) | (cmd_buf[0] & 0xFFFF);
++            header.raw = cmd_buf[0];
++            rewritten_requests.erase(it);
++        }
++    }
++
+     // Background SpotPass and StreetPass while a game runs (test, 2026-10-16). Games ask NDM to
+     // pause the background daemons when they start (ndm:u SuspendDaemons, mask bit 0 = StreetPass
+     // (cecd), bit 1 = SpotPass (boss), bit 2 = nim); on a console the HOME Menu and sleep mode
+diff --git a/src/core/hle/kernel/ipc.h b/src/core/hle/kernel/ipc.h
+index a8f1107..7991dbc 100644
+--- a/src/core/hle/kernel/ipc.h
++++ b/src/core/hle/kernel/ipc.h
+@@ -47,6 +47,13 @@ Result TranslateCommandBuffer(KernelSystem& system, Memory::MemorySystem& memory
+  * Each (server, command, result) combination is logged at most a few times.
+  */
+ void LogFailedReply(const std::string& server, const std::string& client, u32 header, u32 result);
++
++/// Tools > Start SpotPass Tasks Right Away: while on, a game's own request that names one of its
++/// SpotPass tasks (StartTask, UpdateTaskCount, UpdateTaskInterval) is sent to the SpotPass
++/// module (boss) as StartTaskImmediate for that task, so the task runs now instead of at its
++/// next scheduled time (Nintendogs + Cats: every 12 hours).
++void SetStartSpotPassTasksNow(bool enabled);
++bool GetStartSpotPassTasksNow();
+ } // namespace Kernel
+ 
+ BOOST_CLASS_EXPORT_KEY(Kernel::MappedBufferContext)
+-- 
+2.43.0
+

@@ -1,0 +1,57 @@
+From 40d5aea24a697efded68c9d22355966afb50224a Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Thu, 29 Oct 2026 20:26:49 +0100
+Subject: [PATCH] ac: ScanAPs takes 1.5 seconds, like a real scan (Build 134)
+
+With 0133 The Denpa Men 2 got 8 (or 32) access points from every ScanAPs
+but still said "Looks like there's no one else here". Its scan thread
+reads the system tick before and after the call and, when the scan took
+less than one second (0x0FFB0FF0 ticks), sets the number of access points
+found to 0. Tangelo answered at once.
+
+The reply now comes after 1.5 s of emulated time (SleepClientThread, as
+the UDS beacon scan does).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                   | 2 +-
+ src/core/hle/service/ac/ac.cpp | 8 ++++++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 6a4573e..405e2af 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-133
++134
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index 0cdc490..ce20480 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cctype>
+ #include <cstdlib>
+ #include <cstring>
+@@ -530,6 +531,13 @@ void Module::Interface::ScanAPs(Kernel::HLERequestContext& ctx) {
+     rb.Push<u32>(static_cast<u32>(count));
+     rb.PushStaticBuffer(std::move(buffer), 0);
+ 
++    // A real scan takes over a second, and games check that: The Denpa Men 2 throws the result
++    // away (0 access points) when ScanAPs came back in under a second of system time (it
++    // compares GetSystemTick before and after with 0x0FFB0FF0 = one second). So the reply
++    // comes after 1.5 s, like a scan on a console.
++    static constexpr std::chrono::nanoseconds ScanTime{1'500'000'000};
++    ctx.SleepClientThread("ac::ScanAPs", ScanTime, nullptr);
++
+     LOG_INFO(Service_AC, "ScanAPs: {} access point(s) around (buffer for {})", count,
+              size / APInfoSize);
+     for (std::size_t i = 0; i < count; ++i) {
+-- 
+2.43.0
+

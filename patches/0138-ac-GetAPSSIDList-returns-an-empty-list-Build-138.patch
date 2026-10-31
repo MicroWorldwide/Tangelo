@@ -1,0 +1,124 @@
+From 08516c678c046b88b4701eec363561a09763523b Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Fri, 30 Oct 2026 22:14:47 +0100
+Subject: [PATCH] ac: GetAPSSIDList returns an empty list (Build 138)
+
+The StreetPass module (cecd) calls ac:u GetAPSSIDList (0x003C0042, a
+0xE14-byte mapped output buffer) each time NDM resumes StreetPass after
+a game (Nintendogs + Cats, 2026-10-30), and got "unimplemented". The
+list holds access points the console should know about (most likely
+StreetPass relay points); the emulated console has none saved, so the
+buffer is zeroed (count 0) and success is returned. Logged once at Info,
+then at Debug. Also on ac:i.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                     |  2 +-
+ src/core/hle/service/ac/ac.cpp   | 25 +++++++++++++++++++++++++
+ src/core/hle/service/ac/ac.h     | 11 +++++++++++
+ src/core/hle/service/ac/ac_i.cpp |  2 +-
+ src/core/hle/service/ac/ac_u.cpp |  2 +-
+ 5 files changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 065fd3e..93e7803 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-137
++138
+diff --git a/src/core/hle/service/ac/ac.cpp b/src/core/hle/service/ac/ac.cpp
+index ce20480..a09069f 100644
+--- a/src/core/hle/service/ac/ac.cpp
++++ b/src/core/hle/service/ac/ac.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cctype>
+ #include <cstdlib>
+@@ -505,6 +506,30 @@ void Module::Interface::GetCurrentAPInfo(Kernel::HLERequestContext& ctx) {
+               ac->ac_connected, IsNintendoZoneMode());
+ }
+ 
++void Module::Interface::GetAPSSIDList(Kernel::HLERequestContext& ctx) {
++    // The StreetPass module (cecd) asks for this list (0xE14 bytes) when NDM resumes StreetPass
++    // after a game (seen with Nintendogs + Cats, 2026-10-30). It holds the names of access points
++    // it should know about, most likely for StreetPass relay points; the emulated console has none
++    // saved, so the list is returned empty (all zero: a count of 0).
++    IPC::RequestParser rp(ctx);
++    const u32 size = rp.Pop<u32>();
++    auto& buffer = rp.PopMappedBuffer();
++
++    const std::vector<u8> empty(std::min<std::size_t>(size, buffer.GetSize()), 0);
++    buffer.Write(empty.data(), 0, empty.size());
++
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true)) {
++        LOG_INFO(Service_AC, "GetAPSSIDList: no saved access points (buffer of {} bytes)", size);
++    } else {
++        LOG_DEBUG(Service_AC, "GetAPSSIDList: no saved access points (buffer of {} bytes)", size);
++    }
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
++    rb.Push(ResultSuccess);
++    rb.PushMappedBuffer(buffer);
++}
++
+ void Module::Interface::ScanAPs(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+     const u32 size = rp.Pop<u32>();
+diff --git a/src/core/hle/service/ac/ac.h b/src/core/hle/service/ac/ac.h
+index fd4abea..003c668 100644
+--- a/src/core/hle/service/ac/ac.h
++++ b/src/core/hle/service/ac/ac.h
+@@ -263,6 +263,17 @@ public:
+          */
+         void ScanAPs(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AC::GetAPSSIDList service function (0x003C)
++         *  Inputs:
++         *      1 : Size of the output buffer (the StreetPass module asks 0xE14)
++         *      2-3 : Mapped output buffer
++         *  Outputs:
++         *      1 : Result of function, 0 on success, otherwise error code
++         *      2-3 : The mapped buffer
++         */
++        void GetAPSSIDList(Kernel::HLERequestContext& ctx);
++
+         /**
+          * AC::GetNZoneApNumService service function (0x0011)
+          *  Inputs:
+diff --git a/src/core/hle/service/ac/ac_i.cpp b/src/core/hle/service/ac/ac_i.cpp
+index 9f3d1c0..639ff44 100644
+--- a/src/core/hle/service/ac/ac_i.cpp
++++ b/src/core/hle/service/ac/ac_i.cpp
+@@ -41,7 +41,7 @@ AC_I::AC_I(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:i"
+         {0x0034, &AC_I::GetConnectingSsid, "GetConnectingSsid"},
+         {0x0035, &AC_I::GetConnectingSsidLength, "GetConnectingSsidLength"},
+         {0x0036, &AC_I::GetConnectingProxyEnable, "GetConnectingProxyEnable"},
+-        {0x003C, nullptr, "GetAPSSIDList"},
++        {0x003C, &AC_I::GetAPSSIDList, "GetAPSSIDList"},
+         {0x003D, &AC_I::SetZoneMacFilter, "SetZoneMacFilter"},
+         {0x003E, &AC_I::IsConnected, "IsConnected"},
+         {0x0040, &AC_I::SetClientVersion, "SetClientVersion"},
+diff --git a/src/core/hle/service/ac/ac_u.cpp b/src/core/hle/service/ac/ac_u.cpp
+index 0b39c0b..aa4bfcb 100644
+--- a/src/core/hle/service/ac/ac_u.cpp
++++ b/src/core/hle/service/ac/ac_u.cpp
+@@ -41,7 +41,7 @@ AC_U::AC_U(std::shared_ptr<Module> ac) : Module::Interface(std::move(ac), "ac:u"
+         {0x0034, &AC_U::GetConnectingSsid, "GetConnectingSsid"},
+         {0x0035, &AC_U::GetConnectingSsidLength, "GetConnectingSsidLength"},
+         {0x0036, &AC_U::GetConnectingProxyEnable, "GetConnectingProxyEnable"},
+-        {0x003C, nullptr, "GetAPSSIDList"},
++        {0x003C, &AC_U::GetAPSSIDList, "GetAPSSIDList"},
+         {0x003D, &AC_U::SetZoneMacFilter, "SetZoneMacFilter"},
+         {0x003E, &AC_U::IsConnected, "IsConnected"},
+         {0x0040, &AC_U::SetClientVersion, "SetClientVersion"},
+-- 
+2.43.0
+
