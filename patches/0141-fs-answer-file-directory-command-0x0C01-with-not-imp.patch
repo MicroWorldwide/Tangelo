@@ -1,0 +1,142 @@
+From 9bf0ef5c4045533cd3e959b7aa44cda039d7c281 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 3 Nov 2026 21:27:32 +0100
+Subject: [PATCH] fs: answer file/directory command 0x0C01 with "not
+ implemented" and log it (Build 141)
+
+Build 140 test (3 Nov): ListExistingContentInfosSystem now answers
+(Mario Golf: 1 content), and the log stayed small, but the eShop's "Repair
+software" check still loops: right after the list it sends command 0x0C01
+(4 words: 0, 0, 0x100000, 0 on the first call) on a file or directory
+session, ~14,000 times a second. 0x0C01 is not a known File/Directory
+command; the generic unimplemented handler answered "success" without
+output, and each next call is built from the stale words of the previous
+one.
+
+- File and Directory: 0x0C01 answered with FS NotImplemented
+  (NotSupported, Permanent) instead of the generic success, so the caller
+  gets a failure and stops looping.
+- Logged with the session's path: "File command 0x0C01 on Path: ...
+  (N call(s)): w1 w2 w3 w4; answered not implemented" (first 5 calls, then
+  every 1000th), to identify which file the check reads and what the
+  command is.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                          |  2 +-
+ src/core/hle/service/fs/directory.cpp | 20 ++++++++++++++++++++
+ src/core/hle/service/fs/directory.h   |  1 +
+ src/core/hle/service/fs/file.cpp      | 23 +++++++++++++++++++++++
+ src/core/hle/service/fs/file.h        |  1 +
+ 5 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index dee261d..b4f334f 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-140
++141
+diff --git a/src/core/hle/service/fs/directory.cpp b/src/core/hle/service/fs/directory.cpp
+index 78fdc97..e3c83f1 100644
+--- a/src/core/hle/service/fs/directory.cpp
++++ b/src/core/hle/service/fs/directory.cpp
+@@ -33,6 +33,7 @@ Directory::Directory() : ServiceFramework("", 1), path(""), backend(nullptr) {
+         // clang-format off
+         {0x0801, &Directory::Read, "Read"},
+         {0x0802, &Directory::Close, "Close"},
++        {0x0C01, &Directory::UnknownCommand0C01, "Unknown0C01"},
+         // clang-format on
+     };
+     RegisterHandlers(functions);
+@@ -92,4 +93,23 @@ void Directory::Close(Kernel::HLERequestContext& ctx) {
+         Settings::values.async_fs_operations.GetValue());
+ }
+ 
++// Tangelo: see File::UnknownCommand0C01 (eShop "Repair software" check).
++void Directory::UnknownCommand0C01(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 w1 = rp.Pop<u32>();
++    const u32 w2 = rp.Pop<u32>();
++    const u32 w3 = rp.Pop<u32>();
++    const u32 w4 = rp.Pop<u32>();
++    static u64 calls = 0;
++    if (++calls <= 5 || calls % 1000 == 0) {
++        LOG_WARNING(Service_FS,
++                    "Directory command 0x0C01 on {} ({} call(s)): {:#x} {:#x} {:#x} {:#x}; "
++                    "answered not implemented",
++                    path.DebugStr(), calls, w1, w2, w3, w4);
++    }
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(Result(ErrorDescription::NotImplemented, ErrorModule::FS, ErrorSummary::NotSupported,
++                   ErrorLevel::Permanent));
++}
++
+ } // namespace Service::FS
+diff --git a/src/core/hle/service/fs/directory.h b/src/core/hle/service/fs/directory.h
+index a15ca35..7128851 100644
+--- a/src/core/hle/service/fs/directory.h
++++ b/src/core/hle/service/fs/directory.h
+@@ -26,6 +26,7 @@ public:
+ protected:
+     void Read(Kernel::HLERequestContext& ctx);
+     void Close(Kernel::HLERequestContext& ctx);
++    void UnknownCommand0C01(Kernel::HLERequestContext& ctx);
+ 
+ private:
+     Directory();
+diff --git a/src/core/hle/service/fs/file.cpp b/src/core/hle/service/fs/file.cpp
+index c1c947b..7b6484f 100644
+--- a/src/core/hle/service/fs/file.cpp
++++ b/src/core/hle/service/fs/file.cpp
+@@ -50,6 +50,7 @@ File::File(Kernel::KernelSystem& kernel)
+         {0x080A, &File::SetPriority, "SetPriority"},
+         {0x080B, &File::GetPriority, "GetPriority"},
+         {0x080C, &File::OpenLinkFile, "OpenLinkFile"},
++        {0x0C01, &File::UnknownCommand0C01, "Unknown0C01"},
+     };
+     RegisterHandlers(functions);
+ }
+@@ -472,4 +473,26 @@ std::size_t File::GetSessionFileSize(std::shared_ptr<Kernel::ServerSession> sess
+     return slot->size;
+ }
+ 
++// Tangelo: the eShop's "Repair software" check sends command 0x0C01 (4 words) on a file
++// session after ListExistingContentInfosSystem. Its meaning is unknown; answered with
++// "not implemented" (not the generic "success"), so the caller stops instead of looping, and
++// logged with the file's path so it can be identified.
++void File::UnknownCommand0C01(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 w1 = rp.Pop<u32>();
++    const u32 w2 = rp.Pop<u32>();
++    const u32 w3 = rp.Pop<u32>();
++    const u32 w4 = rp.Pop<u32>();
++    static u64 calls = 0;
++    if (++calls <= 5 || calls % 1000 == 0) {
++        LOG_WARNING(Service_FS,
++                    "File command 0x0C01 on {} ({} call(s)): {:#x} {:#x} {:#x} {:#x}; answered "
++                    "not implemented",
++                    GetName(), calls, w1, w2, w3, w4);
++    }
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    rb.Push(Result(ErrorDescription::NotImplemented, ErrorModule::FS, ErrorSummary::NotSupported,
++                   ErrorLevel::Permanent));
++}
++
+ } // namespace Service::FS
+diff --git a/src/core/hle/service/fs/file.h b/src/core/hle/service/fs/file.h
+index f3c2315..aaffdc3 100644
+--- a/src/core/hle/service/fs/file.h
++++ b/src/core/hle/service/fs/file.h
+@@ -73,6 +73,7 @@ private:
+     void GetPriority(Kernel::HLERequestContext& ctx);
+     void OpenLinkFile(Kernel::HLERequestContext& ctx);
+     void OpenSubFile(Kernel::HLERequestContext& ctx);
++    void UnknownCommand0C01(Kernel::HLERequestContext& ctx);
+ 
+     Kernel::KernelSystem& kernel;
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,206 @@
+From 3566786706c79426b3a18a54a48fa69fa174f25f Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 3 Nov 2026 21:59:01 +0100
+Subject: [PATCH] fs: File GetAvailable (0x0C01); am:net
+ BeginImportTitleForOverWrite (Build 142)
+
+Build 141 test (3 Nov, Mario Golf, eShop "Repair software"): the 0x0C01
+loop stopped. The command came from the eShop ("tiger") on a file opened by
+binary path (the title's content), and our "not implemented" made the check
+report "this software must be repaired" with 17-1012 (FS NotImplemented).
+The repair then called am:net 0x0828 BeginImportTitleForOverWrite
+(unimplemented) and the eShop showed 007-9023.
+
+- FSFile 0x0C010100 is GetAvailable (3dbrew FSFile command list): inputs u64
+  offset and u64 size, output u64 available. The check walks the content in
+  1 MiB steps with it. Answered with the part of the range inside the file
+  (files here are never sparse); first 3 calls logged
+  "GetAvailable <path>: offset=... size=... -> ...". Replaces Build 141's
+  diagnostic answer (Directory keeps the "not implemented" answer + log).
+- am:net 0x0828 BeginImportTitleForOverWrite: inputs media type and title
+  ID; same as BeginImportTitle (ticket lookup, CIA decryption authorised)
+  without the database byte. Logged "BeginImportTitleForOverWrite: title ...".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                       |  2 +-
+ src/core/hle/service/am/am.cpp     | 40 +++++++++++++++++++++++++++
+ src/core/hle/service/am/am.h       | 10 +++++++
+ src/core/hle/service/am/am_net.cpp |  2 +-
+ src/core/hle/service/fs/file.cpp   | 43 +++++++++++++++++-------------
+ src/core/hle/service/fs/file.h     |  2 +-
+ 6 files changed, 78 insertions(+), 21 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index b4f334f..aaacbe6 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-141
++142
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index f9813b1..1a82816 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -4408,6 +4408,46 @@ void Module::Interface::BeginImportTitle(Kernel::HLERequestContext& ctx) {
+     rb.Push(ResultSuccess);
+ }
+ 
++// am:net 0x0828: like BeginImportTitle, without the database byte. Used by the eShop's "Repair
++// software" to download a title again over the installed one; the import writes the contents
++// over the existing files as a normal import does.
++void Module::Interface::BeginImportTitleForOverWrite(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const auto media_type = static_cast<FS::MediaType>(rp.Pop<u8>());
++    const u64 title_id = rp.Pop<u64>();
++
++    LOG_INFO(Service_AM, "BeginImportTitleForOverWrite: title {:016X} media {}", title_id,
++             static_cast<u32>(media_type));
++
++    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
++    if (!IsInstallableMediaType(media_type)) {
++        rb.Push(ResultInvalidMediaType);
++        return;
++    }
++
++    am->importing_title =
++        std::make_shared<CurrentImportingTitle>(Core::System::GetInstance(), title_id, media_type);
++
++    std::scoped_lock lock(am->am_lists_mutex);
++    auto entries = am->am_ticket_list.find(title_id);
++    if (entries == am->am_ticket_list.end()) {
++        rb.Push(ResultUnknown);
++        return;
++    }
++    FileSys::Ticket ticket;
++    if (ticket.Load(title_id, (*entries).second) != Loader::ResultStatus::Success) {
++        rb.Push(ResultUnknown);
++        return;
++    }
++    Result res = am->importing_title->cia_file.ProvideTicket(ticket);
++    if (res.IsError()) {
++        rb.Push(res);
++        return;
++    }
++    AuthorizeCIAFileDecryption(&am->importing_title->cia_file, ctx);
++    rb.Push(ResultSuccess);
++}
++
+ void Module::Interface::StopImportTitle(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+diff --git a/src/core/hle/service/am/am.h b/src/core/hle/service/am/am.h
+index e3f3f03..420bf2f 100644
+--- a/src/core/hle/service/am/am.h
++++ b/src/core/hle/service/am/am.h
+@@ -1189,6 +1189,16 @@ public:
+          */
+         void ListExistingContentInfosSystem(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AM::BeginImportTitleForOverWrite service function (am:net 0x0828)
++         *  Inputs:
++         *      1 : Media type
++         *    2-3 : Title ID
++         *  Outputs:
++         *      1 : Result
++         */
++        void BeginImportTitleForOverWrite(Kernel::HLERequestContext& ctx);
++
+         void CalculateContextRequiredSize(Kernel::HLERequestContext& ctx);
+ 
+         void UpdateImportContentContexts(Kernel::HLERequestContext& ctx);
+diff --git a/src/core/hle/service/am/am_net.cpp b/src/core/hle/service/am/am_net.cpp
+index a62912c..2f199fb 100644
+--- a/src/core/hle/service/am/am_net.cpp
++++ b/src/core/hle/service/am/am_net.cpp
+@@ -119,7 +119,7 @@ AM_NET::AM_NET(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x0825, &AM_NET::CalculateContextRequiredSize, "CalculateContextRequiredSize"},
+         {0x0826, &AM_NET::UpdateImportContentContexts, "UpdateImportContentContexts"},
+         {0x0827, nullptr, "DeleteAllDemoLaunchInfos"},
+-        {0x0828, nullptr, "BeginImportTitleForOverWrite"},
++        {0x0828, &AM_NET::BeginImportTitleForOverWrite, "BeginImportTitleForOverWrite"},
+         {0x0829, &AM_NET::ExportTicketWrapped, "ExportTicketWrapped"},
+         // clang-format on
+     };
+diff --git a/src/core/hle/service/fs/file.cpp b/src/core/hle/service/fs/file.cpp
+index 7b6484f..8c96471 100644
+--- a/src/core/hle/service/fs/file.cpp
++++ b/src/core/hle/service/fs/file.cpp
+@@ -50,7 +50,7 @@ File::File(Kernel::KernelSystem& kernel)
+         {0x080A, &File::SetPriority, "SetPriority"},
+         {0x080B, &File::GetPriority, "GetPriority"},
+         {0x080C, &File::OpenLinkFile, "OpenLinkFile"},
+-        {0x0C01, &File::UnknownCommand0C01, "Unknown0C01"},
++        {0x0C01, &File::GetAvailable, "GetAvailable"},
+     };
+     RegisterHandlers(functions);
+ }
+@@ -473,26 +473,33 @@ std::size_t File::GetSessionFileSize(std::shared_ptr<Kernel::ServerSession> sess
+     return slot->size;
+ }
+ 
+-// Tangelo: the eShop's "Repair software" check sends command 0x0C01 (4 words) on a file
+-// session after ListExistingContentInfosSystem. Its meaning is unknown; answered with
+-// "not implemented" (not the generic "success"), so the caller stops instead of looping, and
+-// logged with the file's path so it can be identified.
+-void File::UnknownCommand0C01(Kernel::HLERequestContext& ctx) {
++// FSFile:GetAvailable (0x0C010100): how much of [offset, offset + size) the file actually has.
++// Inputs: u64 offset, u64 size. Outputs: result, u64 available. Used by the eShop's "Repair
++// software" check, which walks a title's content in 1 MiB steps with it (before Build 142 the
++// generic "success" answer without a size made it loop forever). A file here is never sparse,
++// so this is the part of the range that lies inside the file.
++void File::GetAvailable(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+-    const u32 w1 = rp.Pop<u32>();
+-    const u32 w2 = rp.Pop<u32>();
+-    const u32 w3 = rp.Pop<u32>();
+-    const u32 w4 = rp.Pop<u32>();
++    const u64 offset = rp.Pop<u64>();
++    const u64 size = rp.Pop<u64>();
++
++    const FileSessionSlot* file = GetSessionData(ctx.Session());
++    u64 file_size = backend ? backend->GetSize() : 0;
++    if (file->subfile) {
++        file_size = file->size;
++    } else if (file_size > file->offset) {
++        file_size -= file->offset;
++    }
++    const u64 available = offset >= file_size ? 0 : std::min(size, file_size - offset);
++
+     static u64 calls = 0;
+-    if (++calls <= 5 || calls % 1000 == 0) {
+-        LOG_WARNING(Service_FS,
+-                    "File command 0x0C01 on {} ({} call(s)): {:#x} {:#x} {:#x} {:#x}; answered "
+-                    "not implemented",
+-                    GetName(), calls, w1, w2, w3, w4);
++    if (++calls <= 3) {
++        LOG_INFO(Service_FS, "GetAvailable {}: offset=0x{:x} size=0x{:x} -> 0x{:x}", GetName(),
++                 offset, size, available);
+     }
+-    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+-    rb.Push(Result(ErrorDescription::NotImplemented, ErrorModule::FS, ErrorSummary::NotSupported,
+-                   ErrorLevel::Permanent));
++    IPC::RequestBuilder rb = rp.MakeBuilder(3, 0);
++    rb.Push(ResultSuccess);
++    rb.Push<u64>(available);
+ }
+ 
+ } // namespace Service::FS
+diff --git a/src/core/hle/service/fs/file.h b/src/core/hle/service/fs/file.h
+index aaffdc3..53ab8c0 100644
+--- a/src/core/hle/service/fs/file.h
++++ b/src/core/hle/service/fs/file.h
+@@ -73,7 +73,7 @@ private:
+     void GetPriority(Kernel::HLERequestContext& ctx);
+     void OpenLinkFile(Kernel::HLERequestContext& ctx);
+     void OpenSubFile(Kernel::HLERequestContext& ctx);
+-    void UnknownCommand0C01(Kernel::HLERequestContext& ctx);
++    void GetAvailable(Kernel::HLERequestContext& ctx);
+ 
+     Kernel::KernelSystem& kernel;
+ 
+-- 
+2.43.0
+

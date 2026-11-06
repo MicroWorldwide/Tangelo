@@ -1,0 +1,260 @@
+From 3258fc967a0112740e491f8d387dc011243d67c3 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Tue, 3 Nov 2026 21:11:39 +0100
+Subject: [PATCH] am: ListExistingContentInfosSystem; unimplemented-call log
+ flood guard (Build 140)
+
+The eShop's "Repair software" check (Gedownload > Software herstellen) asks
+am:sys ListExistingContentInfosSystem (0x002B) for the title's contents.
+Tangelo had no handler: the call was answered "success" with nothing in the
+output buffer, after which the check looped on an unknown command (0x0C01)
+on a file session about 14,000 times a second and filled the 100 MB log in
+29 seconds.
+
+- am:u/am:sys/am:net 0x002B ListExistingContentInfosSystem: inputs content
+  count, media type, title ID, start index and a mapped buffer; returns the
+  ContentInfo (index, type, content ID, size, ownership) of every content of
+  the title's TMD whose file exists (and is not being imported), skipping
+  the first start_index of those. Ownership: owned when the ticket gives
+  rights (or there is no ticket), always downloaded. Logs
+  "ListExistingContentInfosSystem: title ...: N content(s)".
+- service.cpp ReportUnimplementedFunction: logs the first 10 calls of each
+  service + command, then a line every 10,000 calls with the count, so a
+  loop on an unimplemented function can no longer fill the log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                       |  2 +-
+ src/core/hle/service/am/am.cpp     | 93 ++++++++++++++++++++++++++++++
+ src/core/hle/service/am/am.h       | 14 +++++
+ src/core/hle/service/am/am_net.cpp |  2 +-
+ src/core/hle/service/am/am_sys.cpp |  2 +-
+ src/core/hle/service/am/am_u.cpp   |  2 +-
+ src/core/hle/service/service.cpp   | 28 ++++++++-
+ 7 files changed, 138 insertions(+), 5 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 897bdc8..dee261d 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-139
++140
+diff --git a/src/core/hle/service/am/am.cpp b/src/core/hle/service/am/am.cpp
+index 6edd1dd..f9813b1 100644
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -5341,6 +5341,99 @@ void Module::Interface::ListCurrentContentInfos(Kernel::HLERequestContext& ctx)
+         true);
+ }
+ 
++void Module::Interface::ListExistingContentInfosSystem(Kernel::HLERequestContext& ctx) {
++    IPC::RequestParser rp(ctx);
++    const u32 content_count = rp.Pop<u32>();
++    const auto media_type = static_cast<Service::FS::MediaType>(rp.Pop<u8>());
++    const u64 title_id = rp.Pop<u64>();
++    const u32 start_index = rp.Pop<u32>();
++
++    struct AsyncData {
++        Service::FS::MediaType media_type;
++        u64 title_id;
++        u32 content_count;
++        u32 start_index;
++        std::set<u16> pending_indices;
++
++        std::vector<ContentInfo> out_vec;
++        Kernel::MappedBuffer* content_info_out;
++        Result res{0};
++    };
++    auto async_data = std::make_shared<AsyncData>();
++    async_data->media_type = media_type;
++    async_data->title_id = title_id;
++    async_data->content_count = content_count;
++    async_data->start_index = start_index;
++    async_data->content_info_out = &rp.PopMappedBuffer();
++    async_data->pending_indices = am->GetPendingImportContentIndices(title_id);
++
++    ctx.RunAsync(
++        [this, async_data](Kernel::HLERequestContext& ctx) {
++            // The contents of an installed title that are present on its media (used by the
++            // eShop's "Repair software" check). Same entries as ListContentInfos, but only for
++            // contents whose file exists, skipping the first start_index of those.
++            FileSys::TitleMetadata tmd;
++            const std::string tmd_path =
++                GetTitleMetadataPath(async_data->media_type, async_data->title_id);
++            if (tmd.Load(tmd_path) != Loader::ResultStatus::Success) {
++                async_data->res = Result(ErrCodes::InvalidTIDInList, ErrorModule::AM,
++                                         ErrorSummary::InvalidArgument, ErrorLevel::Usage);
++                return 0;
++            }
++
++            bool has_ticket = false;
++            FileSys::Ticket ticket;
++            {
++                std::scoped_lock lock(am->am_lists_mutex);
++                auto entries = am->am_ticket_list.find(async_data->title_id);
++                if (entries != am->am_ticket_list.end() &&
++                    ticket.Load(async_data->title_id, (*entries).second) ==
++                        Loader::ResultStatus::Success) {
++                    has_ticket = true;
++                }
++            }
++
++            u32 skipped = 0;
++            for (u16 index = 0; index < tmd.GetContentCount(); index++) {
++                if (async_data->out_vec.size() >= async_data->content_count) {
++                    break;
++                }
++                if (async_data->pending_indices.contains(index) ||
++                    !FileUtil::Exists(GetTitleContentPath(async_data->media_type,
++                                                          async_data->title_id, index))) {
++                    continue;
++                }
++                if (skipped < async_data->start_index) {
++                    skipped++;
++                    continue;
++                }
++                ContentInfo content_info = {};
++                content_info.index = index;
++                content_info.type = tmd.GetContentTypeByIndex(index);
++                content_info.content_id = tmd.GetContentIDByIndex(index);
++                content_info.size = tmd.GetContentSizeByIndex(index);
++                content_info.ownership =
++                    ((!has_ticket || ticket.HasRights(index)) ? OWNERSHIP_OWNED : 0) |
++                    OWNERSHIP_DOWNLOADED;
++                async_data->out_vec.push_back(content_info);
++            }
++            LOG_INFO(Service_AM, "ListExistingContentInfosSystem: title {:016X}: {} content(s)",
++                     async_data->title_id, async_data->out_vec.size());
++            return 0;
++        },
++        [async_data](Kernel::HLERequestContext& ctx) {
++            IPC::RequestBuilder rb(ctx, 2, 0);
++            rb.Push(async_data->res);
++            rb.Push(static_cast<u32>(async_data->out_vec.size()));
++            if (async_data->res.IsSuccess()) {
++                async_data->content_info_out->Write(async_data->out_vec.data(), 0,
++                                                    async_data->out_vec.size() *
++                                                        sizeof(ContentInfo));
++            }
++        },
++        true);
++}
++
+ void Module::Interface::CalculateContextRequiredSize(Kernel::HLERequestContext& ctx) {
+     IPC::RequestParser rp(ctx);
+ 
+diff --git a/src/core/hle/service/am/am.h b/src/core/hle/service/am/am.h
+index 63c66d8..e3f3f03 100644
+--- a/src/core/hle/service/am/am.h
++++ b/src/core/hle/service/am/am.h
+@@ -1175,6 +1175,20 @@ public:
+ 
+         void ListCurrentContentInfos(Kernel::HLERequestContext& ctx);
+ 
++        /**
++         * AM::ListExistingContentInfosSystem service function (0x002B)
++         *  Inputs:
++         *      1 : Content count
++         *      2 : Media type
++         *    3-4 : Title ID
++         *      5 : Start index (among the existing contents)
++         *    6-7 : Mapped output buffer, ContentInfo[count]
++         *  Outputs:
++         *      1 : Result
++         *      2 : Number of content infos written
++         */
++        void ListExistingContentInfosSystem(Kernel::HLERequestContext& ctx);
++
+         void CalculateContextRequiredSize(Kernel::HLERequestContext& ctx);
+ 
+         void UpdateImportContentContexts(Kernel::HLERequestContext& ctx);
+diff --git a/src/core/hle/service/am/am_net.cpp b/src/core/hle/service/am/am_net.cpp
+index b78e3f0..a62912c 100644
+--- a/src/core/hle/service/am/am_net.cpp
++++ b/src/core/hle/service/am/am_net.cpp
+@@ -52,7 +52,7 @@ AM_NET::AM_NET(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x0028, nullptr, "ReadTwlBackupInfoEx"},
+         {0x0029, nullptr, "DeleteUserProgramsAtomically"},
+         {0x002A, nullptr, "GetNumExistingContentInfosSystem"},
+-        {0x002B, nullptr, "ListExistingContentInfosSystem"},
++        {0x002B, &AM_NET::ListExistingContentInfosSystem, "ListExistingContentInfosSystem"},
+         {0x002C, &AM_NET::GetProgramInfosIgnorePlatform, "GetProgramInfosIgnorePlatform"},
+         {0x002D, &AM_NET::CheckContentRightsIgnorePlatform, "CheckContentRightsIgnorePlatform"},
+         {0x0401, nullptr, "UpdateFirmwareTo"},
+diff --git a/src/core/hle/service/am/am_sys.cpp b/src/core/hle/service/am/am_sys.cpp
+index e8f070d..a144426 100644
+--- a/src/core/hle/service/am/am_sys.cpp
++++ b/src/core/hle/service/am/am_sys.cpp
+@@ -52,7 +52,7 @@ AM_SYS::AM_SYS(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "a
+         {0x0028, nullptr, "ReadTwlBackupInfoEx"},
+         {0x0029, nullptr, "DeleteUserProgramsAtomically"},
+         {0x002A, nullptr, "GetNumExistingContentInfosSystem"},
+-        {0x002B, nullptr, "ListExistingContentInfosSystem"},
++        {0x002B, &AM_SYS::ListExistingContentInfosSystem, "ListExistingContentInfosSystem"},
+         {0x002C, &AM_SYS::GetProgramInfosIgnorePlatform, "GetProgramInfosIgnorePlatform"},
+         {0x002D, &AM_SYS::CheckContentRightsIgnorePlatform, "CheckContentRightsIgnorePlatform"},
+         {0x1001, &AM_SYS::GetDLCContentInfoCount, "GetDLCContentInfoCount"},
+diff --git a/src/core/hle/service/am/am_u.cpp b/src/core/hle/service/am/am_u.cpp
+index c8fb951..d1c821e 100644
+--- a/src/core/hle/service/am/am_u.cpp
++++ b/src/core/hle/service/am/am_u.cpp
+@@ -52,7 +52,7 @@ AM_U::AM_U(std::shared_ptr<Module> am) : Module::Interface(std::move(am), "am:u"
+         {0x0028, nullptr, "ReadTwlBackupInfoEx"},
+         {0x0029, nullptr, "DeleteUserProgramsAtomically"},
+         {0x002A, nullptr, "GetNumExistingContentInfosSystem"},
+-        {0x002B, nullptr, "ListExistingContentInfosSystem"},
++        {0x002B, &AM_U::ListExistingContentInfosSystem, "ListExistingContentInfosSystem"},
+         {0x002C, &AM_U::GetProgramInfosIgnorePlatform, "GetProgramInfosIgnorePlatform"},
+         {0x002D, &AM_U::CheckContentRightsIgnorePlatform, "CheckContentRightsIgnorePlatform"},
+         {0x0401, nullptr, "UpdateFirmwareTo"},
+diff --git a/src/core/hle/service/service.cpp b/src/core/hle/service/service.cpp
+index ab4a3c3..4187e02 100644
+--- a/src/core/hle/service/service.cpp
++++ b/src/core/hle/service/service.cpp
+@@ -4,6 +4,9 @@
+ 
+ #include <algorithm>
+ #include <exception>
++#include <map>
++#include <mutex>
++#include <utility>
+ #include <fmt/format.h>
+ #include "common/assert.h"
+ #include "common/hacks/hack_manager.h"
+@@ -169,7 +172,30 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(u32* cmd_buf, const Funct
+ 
+     result.push_back('}');
+ 
+-    LOG_ERROR(Service, "unknown / unimplemented {}", result);
++    // Tangelo: a program that keeps calling the same unimplemented function (the eShop's
++    // "Repair software" check did ~14,000 a second) would fill the whole log file. Log the
++    // first few calls of each service + command, then only a count now and then.
++    static std::mutex unimplemented_mutex;
++    static std::map<std::pair<std::string, u32>, u64> unimplemented_counts;
++    u64 count;
++    {
++        std::scoped_lock lock(unimplemented_mutex);
++        count = ++unimplemented_counts[{service_name, header.command_id.Value()}];
++    }
++    constexpr u64 LOG_FIRST = 10;
++    constexpr u64 LOG_EVERY = 10000;
++    if (count <= LOG_FIRST) {
++        LOG_ERROR(Service, "unknown / unimplemented {}", result);
++        if (count == LOG_FIRST) {
++            LOG_ERROR(Service,
++                      "port='{}' command 0x{:04X}: further calls are counted, logged every {}",
++                      service_name, header.command_id.Value(), LOG_EVERY);
++        }
++    } else if (count % LOG_EVERY == 0) {
++        LOG_ERROR(Service, "unknown / unimplemented function: port='{}' command 0x{:04X} called {} times "
++                  "(last: {})",
++                  service_name, header.command_id.Value(), count, result);
++    }
+     // TODO(bunnei): Hack - ignore error
+     header.normal_params_size.Assign(1);
+     header.translate_params_size.Assign(0);
+-- 
+2.43.0
+
