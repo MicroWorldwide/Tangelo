@@ -1,0 +1,95 @@
+From 9700ed50671cfd33f537f25207339a436aebb941 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 7 Nov 2026 01:45:16 +0100
+Subject: [PATCH] kernel: log what games send BOSS as task properties (Build
+ 145)
+
+boss:U SendProperty (0x0014: u16 property ID, u32 size, mapped buffer)
+is how a game describes the SpotPass task it is about to register. The
+BOSS call log only showed the property number and size. It now also logs
+the content at Info level: property 7 (the task's URL) as text, the others
+as hex (first 32 bytes). These lines are logged before the per-command
+rate limit, so every registration shows in full.
+
+Why: New Super Mario Bros. 2's "present" task was registered and started
+right away twice (7 Nov 2026), reported success, but the server never got
+a request for it. The URL the game gave decides where to look next.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/ipc.cpp | 37 ++++++++++++++++++++++++++++++++-----
+ 2 files changed, 33 insertions(+), 6 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index a29644e..13c09a0 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-144
++145
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 825c88f..7b9bbc4 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <algorithm>
++#include <vector>
+ #include <atomic>
+ #include <chrono>
+ #include <set>
+@@ -65,6 +66,37 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+     const u32 header = cmd_buf[0];
+     const u16 command = static_cast<u16>(header >> 16);
+     const u32 result = reply && untranslated_size > 1 ? cmd_buf[1] : 0;
++    // Service_BOSS:Debug, except NDM pausing and resuming SpotPass (ndm -> boss), which is
++    // rare and tells whether background SpotPass runs at all.
++    const bool ndm_boss = src.GetName() == "ndm" && dst.GetName() == "boss";
++    const auto level = ndm_boss && !reply && command <= 0x0004 ? Common::Log::Level::Info
++                                                               : Common::Log::Level::Debug;
++    // boss:U SendProperty (0x0014: u16 property ID, u32 size, mapped buffer): what a game tells
++    // BOSS about the task it is about to register. Property 7 is the task's URL; the others are
++    // shown as hex. Added for New Super Mario Bros. 2, whose "present" task ran without asking
++    // the server for anything (7 Nov 2026). Always logged (a game sends ~20 per registration).
++    if (!reply && dst.GetName() == "boss" && command == 0x0014 && untranslated_size >= 3 &&
++        untranslated_size + 1 < command_size &&
++        IPC::GetDescriptorType(cmd_buf[untranslated_size]) == IPC::MappedBuffer) {
++        const u32 property = cmd_buf[1] & 0xFFFF;
++        const u32 size = std::min<u32>(cmd_buf[untranslated_size] >> 4, 0x200);
++        std::vector<u8> data(size);
++        memory.ReadBlock(src, cmd_buf[untranslated_size + 1], data.data(), size);
++        std::string shown;
++        if (property == 0x07) {
++            shown.assign(data.begin(), std::find(data.begin(), data.end(), u8{0}));
++            shown = "URL \"" + shown + "\"";
++        } else {
++            for (std::size_t k = 0; k < std::min<std::size_t>(size, 32); ++k) {
++                shown += fmt::format("{:02X}", data[k]);
++            }
++            if (size > 32) {
++                shown += "...";
++            }
++        }
++        LOG_INFO(Service_BOSS, "{} -> boss: SendProperty 0x{:02X} ({} bytes): {}", src.GetName(),
++                 property, size, shown);
++    }
+     {
+         std::scoped_lock lock{mutex};
+         const u64 n = ++counts[{src.GetName(), dst.GetName(), command, result}];
+@@ -72,11 +104,6 @@ static void LogBossCall(Memory::MemorySystem& memory, Process& src, Process& dst
+             return;
+         }
+     }
+-    // Service_BOSS:Debug, except NDM pausing and resuming SpotPass (ndm -> boss), which is
+-    // rare and tells whether background SpotPass runs at all.
+-    const bool ndm_boss = src.GetName() == "ndm" && dst.GetName() == "boss";
+-    const auto level = ndm_boss && !reply && command <= 0x0004 ? Common::Log::Level::Info
+-                                                               : Common::Log::Level::Debug;
+     if (reply) {
+         // Friends replies: the words after the result too (e.g. GetFriendKeyList's count).
+         std::string values;
+-- 
+2.43.0
+

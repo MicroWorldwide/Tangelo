@@ -1,0 +1,110 @@
+From 4d7be9c1b30148edc8eee0d12431da5f4c8c77cd Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 7 Nov 2026 02:07:59 +0100
+Subject: [PATCH] kernel: start SpotPass tasks right away with StartBgImmediate
+ (Build 146)
+
+Tools > Start SpotPass Tasks Right Away turned a game's StartTask /
+UpdateTaskCount / UpdateTaskInterval into StartTaskImmediate (boss:U
+0x001D). For New Super Mario Bros. 2's ordinary tasks ("present",
+"patch", registered with RegisterTask) BOSS answered success and opened no
+HTTP connection at all (7 Nov 2026, HTTP debug log), so the archived
+present file was never fetched.
+
+New Style Boutique 2 shows how games do it themselves: ordinary tasks
+(NEWS, POSTER) are registered with RegisterTask and run now with
+StartBgImmediate (0x0033), and those download; StartTaskImmediate is
+paired with RegisterImmediateTask (0x0035, its FGONLYT task). The request
+now becomes StartBgImmediate (same layout: size, task ID buffer), and its
+reply still goes back under the game's own command.
+
+The task settings NSMB2 sends (Build 145 log) match NSB2's except for the
+interval (1 h vs 1 day) and count (99 vs 100).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ BUILD-NUMBER                |  2 +-
+ src/core/hle/kernel/ipc.cpp | 18 ++++++++++++------
+ src/core/hle/kernel/ipc.h   |  2 +-
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 13c09a0..878d5a0 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-145
++146
+diff --git a/src/core/hle/kernel/ipc.cpp b/src/core/hle/kernel/ipc.cpp
+index 7b9bbc4..511f9f4 100644
+--- a/src/core/hle/kernel/ipc.cpp
++++ b/src/core/hle/kernel/ipc.cpp
+@@ -166,7 +166,7 @@ std::mutex start_now_mutex;
+ /// (program ID, task ID) -> when it was last started this way, so a game that names its task
+ /// over and over doesn't restart it each time (at most once a minute).
+ std::map<std::pair<u64, std::string>, std::chrono::steady_clock::time_point> started_now;
+-/// Game threads whose request was turned into StartTaskImmediate, with the command they sent,
++/// Game threads whose request was turned into StartBgImmediate, with the command they sent,
+ /// so the reply goes back under the command the game expects.
+ std::map<u32, u32> rewritten_requests;
+ 
+@@ -223,10 +223,16 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+     // Tools > Start SpotPass Tasks Right Away. A game names its SpotPass task to the real
+     // SpotPass module now and then; Nintendogs + Cats does it once at start (UpdateTaskCount
+     // task_EU) and otherwise waits for the module's 12-hour schedule. While the option is on,
+-    // such a request becomes StartTaskImmediate (boss:U 0x001D0042: size, task ID buffer) for the
++    // such a request becomes a start-now request (size, task ID buffer) for the
+     // same task, and its reply goes back under the game's own command. All three requests answer
+     // with just a result. UpdateTaskCount/UpdateTaskInterval's value is dropped that once (the
+     // game sets it again at its next start).
++    // Since Build 146 the request becomes StartBgImmediate (boss:U 0x00330042, same layout), the
++    // call games use themselves to run a registered task now (New Style Boutique 2: RegisterTask
++    // + 0x0033 for NEWS / POSTER, which download). StartTaskImmediate (0x001D) is what games
++    // pair with RegisterImmediateTask (0x0035, NSB2's FGONLYT); for New Super Mario Bros. 2's
++    // ordinary "present" / "patch" tasks it answered success and downloaded nothing (7 Nov 2026,
++    // no HTTP context opened at all).
+     const auto is_app = [](const Process& process) {
+         return process.codeset && (process.codeset->program_id >> 32) == 0x00040000;
+     };
+@@ -257,9 +263,9 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+         if (start) {
+             LOG_INFO(Service_BOSS,
+                      "SpotPass: {} names its task {} (command 0x{:04X}): starting it right away "
+-                     "(StartTaskImmediate)",
++                     "(StartBgImmediate)",
+                      src_process->GetName(), task, header.raw >> 16);
+-            cmd_buf[0] = 0x001D0042;
++            cmd_buf[0] = 0x00330042;
+             cmd_buf[2] = cmd_buf[desc_index];
+             cmd_buf[3] = cmd_buf[desc_index + 1];
+             header.raw = cmd_buf[0];
+@@ -267,11 +273,11 @@ Result TranslateCommandBuffer(Kernel::KernelSystem& kernel, Memory::MemorySystem
+             command_size = untranslated_size + header.translate_params_size;
+         }
+     }
+-    if (reply && src_process->GetName() == "boss" && (header.raw >> 16) == 0x001D) {
++    if (reply && src_process->GetName() == "boss" && (header.raw >> 16) == 0x0033) {
+         std::scoped_lock lock{start_now_mutex};
+         if (const auto it = rewritten_requests.find(dst_thread->GetThreadId());
+             it != rewritten_requests.end()) {
+-            LOG_INFO(Service_BOSS, "SpotPass: StartTaskImmediate for {} answered 0x{:08X}",
++            LOG_INFO(Service_BOSS, "SpotPass: StartBgImmediate for {} answered 0x{:08X}",
+                      dst_process->GetName(), header.normal_params_size >= 1 ? cmd_buf[1] : 0);
+             cmd_buf[0] = (it->second & 0xFFFF0000) | (cmd_buf[0] & 0xFFFF);
+             header.raw = cmd_buf[0];
+diff --git a/src/core/hle/kernel/ipc.h b/src/core/hle/kernel/ipc.h
+index e3a27e8..8c440ad 100644
+--- a/src/core/hle/kernel/ipc.h
++++ b/src/core/hle/kernel/ipc.h
+@@ -52,7 +52,7 @@ void LogFailedReply(const std::string& server, const std::string& client, u32 he
+ 
+ /// Tools > Start SpotPass Tasks Right Away: while on, a game's own request that names one of its
+ /// SpotPass tasks (StartTask, UpdateTaskCount, UpdateTaskInterval) is sent to the SpotPass
+-/// module (boss) as StartTaskImmediate for that task, so the task runs now instead of at its
++/// module (boss) as StartBgImmediate (0x0033) for that task, so the task runs now instead of at its
+ /// next scheduled time (Nintendogs + Cats: every 12 hours).
+ void SetStartSpotPassTasksNow(bool enabled);
+ bool GetStartSpotPassTasksNow();
+-- 
+2.43.0
+

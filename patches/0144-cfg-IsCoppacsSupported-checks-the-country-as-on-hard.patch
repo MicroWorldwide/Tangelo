@@ -1,0 +1,64 @@
+From 363d392ee17000acfd1c5a067c2c69c163823c76 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 7 Nov 2026 00:15:18 +0100
+Subject: [PATCH] cfg: IsCoppacsSupported checks the country, as on hardware
+ (Build 144)
+
+COPPACS (the Child Online Privacy Protection setting in Parental Controls)
+only applies to a USA-region console whose country is Canada (18) or the
+United States (49) (3dbrew, Cfg:GetRegionCanadaUSA). Tangelo only checked
+the region. A USA game on a European console gets the USA region for the
+session (UseGameRegion) but keeps its own country, so it was told COPPACS
+applies and asked for a setting such a console never has: Art Academy:
+Lessons for Everyone! (USA) on its gallery / SpotPass feature showed
+"To use this feature, you need to complete the Child Online Privacy
+Protection setting in Parental Controls", and OK tried to start the USA
+System Settings (not installed on a European NAND).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ BUILD-NUMBER                     |  2 +-
+ src/core/hle/service/cfg/cfg.cpp | 20 ++++++++++++++------
+ 2 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index fba7ed5..a29644e 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-143
++144
+diff --git a/src/core/hle/service/cfg/cfg.cpp b/src/core/hle/service/cfg/cfg.cpp
+index aa3f766..3e7dae9 100644
+--- a/src/core/hle/service/cfg/cfg.cpp
++++ b/src/core/hle/service/cfg/cfg.cpp
+@@ -612,12 +612,20 @@ void Module::Interface::IsCoppacsSupported(Kernel::HLERequestContext& ctx) {
+     bool from_secure_info = Common::Hacks::hack_manager.OverrideBooleanSetting(
+         Common::Hacks::HackType::REGION_FROM_SECURE, caller_tid, false);
+ 
+-    u8 canada_or_usa = 1;
+-    if (canada_or_usa == cfg->GetRegionValueFor(caller_tid, from_secure_info)) {
+-        rb.Push(true);
+-    } else {
+-        rb.Push(false);
+-    }
++    // As on hardware (3dbrew Cfg:GetRegionCanadaUSA): COPPACS (the Child Online Privacy
++    // Protection setting in Parental Controls) only applies to a USA-region console whose
++    // country is Canada (18) or the United States (49). Checking the region alone made a USA game
++    // on a European console (the region is switched to the game's for the session, the country
++    // is not) ask for a COPPACS setting such a console never has, e.g. Art Academy's gallery:
++    // "To use this feature, you need to complete the Child Online Privacy Protection setting".
++    constexpr u32 usa_region = 1;
++    constexpr u8 canada = 18;
++    constexpr u8 united_states = 49;
++    const u8 country = cfg->GetCountryCode();
++    const bool supported = cfg->GetRegionValueFor(caller_tid, from_secure_info) == usa_region &&
++                           (country == canada || country == united_states);
++    LOG_DEBUG(Service_CFG, "called, country={}, supported={}", country, supported);
++    rb.Push(supported);
+ }
+ 
+ void Module::Interface::GetSystemModel(Kernel::HLERequestContext& ctx) {
+-- 
+2.43.0
+

@@ -1,0 +1,162 @@
+From 3b4d4402593f931b1a2608321152a5169fb54660 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 7 Nov 2026 13:50:10 +0100
+Subject: [PATCH] video_core: reinterpret D16 depth as RG8 colour in OpenGL
+ (Build 147)
+
+DEAD OR ALIVE Dimensions reads its 16-bit depth buffer back as an RG8 texture
+(log: 'Unimplemented reinterpretation D16(0x81a5) -> RG8(0x8058)', many times a
+second), so the texture kept stale contents. In 3DS memory both formats are two
+bytes a pixel: D16 is a little-endian u16 and RG8 is stored [G, R], so R gets the
+depth's high byte and G its low byte. New shader d16_to_rg8.frag, done like the
+existing D24S8 -> RGBA8 and RGBA4 -> RGB5A1 reinterpreters.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                                  |  2 +-
+ src/video_core/host_shaders/CMakeLists.txt    |  1 +
+ .../format_reinterpreter/d16_to_rg8.frag      | 25 +++++++++++++++++++
+ .../renderer_opengl/gl_blit_helper.cpp        | 25 ++++++++++++++++++-
+ .../renderer_opengl/gl_blit_helper.h          |  3 +++
+ .../renderer_opengl/gl_texture_runtime.cpp    |  2 ++
+ 6 files changed, 56 insertions(+), 2 deletions(-)
+ create mode 100644 src/video_core/host_shaders/format_reinterpreter/d16_to_rg8.frag
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 878d5a0..c748b56 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-146
++147
+diff --git a/src/video_core/host_shaders/CMakeLists.txt b/src/video_core/host_shaders/CMakeLists.txt
+index 39942c1..0eafa18 100644
+--- a/src/video_core/host_shaders/CMakeLists.txt
++++ b/src/video_core/host_shaders/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ # Refer to the misc/licenses/gplv2.txt file included.
+ 
+ set(SHADER_FILES
++    format_reinterpreter/d16_to_rg8.frag
+     format_reinterpreter/d24s8_to_rgba8.frag
+     format_reinterpreter/rgba4_to_rgb5a1.frag
+     format_reinterpreter/vulkan_d24s8_to_rgba8.comp
+diff --git a/src/video_core/host_shaders/format_reinterpreter/d16_to_rg8.frag b/src/video_core/host_shaders/format_reinterpreter/d16_to_rg8.frag
+new file mode 100644
+index 0000000..c9eb3d5
+--- /dev/null
++++ b/src/video_core/host_shaders/format_reinterpreter/d16_to_rg8.frag
+@@ -0,0 +1,25 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv2 or any later version
++// Refer to the misc/licenses/gplv2.txt file included.
++
++//? #version 430 core
++
++// A 16-bit depth buffer read back as an RG8 texture (DEAD OR ALIVE Dimensions does this).
++// In 3DS memory both are two bytes per pixel: D16 is a little-endian u16 (low byte first) and
++// RG8 is stored [G, R], so R gets the high byte of the depth and G the low byte.
++
++precision highp int;
++precision highp float;
++
++layout(location = 0) in mediump vec2 tex_coord;
++layout(location = 0) out lowp vec4 frag_color;
++
++layout(binding = 0) uniform highp sampler2D depth;
++
++void main() {
++    mediump vec2 coord = tex_coord * vec2(textureSize(depth, 0));
++    mediump ivec2 tex_icoord = ivec2(coord);
++    highp uint depth_val = uint(texelFetch(depth, tex_icoord, 0).x * (exp2(16.0) - 1.0) + 0.5);
++    highp uvec2 components = uvec2(depth_val >> 8u, depth_val) & 0x000000FFu;
++    frag_color = vec4(vec2(components) / (exp2(8.0) - 1.0), 0.0, 1.0);
++}
+diff --git a/src/video_core/renderer_opengl/gl_blit_helper.cpp b/src/video_core/renderer_opengl/gl_blit_helper.cpp
+index 18eb83d..8da2ecd 100644
+--- a/src/video_core/renderer_opengl/gl_blit_helper.cpp
++++ b/src/video_core/renderer_opengl/gl_blit_helper.cpp
+@@ -10,6 +10,7 @@
+ #include "video_core/renderer_opengl/gl_state.h"
+ #include "video_core/renderer_opengl/gl_texture_runtime.h"
+ 
++#include "video_core/host_shaders/format_reinterpreter/d16_to_rg8_frag.h"
+ #include "video_core/host_shaders/format_reinterpreter/d24s8_to_rgba8_frag.h"
+ #include "video_core/host_shaders/format_reinterpreter/rgba4_to_rgb5a1_frag.h"
+ #include "video_core/host_shaders/full_screen_triangle_vert.h"
+@@ -65,7 +66,8 @@ BlitHelper::BlitHelper(const Driver& driver_)
+       gradient_y_program{CreateProgram(HostShaders::Y_GRADIENT_FRAG, "Y_GRADIENT_FRAG")},
+       refine_program{CreateProgram(HostShaders::REFINE_FRAG, "REFINE_FRAG")},
+       d24s8_to_rgba8{CreateProgram(HostShaders::D24S8_TO_RGBA8_FRAG, "D24S8_TO_RGBA8_FRAG")},
+-      rgba4_to_rgb5a1{CreateProgram(HostShaders::RGBA4_TO_RGB5A1_FRAG, "RGBA4_TO_RGB5A1_FRAG")} {
++      rgba4_to_rgb5a1{CreateProgram(HostShaders::RGBA4_TO_RGB5A1_FRAG, "RGBA4_TO_RGB5A1_FRAG")},
++      d16_to_rg8{CreateProgram(HostShaders::D16_TO_RG8_FRAG, "D16_TO_RG8_FRAG")} {
+     vao.Create();
+     draw_fbo.Create();
+     state.draw.vertex_array = vao.handle;
+@@ -160,6 +162,27 @@ bool BlitHelper::ConvertRGBA4ToRGB5A1(Surface& source, Surface& dest,
+     return true;
+ }
+ 
++bool BlitHelper::ConvertD16ToRG8(Surface& source, Surface& dest,
++                                 const VideoCore::TextureCopy& copy) {
++    OpenGLState prev_state = OpenGLState::GetCurState();
++    SCOPE_EXIT({ prev_state.Apply(); });
++
++    // The depth texture is read with texelFetch (no filtering, no depth compare).
++    state.texture_units[0].texture_2d = source.Handle();
++    state.texture_units[0].target = GL_TEXTURE_2D;
++    state.texture_units[0].sampler = 0;
++
++    const Common::Rectangle src_rect{copy.src_offset.x, copy.src_offset.y + copy.extent.height,
++                                     copy.src_offset.x + copy.extent.width, copy.src_offset.x};
++    const Common::Rectangle dst_rect{copy.dst_offset.x, copy.dst_offset.y + copy.extent.height,
++                                     copy.dst_offset.x + copy.extent.width, copy.dst_offset.x};
++    SetParams(d16_to_rg8, source.RealExtent(), src_rect);
++    Draw(d16_to_rg8, dest.Handle(), draw_fbo.handle, 0, dst_rect);
++
++    state.texture_units[0].sampler = linear_sampler.handle;
++    return true;
++}
++
+ bool BlitHelper::Filter(Surface& surface, const VideoCore::TextureBlit& blit) {
+     const auto filter = Settings::values.texture_filter.GetValue();
+     const bool is_depth =
+diff --git a/src/video_core/renderer_opengl/gl_blit_helper.h b/src/video_core/renderer_opengl/gl_blit_helper.h
+index 11cf97f..e7b6589 100644
+--- a/src/video_core/renderer_opengl/gl_blit_helper.h
++++ b/src/video_core/renderer_opengl/gl_blit_helper.h
+@@ -31,6 +31,8 @@ public:
+ 
+     bool ConvertRGBA4ToRGB5A1(Surface& source, Surface& dest, const VideoCore::TextureCopy& copy);
+ 
++    bool ConvertD16ToRG8(Surface& source, Surface& dest, const VideoCore::TextureCopy& copy);
++
+ private:
+     void FilterAnime4K(Surface& surface, const VideoCore::TextureBlit& blit);
+     void FilterBicubic(Surface& surface, const VideoCore::TextureBlit& blit);
+@@ -60,6 +62,7 @@ private:
+     OGLProgram refine_program;
+     OGLProgram d24s8_to_rgba8;
+     OGLProgram rgba4_to_rgb5a1;
++    OGLProgram d16_to_rg8;
+ 
+     OGLTexture temp_tex;
+     VideoCore::Extent temp_extent{};
+diff --git a/src/video_core/renderer_opengl/gl_texture_runtime.cpp b/src/video_core/renderer_opengl/gl_texture_runtime.cpp
+index 2e234a7..177c11e 100644
+--- a/src/video_core/renderer_opengl/gl_texture_runtime.cpp
++++ b/src/video_core/renderer_opengl/gl_texture_runtime.cpp
+@@ -186,6 +186,8 @@ bool TextureRuntime::Reinterpret(Surface& source, Surface& dest,
+         blit_helper.ConvertDS24S8ToRGBA8(source, dest, copy);
+     } else if (src_format == PixelFormat::RGBA4 && dst_format == PixelFormat::RGB5A1) {
+         blit_helper.ConvertRGBA4ToRGB5A1(source, dest, copy);
++    } else if (src_format == PixelFormat::D16 && dst_format == PixelFormat::RG8) {
++        blit_helper.ConvertD16ToRG8(source, dest, copy);
+     } else {
+         LOG_WARNING(Render_OpenGL, "Unimplemented reinterpretation {}({:#x}) -> {}({:#x})",
+                     VideoCore::PixelFormatAsString(src_format), source.Tuple().internal_format,
+-- 
+2.43.0
+
