@@ -1,0 +1,49 @@
+From 7b43fa8afac42a8097c85a636c72c106e5c24c45 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sun, 8 Nov 2026 19:24:18 +0100
+Subject: [PATCH] http: SendPostDataBinary works on chunked POSTs (Build 153)
+
+The state check in SendPostDataBinary was the wrong way round: it refused post
+data while the request was NotStarted, which is exactly when Tangelo takes it
+(a chunked POST is only sent at NotifyFinishSendPostData). SendPostDataAscii and
+SendPostDataRaw already checked it the right way. Every binary chunked upload
+failed with 0xD8A0A016 "Tried to add Post data on a context that has not been
+started"; seen 2026-11-08 for the SpotPass module's upload that reads its data
+from cecd, every ~10 minutes.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                         | 2 +-
+ src/core/hle/service/http/http_c.cpp | 8 ++++++--
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 492dff0..7f1ddd5 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-152
++153
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index d5eaad0..c5610aa 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -1402,8 +1402,12 @@ void HTTP_C::SendPostDataBinaryImpl(Kernel::HLERequestContext& ctx, bool timeout
+ 
+     Context& http_context = GetContext(context_handle);
+ 
+-    if (http_context.state == RequestState::NotStarted) {
+-        LOG_ERROR(Service_HTTP, "Tried to add Post data on a context that has not been started");
++    // Like SendPostDataAscii/Raw: a chunked POST stays NotStarted here until
++    // NotifyFinishSendPostData sends it (httplib needs the whole body first). The check was the
++    // wrong way round, so every SendPostDataBinary failed (2026-11-08: boss's upload that reads
++    // its data from cecd, every ~10 minutes, 0xD8A0A016).
++    if (http_context.state != RequestState::NotStarted) {
++        LOG_ERROR(Service_HTTP, "Tried to send Post data on a context that has been started");
+         IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+         rb.Push(ErrorInvalidRequestState);
+         rb.PushMappedBuffer(value_buffer);
+-- 
+2.43.0
+

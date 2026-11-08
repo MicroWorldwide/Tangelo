@@ -1,0 +1,109 @@
+From a23790d9fbac93403f00c1cd831c8a2767b2b025 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 7 Nov 2026 15:23:42 +0100
+Subject: [PATCH] SpotPass Tasks: no-limit runs, no runs left, names for system
+ titles (Build 150)
+
+From the first look at the window (7 Nov 15:22): runs left 0xFFFFFFFF shows as
+'no limit'; a task with 0 runs left shows 'no runs left' instead of 'due now'
+(and no longer counts as due); intervals that aren't whole minutes read
+'14 min 56 s' (NetPass sprelay, 896 s); titles not in the game list get a name:
+the HOME Menu by region, other system titles by kind (system app / applet /
+module) with their title ID.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                    |  2 +-
+ src/citra_qt/spotpass_tasks.cpp | 44 ++++++++++++++++++++++++++++++---
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 15c44e9..fa8f08c 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-149
++150
+diff --git a/src/citra_qt/spotpass_tasks.cpp b/src/citra_qt/spotpass_tasks.cpp
+index 5d20814..e4c232c 100644
+--- a/src/citra_qt/spotpass_tasks.cpp
++++ b/src/citra_qt/spotpass_tasks.cpp
+@@ -62,9 +62,41 @@ QString Interval(u32 seconds) {
+     if (seconds % 60 == 0) {
+         return QObject::tr("%n minute(s)", "", static_cast<int>(seconds / 60));
+     }
++    if (seconds > 60) {
++        return QObject::tr("%1 min %2 s").arg(seconds / 60).arg(seconds % 60);
++    }
+     return QObject::tr("%n second(s)", "", static_cast<int>(seconds));
+ }
+ 
++/// The SpotPass module's "no limit" for runs left.
++constexpr u32 NoLimit = 0xFFFFFFFF;
++
++/// A name for titles that aren't in the game list: the HOME Menu by name, other system titles
++/// by kind (the title ID's high word), anything else by its title ID.
++QString FallbackName(u64 program_id) {
++    switch (program_id) {
++    case 0x0004003000008202:
++        return QObject::tr("HOME Menu (JPN)");
++    case 0x0004003000008F02:
++        return QObject::tr("HOME Menu (USA)");
++    case 0x0004003000009802:
++        return QObject::tr("HOME Menu (EUR)");
++    default:
++        break;
++    }
++    const QString id = QString::fromStdString(fmt::format("{:016X}", program_id));
++    switch (program_id >> 32) {
++    case 0x00040010:
++        return QObject::tr("System app %1").arg(id);
++    case 0x00040030:
++        return QObject::tr("System applet %1").arg(id);
++    case 0x00040130:
++        return QObject::tr("System module %1").arg(id);
++    default:
++        return id;
++    }
++}
++
+ QString ResultText(const Service::BOSS::SpotPassTaskSummary& task) {
+     if (task.last_run == 0) {
+         return QObject::tr("never run");
+@@ -174,7 +206,7 @@ void SpotPassTasks::Refresh() {
+         item->setData(ColumnGame, RunnableRole, runnable);
+ 
+         GameInfo game = lookup ? lookup(task.program_id) : GameInfo{};
+-        item->setText(ColumnGame, game.name.isEmpty() ? program : game.name);
++        item->setText(ColumnGame, game.name.isEmpty() ? FallbackName(task.program_id) : game.name);
+         item->setIcon(ColumnGame, game.icon);
+         item->setToolTip(ColumnGame, program);
+         item->setText(ColumnTask, task_id);
+@@ -188,7 +220,12 @@ void SpotPassTasks::Refresh() {
+             item->setForeground(ColumnResult, QColor(0xC0, 0x50, 0x00));
+         }
+ 
+-        if (task.interval != 0 && task.last_run != 0) {
++        if (task.runs_left == 0) {
++            item->setText(ColumnNextRun, tr("no runs left"));
++            item->setForeground(ColumnNextRun, QColor(0x80, 0x80, 0x80));
++            item->setToolTip(ColumnNextRun, tr("The game sets new runs the next time it starts "
++                                               "(or the task is finished)."));
++        } else if (task.interval != 0 && task.last_run != 0) {
+             const qint64 next = static_cast<qint64>(task.last_run) + task.interval;
+             if (next <= now) {
+                 item->setText(ColumnNextRun, tr("due now"));
+@@ -207,7 +244,8 @@ void SpotPassTasks::Refresh() {
+         } else {
+             item->setText(ColumnNextRun, QStringLiteral("–"));
+         }
+-        item->setText(ColumnRunsLeft, QString::number(task.runs_left));
++        item->setText(ColumnRunsLeft,
++                      task.runs_left == NoLimit ? tr("no limit") : QString::number(task.runs_left));
+         item->setText(ColumnAddress, upload ? tr("(sends data) %1").arg(QString::fromStdString(
+                                                   task.url))
+                                             : QString::fromStdString(task.url));
+-- 
+2.43.0
+

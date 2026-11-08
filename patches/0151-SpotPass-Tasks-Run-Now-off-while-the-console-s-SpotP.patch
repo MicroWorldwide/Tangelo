@@ -1,0 +1,144 @@
+From 783a3617679c3816ab46910e2f6207d5eb184da7 Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 7 Nov 2026 15:44:47 +0100
+Subject: [PATCH] SpotPass Tasks: Run Now off while the console's SpotPass
+ module runs (Build 151)
+
+With the console's own SpotPass module (the LLE 'boss' system module, used with
+the online modules on), files Run Now wrote in Tangelo's way (tangelo_<ID>, the
+0x34-byte header) aren't the module's own: for DEAD OR ALIVE Dimensions it then
+listed a made-up NsData ID (0xF6AF7D74) and the game asked its data type and
+set its new flag every 15 seconds, stuck on its mode select at 2 FPS (7 Nov
+15:40; moving the two tangelo_ files away fixed it).
+
+OnlineService::RealModuleInUse(): a running 'boss' process, or (not running)
+the BOSS LLE setting / required online modules with a linked console. Run Now
+refuses then (core and window); the window says why and that the module runs
+the tasks itself while the HOME Menu or another game is open. Run Now stays
+for Tangelo's own SpotPass module.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                                 |  2 +-
+ src/citra_qt/spotpass_tasks.cpp              | 19 +++++++++++++---
+ src/core/hle/service/boss/online_service.cpp | 24 ++++++++++++++++++++
+ src/core/hle/service/boss/online_service.h   |  7 ++++++
+ 4 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index fa8f08c..1b9cba4 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-150
++151
+diff --git a/src/citra_qt/spotpass_tasks.cpp b/src/citra_qt/spotpass_tasks.cpp
+index e4c232c..2e12bca 100644
+--- a/src/citra_qt/spotpass_tasks.cpp
++++ b/src/citra_qt/spotpass_tasks.cpp
+@@ -264,19 +264,32 @@ void SpotPassTasks::Refresh() {
+         tree->setCurrentItem(reselect);
+     }
+     if (!running) {
+-        status->setText(tasks.empty()
++        const QString note =
++            Service::BOSS::OnlineService::RealModuleInUse()
++                ? tr(" Run Now is off: the console's own SpotPass module is in use (it runs the "
++                     "tasks itself, e.g. while the HOME Menu or another game is open).")
++                : QString();
++        status->setText((tasks.empty()
+                             ? tr("No SpotPass tasks yet (the SpotPass module's save is empty or "
+                                  "not there).")
+                             : tr("%n task(s), %1 due now.", "", static_cast<int>(tasks.size()))
+-                                  .arg(due));
++                                  .arg(due)) +
++                        note);
+     }
+     UpdateButtons();
+ }
+ 
+ void SpotPassTasks::UpdateButtons() {
+     const auto items = tree->selectedItems();
+-    run_button->setEnabled(!running && !items.isEmpty() &&
++    const bool real_module = Service::BOSS::OnlineService::RealModuleInUse();
++    run_button->setEnabled(!real_module && !running && !items.isEmpty() &&
+                            items.front()->data(ColumnGame, RunnableRole).toBool());
++    run_button->setToolTip(
++        real_module ? tr("Off: the console's own SpotPass module is in use. It keeps its files in "
++                         "its own way and doesn't read files Tangelo puts there (DEAD OR ALIVE "
++                         "Dimensions then hung on its mode select). Tasks run when the module "
++                         "runs them, e.g. while the HOME Menu or another game is open.")
++                    : tr("Download the selected task's file now"));
+ }
+ 
+ void SpotPassTasks::RunSelected() {
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index f32ca1f..efeaca7 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -21,11 +21,14 @@
+ #include "core/file_sys/errors.h"
+ #include "core/file_sys/file_backend.h"
+ #include "core/hle/kernel/hle_ipc.h"
++#include "core/hle/kernel/kernel.h"
++#include "core/hle/kernel/process.h"
+ #include "core/hle/service/boss/boss_download.h"
+ #include "core/hle/service/boss/online_service.h"
+ #include "core/hle/service/http/spotpass_redirect.h"
+ #include "core/hle/service/news/news_arrivals.h"
+ #include "core/hw/aes/key.h"
++#include "core/hw/unique_data.h"
+ 
+ namespace Service::BOSS {
+ 
+@@ -863,7 +866,28 @@ std::vector<SpotPassTaskSummary> OnlineService::ListAllTasks() {
+     return tasks;
+ }
+ 
++bool OnlineService::RealModuleInUse() {
++    auto& system = Core::System::GetInstance();
++    if (system.IsPoweredOn()) {
++        for (const auto& process : system.Kernel().GetProcessList()) {
++            if (process && process->GetName() == "boss") {
++                return true;
++            }
++        }
++        return false;
++    }
++    // Not running: what the next start will use (Service::AttemptLLE, without per-game hacks).
++    const auto it = Settings::values.lle_modules.find("BOSS");
++    const bool lle = (it != Settings::values.lle_modules.end() && it->second) ||
++                     Settings::values.enable_required_online_lle_modules.GetValue();
++    return lle && HW::UniqueData::IsFullConsoleLinked();
++}
++
+ std::string OnlineService::RunTaskNow(const std::string& task_id) {
++    if (RealModuleInUse()) {
++        return "Run Now only works with Tangelo's own SpotPass module; the console's SpotPass "
++               "module is in use and keeps its files differently.";
++    }
+     if (InitializeSession(program_id).IsError()) {
+         return "The SpotPass module's save data couldn't be opened.";
+     }
+diff --git a/src/core/hle/service/boss/online_service.h b/src/core/hle/service/boss/online_service.h
+index faddf63..a8e18bf 100644
+--- a/src/core/hle/service/boss/online_service.h
++++ b/src/core/hle/service/boss/online_service.h
+@@ -301,6 +301,13 @@ public:
+      * what happened, for the window.
+      */
+     std::string RunTaskNow(const std::string& task_id);
++    /**
++     * Whether the console's own SpotPass module (the "boss" system module, LLE) runs SpotPass
++     * instead of Tangelo's. It keeps the files in the SpotPass storage in its own way: a file
++     * written by RunTaskNow made it hand DEAD OR ALIVE Dimensions a made-up NsData ID
++     * (0xF6AF7D74), and the game asked about it forever (7 Nov 2026). Run Now is off then.
++     */
++    static bool RealModuleInUse();
+ 
+ private:
+     void RunTask(const std::string& task_id, std::string url, std::string last_modified,
+-- 
+2.43.0
+

@@ -1,0 +1,434 @@
+From 2ddd37cb01caa25cbf912ff84eff75113fc3a80c Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sun, 8 Nov 2026 20:46:59 +0100
+Subject: [PATCH] NetPass StreetPass relay to your own NetPass server (Build
+ 154)
+
+With NetPass's system patches the SpotPass module (about every 15 minutes) and
+cecd send the console's StreetPass outboxes to https://api.netpass.cafe/spr.
+New setting "netpass_relay_url" (Configure > Network, "StreetPass relay
+(NetPass)"; Android: Network settings): when set, e.g. to a LocalPass at
+https://netpass.nintendo.local, those requests go there instead (https when
+no scheme is given, path kept). Empty keeps the official NetPass server. It is
+independent of the custom Nintendo server.
+
+Every relay request now logs its answer: "StreetPass relay <url>: 200" at
+Info, or "refused with <status>" at Warning, with the 3ds-netpass-msg and
+x-spr-* reply headers and the start of the body, so a refusal can be read in
+the log (the official server answered 403 on 8 Nov 2026).
+
+Tests: IsNetPassRelayUrl / RedirectNetPassRelayUrl (92 assertions pass).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                                  |  2 +-
+ CMakeModules/GenerateSettingKeys.cmake        |  1 +
+ .../tangelo/features/settings/SettingKeys.kt  |  1 +
+ .../features/settings/model/StringSetting.kt  |  3 +-
+ .../settings/ui/SettingsFragmentPresenter.kt  |  9 ++++
+ src/android/app/src/main/jni/config.cpp       |  1 +
+ src/android/app/src/main/jni/default_ini.h    |  3 ++
+ .../app/src/main/res/values/strings.xml       |  2 +
+ src/citra_qt/configuration/config.cpp         |  2 +
+ .../configuration/configure_network.cpp       |  4 ++
+ .../configuration/configure_network.ui        | 34 +++++++++++++++
+ src/common/settings.h                         |  5 +++
+ src/core/hle/service/http/http_c.cpp          | 41 ++++++++++++++++++-
+ src/core/hle/service/http/http_c.h            |  2 +
+ .../hle/service/http/spotpass_redirect.cpp    | 19 +++++++++
+ src/core/hle/service/http/spotpass_redirect.h | 13 ++++++
+ .../core/hle/service/spotpass_redirect.cpp    | 20 +++++++++
+ 17 files changed, 159 insertions(+), 3 deletions(-)
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 7f1ddd5..a2ecc45 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-153
++154
+diff --git a/CMakeModules/GenerateSettingKeys.cmake b/CMakeModules/GenerateSettingKeys.cmake
+index 6f7567c..c5380f6 100644
+--- a/CMakeModules/GenerateSettingKeys.cmake
++++ b/CMakeModules/GenerateSettingKeys.cmake
+@@ -150,6 +150,7 @@ foreach(KEY IN ITEMS
+     "network_token"
+     "use_custom_nintendo_server"
+     "nintendo_server_url"
++    "netpass_relay_url"
+     "ac_connecting_location"
+     "nintendo_zone_mode"
+     "share_games_with_server"
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt
+index 0bd7cfd..824322c 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/SettingKeys.kt
+@@ -131,6 +131,7 @@ object SettingKeys {
+     external fun network_token(): String
+     external fun use_custom_nintendo_server(): String
+     external fun nintendo_server_url(): String
++    external fun netpass_relay_url(): String
+     external fun nintendo_zone_mode(): String
+     external fun share_games_with_server(): String
+     external fun check_for_update_on_start(): String
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt
+index 0b6fa82..995f95e 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/model/StringSetting.kt
+@@ -28,7 +28,8 @@ enum class StringSetting(
+     ),
+     WEB_API_URL(SettingKeys.web_api_url(), Settings.SECTION_NETWORK, "http://88.198.47.46:5000"),
+     NETWORK_TOKEN(SettingKeys.network_token(), Settings.SECTION_NETWORK, ""),
+-    NINTENDO_SERVER_URL(SettingKeys.nintendo_server_url(), Settings.SECTION_NETWORK, "");
++    NINTENDO_SERVER_URL(SettingKeys.nintendo_server_url(), Settings.SECTION_NETWORK, ""),
++    NETPASS_RELAY_URL(SettingKeys.netpass_relay_url(), Settings.SECTION_NETWORK, "");
+ 
+     override var string: String = defaultValue
+ 
+diff --git a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt
+index ab899c1..543052d 100644
+--- a/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/src/android/app/src/main/java/io/github/microworldwide/tangelo/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -1835,6 +1835,15 @@ class SettingsFragmentPresenter(private val fragmentView: SettingsFragmentView)
+                     BooleanSetting.NINTENDO_ZONE_MODE.defaultValue
+                 )
+             )
++            add(
++                StringInputSetting(
++                    StringSetting.NETPASS_RELAY_URL,
++                    R.string.netpass_relay_url,
++                    R.string.netpass_relay_url_description,
++                    StringSetting.NETPASS_RELAY_URL.key,
++                    StringSetting.NETPASS_RELAY_URL.defaultValue
++                )
++            )
+             add(HeaderSetting(R.string.network_room))
+             add(
+                 StringInputSetting(
+diff --git a/src/android/app/src/main/jni/config.cpp b/src/android/app/src/main/jni/config.cpp
+index 301c733..2bc5ac5 100644
+--- a/src/android/app/src/main/jni/config.cpp
++++ b/src/android/app/src/main/jni/config.cpp
+@@ -333,6 +333,7 @@ void Config::ReadValues() {
+     ReadSetting("WebService", Settings::values.network_token);
+     ReadSetting("WebService", Settings::values.use_custom_nintendo_server);
+     ReadSetting("WebService", Settings::values.nintendo_server_url);
++    ReadSetting("WebService", Settings::values.netpass_relay_url);
+     ReadSetting("WebService", Settings::values.ac_connecting_location);
+     ReadSetting("WebService", Settings::values.nintendo_zone_mode);
+     ReadSetting("WebService", Settings::values.share_games_with_server);
+diff --git a/src/android/app/src/main/jni/default_ini.h b/src/android/app/src/main/jni/default_ini.h
+index b276f70..b8b2344 100644
+--- a/src/android/app/src/main/jni/default_ini.h
++++ b/src/android/app/src/main/jni/default_ini.h
+@@ -598,6 +598,9 @@ static const char* android_config_default_file_content = (BOOST_HANA_STRING(R"(
+ )") DECLARE_KEY(use_custom_nintendo_server) BOOST_HANA_STRING(R"(
+ # Custom server address, e.g. http://localhost:8080 (http when no scheme is given)
+ )") DECLARE_KEY(nintendo_server_url) BOOST_HANA_STRING(R"(
++# NetPass server for the StreetPass relay (api.netpass.cafe/spr), e.g. https://netpass.nintendo.local
++# Empty (default): the official NetPass server. Without a scheme, https is used.
++)") DECLARE_KEY(netpass_relay_url) BOOST_HANA_STRING(R"(
+ # Experimental: the value the ac service reports as the connecting location (GetConnectingLocation).
+ # Games use it to tell a Nintendo Zone from other access points. 0: normal access point (default)
+ )") DECLARE_KEY(ac_connecting_location) BOOST_HANA_STRING(R"(
+diff --git a/src/android/app/src/main/res/values/strings.xml b/src/android/app/src/main/res/values/strings.xml
+index 4986972..01181ac 100644
+--- a/src/android/app/src/main/res/values/strings.xml
++++ b/src/android/app/src/main/res/values/strings.xml
+@@ -60,6 +60,8 @@
+     <string name="share_games_with_server_description">Each time a game starts, tell the custom server which game started, which games are installed and which are in the games folder, under this install\'s Console ID. Nothing is sent to Nintendo.</string>
+     <string name="nintendo_zone_mode">Connect as a Nintendo Zone hotspot</string>
+     <string name="nintendo_zone_mode_description">Games see the virtual access point as a Nintendo Zone (network name NintendoSpotPass1), e.g. for gifts that were only handed out at Nintendo Zone hotspots.</string>
++    <string name="netpass_relay_url">StreetPass relay (NetPass) server</string>
++    <string name="netpass_relay_url_description">Where the console\'s StreetPass outboxes go (NetPass\'s relay, api.netpass.cafe/spr), e.g. https://netpass.nintendo.local for your own LocalPass. Empty: the official NetPass server.</string>
+     <string name="requires_custom_nintendo_server">Turn on \"Use a custom server\" first.</string>
+     <string name="network_room">Network / Room</string>
+     <string name="username_uses_system">This property is linked to the 3DS system username.</string>
+diff --git a/src/citra_qt/configuration/config.cpp b/src/citra_qt/configuration/config.cpp
+index 3ad7b7b..8dde0ad 100644
+--- a/src/citra_qt/configuration/config.cpp
++++ b/src/citra_qt/configuration/config.cpp
+@@ -923,6 +923,7 @@ void QtConfig::ReadWebServiceValues() {
+     ReadBasicSetting(Settings::values.network_token);
+     ReadBasicSetting(Settings::values.use_custom_nintendo_server);
+     ReadBasicSetting(Settings::values.nintendo_server_url);
++    ReadBasicSetting(Settings::values.netpass_relay_url);
+     ReadBasicSetting(Settings::values.ac_connecting_location);
+     ReadBasicSetting(Settings::values.nintendo_zone_mode);
+     ReadBasicSetting(Settings::values.share_games_with_server);
+@@ -1461,6 +1462,7 @@ void QtConfig::SaveWebServiceValues() {
+     WriteBasicSetting(Settings::values.network_token);
+     WriteBasicSetting(Settings::values.use_custom_nintendo_server);
+     WriteBasicSetting(Settings::values.nintendo_server_url);
++    WriteBasicSetting(Settings::values.netpass_relay_url);
+     WriteBasicSetting(Settings::values.ac_connecting_location);
+     WriteBasicSetting(Settings::values.nintendo_zone_mode);
+     WriteBasicSetting(Settings::values.share_games_with_server);
+diff --git a/src/citra_qt/configuration/configure_network.cpp b/src/citra_qt/configuration/configure_network.cpp
+index 4cec917..5726f04 100644
+--- a/src/citra_qt/configuration/configure_network.cpp
++++ b/src/citra_qt/configuration/configure_network.cpp
+@@ -40,6 +40,8 @@ void ConfigureWeb::SetConfiguration() {
+         QString::fromStdString(Settings::values.nintendo_server_url.GetValue()));
+     UpdateNintendoFields(custom_server);
+     ui->nintendo_zone_checkbox->setChecked(Settings::values.nintendo_zone_mode.GetValue());
++    ui->netpass_relay_lineedit->setText(
++        QString::fromStdString(Settings::values.netpass_relay_url.GetValue()));
+     ui->share_games_checkbox->setChecked(Settings::values.share_games_with_server.GetValue());
+ 
+ #ifdef USE_DISCORD_PRESENCE
+@@ -58,6 +60,8 @@ void ConfigureWeb::ApplyConfiguration() {
+     Settings::values.nintendo_server_url =
+         ui->nintendo_url_lineedit->text().trimmed().toStdString();
+     Settings::values.nintendo_zone_mode = ui->nintendo_zone_checkbox->isChecked();
++    Settings::values.netpass_relay_url =
++        ui->netpass_relay_lineedit->text().trimmed().toStdString();
+     Settings::values.share_games_with_server = ui->share_games_checkbox->isChecked();
+ }
+ 
+diff --git a/src/citra_qt/configuration/configure_network.ui b/src/citra_qt/configuration/configure_network.ui
+index a068727..14f280a 100644
+--- a/src/citra_qt/configuration/configure_network.ui
++++ b/src/citra_qt/configuration/configure_network.ui
+@@ -126,6 +126,39 @@
+      </layout>
+     </widget>
+    </item>
++   <item>
++    <widget class="QGroupBox" name="netpass_group">
++     <property name="title">
++      <string>StreetPass relay (NetPass)</string>
++     </property>
++     <layout class="QVBoxLayout" name="netpass_layout">
++      <item>
++       <widget class="QLabel" name="netpass_relay_label">
++        <property name="text">
++         <string>NetPass server for the StreetPass relay:</string>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QLineEdit" name="netpass_relay_lineedit">
++        <property name="placeholderText">
++         <string>Empty: the official NetPass server (e.g. https://netpass.nintendo.local)</string>
++        </property>
++       </widget>
++      </item>
++      <item>
++       <widget class="QLabel" name="netpass_relay_hint_label">
++        <property name="text">
++         <string>With NetPass's system patches, the console sends its StreetPass outboxes to NetPass's relay (api.netpass.cafe/spr) about every 15 minutes. With an address here (your own NetPass server, like LocalPass) they go there instead. Without a scheme, https is used.</string>
++        </property>
++        <property name="wordWrap">
++         <bool>true</bool>
++        </property>
++       </widget>
++      </item>
++     </layout>
++    </widget>
++   </item>
+    <item>
+     <spacer name="verticalSpacer">
+      <property name="orientation">
+@@ -150,6 +183,7 @@
+   <tabstop>nintendo_url_lineedit</tabstop>
+   <tabstop>nintendo_zone_checkbox</tabstop>
+   <tabstop>share_games_checkbox</tabstop>
++  <tabstop>netpass_relay_lineedit</tabstop>
+  </tabstops>
+  <resources/>
+  <connections/>
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 574c9a4..2c8c3ab 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -666,6 +666,11 @@ struct Values {
+     /// routes by the X-Tangelo-Original-Host header. Also SpotPass on NetPass's mirror.
+     Setting<bool> use_custom_nintendo_server{false, Keys::use_custom_nintendo_server};
+     Setting<std::string> nintendo_server_url{"", Keys::nintendo_server_url};
++    /// NetPass's StreetPass relay (https://api.netpass.cafe/spr, where NetPass's patches send the
++    /// console's StreetPass outboxes) goes to this NetPass server instead, e.g. a LocalPass at
++    /// https://netpass.nintendo.local. Empty: the official NetPass server. Independent of the
++    /// custom Nintendo server.
++    Setting<std::string> netpass_relay_url{"", Keys::netpass_relay_url};
+     /// Experimental: value ac:u GetConnectingLocation reports (0 = normal access point).
+     /// Games use it to tell a Nintendo Zone from other access points; meaning of values unknown.
+     Setting<u32> ac_connecting_location{0, Keys::ac_connecting_location};
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index c5610aa..b954dda 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cctype>
+ #include <tuple>
+ #include <unordered_map>
+ #include <boost/algorithm/string/replace.hpp>
+@@ -255,7 +256,14 @@ void Context::MakeRequest() {
+ 
+     std::string request_url = url;
+     std::optional<std::string> original_host;
+-    if (Settings::values.use_custom_nintendo_server.GetValue()) {
++    const bool netpass_relay = IsNetPassRelayUrl(url);
++    if (auto relay = netpass_relay ? RedirectNetPassRelayUrl(
++                                         url, Settings::values.netpass_relay_url.GetValue())
++                                   : std::nullopt) {
++        // NetPass's StreetPass relay to the user's own NetPass server (LocalPass).
++        LOG_INFO(Service_HTTP, "StreetPass relay redirected: {} -> {}", url, *relay);
++        request_url = std::move(*relay);
++    } else if (Settings::values.use_custom_nintendo_server.GetValue()) {
+         if (auto redirected =
+                 RedirectNintendoUrl(url, Settings::values.nintendo_server_url.GetValue())) {
+             LOG_INFO(Service_HTTP, "Nintendo request redirected: {} -> {}", url, redirected->url);
+@@ -367,12 +375,43 @@ void Context::MakeRequest() {
+         MakeRequestNonSSL(request, url_info, pending_headers);
+     }
+ 
++    if (netpass_relay) {
++        LogRelayResult(request_url);
++    }
+     LogSoapResult();
+     if (!original_host) {
+         RecordNintendoResponse(request.method);
+     }
+ }
+ 
++void Context::LogRelayResult(const std::string& request_url) const {
++    // The StreetPass relay answers in headers: 3ds-netpass-msg (why a request was refused) and
++    // x-spr-slotNN-result per uploaded outbox. Nothing else in the log shows them.
++    if (state != RequestState::ReceivingBody) {
++        return; // "Request failed" was logged already
++    }
++    std::string details;
++    for (const auto& [name, value] : response.headers) {
++        std::string lower(name);
++        std::transform(lower.begin(), lower.end(), lower.begin(),
++                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++        if (lower == "3ds-netpass-msg" || lower.starts_with("x-spr-")) {
++            details += fmt::format("; {}: {}", name, value);
++        }
++    }
++    if (response.status >= 200 && response.status < 300) {
++        LOG_INFO(Service_HTTP, "StreetPass relay {}: {}{}", request_url, response.status,
++                 details);
++    } else {
++        std::string body = response.body.substr(0, 200);
++        std::replace_if(
++            body.begin(), body.end(), [](unsigned char c) { return c < 0x20 || c > 0x7E; },
++            ' ');
++        LOG_WARNING(Service_HTTP, "StreetPass relay {}: refused with {}{}{}", request_url,
++                    response.status, details, body.empty() ? "" : "; body: " + body);
++    }
++}
++
+ void Context::RecordNintendoResponse(const std::string& request_method) const {
+     // Saves what Nintendo's own servers answer, so a server stand-in can serve the same thing
+     // later (the eShop's ninja and samurai pages, SOAP replies to compare with). Only when the
+diff --git a/src/core/hle/service/http/http_c.h b/src/core/hle/service/http/http_c.h
+index c4f2e9c..f0d4c1d 100644
+--- a/src/core/hle/service/http/http_c.h
++++ b/src/core/hle/service/http/http_c.h
+@@ -336,6 +336,8 @@ public:
+     void MakeRequest();
+     /// Logs the result of eShop/NUS SOAP replies (they fail with HTTP 200).
+     void LogSoapResult() const;
++    /// Logs NetPass's StreetPass relay answer (status, 3ds-netpass-msg, x-spr-* headers).
++    void LogRelayResult(const std::string& request_url) const;
+     void RecordNintendoResponse(const std::string& request_method) const;
+     void MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo& url_info,
+                            std::vector<Context::RequestHeader>& pending_headers);
+diff --git a/src/core/hle/service/http/spotpass_redirect.cpp b/src/core/hle/service/http/spotpass_redirect.cpp
+index 63370f9..2b140c7 100644
+--- a/src/core/hle/service/http/spotpass_redirect.cpp
++++ b/src/core/hle/service/http/spotpass_redirect.cpp
+@@ -194,6 +194,25 @@ std::optional<std::string> JoinServer(std::string_view server, std::string rest,
+ }
+ } // namespace
+ 
++bool IsNetPassRelayUrl(std::string_view url) {
++    const std::string host = GetUrlHost(url);
++    if (host != NetPassHost && host != "devapi.netpass.cafe") {
++        return false;
++    }
++    const std::string_view rest = SplitAuthority(url).second;
++    constexpr std::string_view relay = "/spr";
++    return rest.starts_with(relay) &&
++           (rest.size() == relay.size() || rest[relay.size()] == '/' ||
++            rest[relay.size()] == '?');
++}
++
++std::optional<std::string> RedirectNetPassRelayUrl(std::string_view url, std::string_view server) {
++    if (!IsNetPassRelayUrl(url)) {
++        return std::nullopt;
++    }
++    return JoinServer(server, std::string(SplitAuthority(url).second), "https");
++}
++
+ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server) {
+     if (!IsSpotPassUrl(url)) {
+         return std::nullopt;
+diff --git a/src/core/hle/service/http/spotpass_redirect.h b/src/core/hle/service/http/spotpass_redirect.h
+index 6850104..308f427 100644
+--- a/src/core/hle/service/http/spotpass_redirect.h
++++ b/src/core/hle/service/http/spotpass_redirect.h
+@@ -39,6 +39,19 @@ bool IsSpotPassUploadUrl(std::string_view url);
+  */
+ std::optional<std::string> RedirectSpotPassUrl(std::string_view url, std::string_view server);
+ 
++/// Returns true if `url` is NetPass's StreetPass relay: https://api.netpass.cafe/spr (also
++/// devapi.netpass.cafe). NetPass's patches send it there from the SpotPass module (every ~15
++/// minutes, the console's StreetPass outboxes as spr-meta + spr-slotNN form fields) and from cecd.
++bool IsNetPassRelayUrl(std::string_view url);
++
++/**
++ * Rewrites NetPass's StreetPass relay address to another NetPass server (e.g. a LocalPass):
++ * "https://api.netpass.cafe/spr" with server "netpass.nintendo.local" becomes
++ * "https://netpass.nintendo.local/spr" (https when no scheme is given; a base path is kept).
++ * Returns nullopt if `url` isn't the relay (see IsNetPassRelayUrl) or `server` is empty.
++ */
++std::optional<std::string> RedirectNetPassRelayUrl(std::string_view url, std::string_view server);
++
+ /// The host part of `url` without scheme, port, path or query.
+ std::string GetUrlHost(std::string_view url);
+ 
+diff --git a/src/tests/core/hle/service/spotpass_redirect.cpp b/src/tests/core/hle/service/spotpass_redirect.cpp
+index 85a4621..985d335 100644
+--- a/src/tests/core/hle/service/spotpass_redirect.cpp
++++ b/src/tests/core/hle/service/spotpass_redirect.cpp
+@@ -10,6 +10,8 @@ using Service::HTTP::GetUrlHost;
+ using Service::HTTP::IsSpotPassHost;
+ using Service::HTTP::IsSpotPassUploadUrl;
+ using Service::HTTP::IsSpotPassUrl;
++using Service::HTTP::IsNetPassRelayUrl;
++using Service::HTTP::RedirectNetPassRelayUrl;
+ using Service::HTTP::RedirectSpotPassUrl;
+ 
+ TEST_CASE("SpotPass hosts are recognised", "[service][http][spotpass]") {
+@@ -187,3 +189,21 @@ TEST_CASE("Everything meant for Nintendo goes to the custom server", "[service][
+     CHECK_FALSE(RedirectNintendoUrl("https://example.com/", "localhost:8080"));
+     CHECK_FALSE(RedirectNintendoUrl("https://nasc.nintendowifi.net/ac", ""));
+ }
++
++TEST_CASE("NetPass's StreetPass relay goes to the user's NetPass server",
++          "[service][http][spotpass]") {
++    CHECK(IsNetPassRelayUrl("https://api.netpass.cafe/spr"));
++    CHECK(IsNetPassRelayUrl("https://API.NetPass.cafe:443/spr?x=1"));
++    CHECK(IsNetPassRelayUrl("https://devapi.netpass.cafe/spr"));
++    CHECK_FALSE(IsNetPassRelayUrl("https://api.netpass.cafe/sprx"));
++    CHECK_FALSE(IsNetPassRelayUrl("https://api.netpass.cafe/npdl/p01/nsa/a/b/c"));
++    CHECK_FALSE(IsNetPassRelayUrl("https://example.com/spr"));
++
++    CHECK(RedirectNetPassRelayUrl("https://api.netpass.cafe/spr", "netpass.nintendo.local") ==
++          "https://netpass.nintendo.local/spr");
++    CHECK(RedirectNetPassRelayUrl("https://api.netpass.cafe/spr",
++                                  " http://10.10.15.25:8000/base/ ") ==
++          "http://10.10.15.25:8000/base/spr");
++    CHECK_FALSE(RedirectNetPassRelayUrl("https://api.netpass.cafe/spr", ""));
++    CHECK_FALSE(RedirectNetPassRelayUrl("https://api.netpass.cafe/api/inbox", "x.local"));
++}
+-- 
+2.43.0
+

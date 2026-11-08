@@ -1,0 +1,652 @@
+From f5d6eabd4955cde92d5265eb85c719546412184a Mon Sep 17 00:00:00 2001
+From: Tangelo Dev <tangelo-dev@noreply.invalid>
+Date: Sat, 7 Nov 2026 14:52:16 +0100
+Subject: [PATCH] Tools: SpotPass Tasks window with Run Now (Build 149)
+
+Tools > SpotPass Tasks lists every task the SpotPass module has registered (from
+its save, BOSS_SV.db / BOSS_SS.db: interval at 0x28, runs left 0x2C, last run
+0x30 in seconds since 2000, state 0x40, HTTP status 0x48; read from a real save
+on 7 Nov 2026): game (name and icon from the game list), task, every, last run,
+result, next run (due now / time and countdown), runs left, address. Refreshes
+every 10 s and stays open next to the game.
+
+Run Now (or double-click) downloads the task's file at once with Tangelo's own
+SpotPass downloader (the custom SpotPass server applies, Akamai addresses too)
+and stores its contents in the game's SpotPass storage like the SpotPass module
+does after a run (OnlineService::RunTaskNow, on a worker thread). Upload tasks
+and tasks without an address can't be run. For DEAD OR ALIVE Dimensions, whose
+tasks the module doesn't run while the game is in front.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FYz3krf43qKGY6aS2Z5snz
+---
+ BUILD-NUMBER                                 |   2 +-
+ src/citra_qt/CMakeLists.txt                  |   2 +
+ src/citra_qt/citra_qt.cpp                    |  25 ++
+ src/citra_qt/citra_qt.h                      |   1 +
+ src/citra_qt/main.ui                         |   9 +
+ src/citra_qt/spotpass_tasks.cpp              | 279 +++++++++++++++++++
+ src/citra_qt/spotpass_tasks.h                |  54 ++++
+ src/core/hle/service/boss/online_service.cpp |  91 ++++++
+ src/core/hle/service/boss/online_service.h   |  26 ++
+ 9 files changed, 488 insertions(+), 1 deletion(-)
+ create mode 100644 src/citra_qt/spotpass_tasks.cpp
+ create mode 100644 src/citra_qt/spotpass_tasks.h
+
+diff --git a/BUILD-NUMBER b/BUILD-NUMBER
+index 0d667b5..15c44e9 100644
+--- a/BUILD-NUMBER
++++ b/BUILD-NUMBER
+@@ -1 +1 @@
+-148
++149
+diff --git a/src/citra_qt/CMakeLists.txt b/src/citra_qt/CMakeLists.txt
+index 1af22d0..3f9966d 100644
+--- a/src/citra_qt/CMakeLists.txt
++++ b/src/citra_qt/CMakeLists.txt
+@@ -187,6 +187,8 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
+     qt_image_interface.cpp
+     qt_image_interface.h
+     setting_qkeys.h
++    spotpass_tasks.cpp
++    spotpass_tasks.h
+     streetpass_overview.cpp
+     streetpass_overview.h
+     uisettings.cpp
+diff --git a/src/citra_qt/citra_qt.cpp b/src/citra_qt/citra_qt.cpp
+index 2409181..ef640a3 100644
+--- a/src/citra_qt/citra_qt.cpp
++++ b/src/citra_qt/citra_qt.cpp
+@@ -13,6 +13,7 @@
+ #include <QIcon>
+ #include <QLabel>
+ #include <QMessageBox>
++#include <QPointer>
+ #include <QPalette>
+ #include <QSysInfo>
+ #include <QtConcurrent/QtConcurrentMap>
+@@ -69,6 +70,7 @@
+ #endif
+ #include "citra_qt/dumping/dumping_dialog.h"
+ #include "citra_qt/game_list.h"
++#include "citra_qt/spotpass_tasks.h"
+ #include "citra_qt/streetpass_overview.h"
+ #include "citra_qt/hotkeys.h"
+ #include "citra_qt/loading_screen.h"
+@@ -2347,6 +2349,7 @@ void GMainWindow::ConnectMenuEvents() {
+     connect_menu(ui->action_Import_ZipPass, &GMainWindow::OnImportZipPass);
+     connect_menu(ui->action_Clear_StreetPass_Config, &GMainWindow::OnClearStreetPassConfig);
+     connect_menu(ui->action_StreetPass_Games, &GMainWindow::OnStreetPassGames);
++    connect_menu(ui->action_SpotPass_Tasks, &GMainWindow::OnSpotPassTasks);
+     connect_menu(ui->action_Previous_Amiibo, &GMainWindow::OnPreviousAmiibo);
+     connect_menu(ui->action_Load_Amiibo, &GMainWindow::OnLoadAmiibo);
+     connect_menu(ui->action_Remove_Amiibo, &GMainWindow::OnRemoveAmiibo);
+@@ -4558,6 +4561,28 @@ void GMainWindow::OnStreetPassGames() {
+     dialog.exec();
+ }
+ 
++void GMainWindow::OnSpotPassTasks() {
++    // Tools > SpotPass Tasks: names and icons from the game list, looked up by title ID.
++    // It stays open next to the game (not modal); a second click brings it to the front.
++    static QPointer<SpotPassTasks> open_window;
++    if (open_window) {
++        open_window->raise();
++        open_window->activateWindow();
++        return;
++    }
++    auto titles = std::make_shared<std::map<u64, GameList::TitleEntry>>(game_list->GetTitles());
++    auto* dialog = new SpotPassTasks(this, [titles](u64 title_id) -> SpotPassTasks::GameInfo {
++        const auto it = titles->find(title_id);
++        if (it == titles->end()) {
++            return {};
++        }
++        return {it->second.name, it->second.icon};
++    });
++    dialog->setAttribute(Qt::WA_DeleteOnClose);
++    open_window = dialog;
++    dialog->show();
++}
++
+ void GMainWindow::OnClearStreetPassConfig() {
+ 	Core::clearStreetPassConfig();
+ 	
+diff --git a/src/citra_qt/citra_qt.h b/src/citra_qt/citra_qt.h
+index f404f9b..3d9a95d 100644
+--- a/src/citra_qt/citra_qt.h
++++ b/src/citra_qt/citra_qt.h
+@@ -278,6 +278,7 @@ private slots:
+     void OnImportZipPass();
+     void OnClearStreetPassConfig();
+     void OnStreetPassGames();
++    void OnSpotPassTasks();
+     void OnLoadAmiibo();
+     void OnRemoveAmiibo();
+     void OnOpenCitraFolder();
+diff --git a/src/citra_qt/main.ui b/src/citra_qt/main.ui
+index 49a6cac..e8a668f 100644
+--- a/src/citra_qt/main.ui
++++ b/src/citra_qt/main.ui
+@@ -301,6 +301,7 @@
+     <addaction name="action_Capture_Screenshot"/>
+     <addaction name="action_Dump_Video"/>
+     <addaction name="action_Dump_Process_Memory"/>
++    <addaction name="action_SpotPass_Tasks"/>
+     <addaction name="action_Start_SpotPass_Now"/>
+     <addaction name="action_Dump_After_SpotPass_Read"/>
+     <addaction name="separator"/>
+@@ -605,6 +606,14 @@
+     <string>Advance Frame</string>
+    </property>
+   </action>
++  <action name="action_SpotPass_Tasks">
++   <property name="text">
++    <string>SpotPass Tasks...</string>
++   </property>
++   <property name="toolTip">
++    <string>Every registered SpotPass task: when it last ran, its result, when it runs next, and Run Now</string>
++   </property>
++  </action>
+   <action name="action_Start_SpotPass_Now">
+    <property name="checkable">
+     <bool>true</bool>
+diff --git a/src/citra_qt/spotpass_tasks.cpp b/src/citra_qt/spotpass_tasks.cpp
+new file mode 100644
+index 0000000..5d20814
+--- /dev/null
++++ b/src/citra_qt/spotpass_tasks.cpp
+@@ -0,0 +1,279 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv3 or any later version
++// Refer to the LICENSE.txt file included.
++
++#include <memory>
++#include <thread>
++#include <QApplication>
++#include <QColor>
++#include <QDateTime>
++#include <QDialogButtonBox>
++#include <QHBoxLayout>
++#include <QHeaderView>
++#include <QLabel>
++#include <QPointer>
++#include <QPushButton>
++#include <QTimer>
++#include <QTreeWidget>
++#include <QVBoxLayout>
++#include <fmt/format.h>
++#include "citra_qt/spotpass_tasks.h"
++#include "core/hle/service/boss/online_service.h"
++#include "core/hle/service/http/spotpass_redirect.h"
++
++namespace {
++
++enum Column {
++    ColumnGame,
++    ColumnTask,
++    ColumnEvery,
++    ColumnLastRun,
++    ColumnResult,
++    ColumnNextRun,
++    ColumnRunsLeft,
++    ColumnAddress,
++    ColumnCount,
++};
++
++constexpr int ProgramIdRole = Qt::UserRole + 1;
++constexpr int TaskIdRole = Qt::UserRole + 2;
++constexpr int RunnableRole = Qt::UserRole + 3;
++constexpr int SortRole = Qt::UserRole + 4;
++
++/// The SpotPass module keeps times as seconds since 1 Jan 2000 in console (local) time.
++QDateTime ConsoleTime(u32 seconds) {
++    return QDateTime(QDate(2000, 1, 1), QTime(0, 0)).addSecs(seconds);
++}
++
++qint64 NowInConsoleSeconds() {
++    return QDateTime(QDate(2000, 1, 1), QTime(0, 0)).secsTo(QDateTime::currentDateTime());
++}
++
++QString Interval(u32 seconds) {
++    if (seconds == 0) {
++        return QStringLiteral("–");
++    }
++    if (seconds % 86400 == 0) {
++        return QObject::tr("%n day(s)", "", static_cast<int>(seconds / 86400));
++    }
++    if (seconds % 3600 == 0) {
++        return QObject::tr("%n hour(s)", "", static_cast<int>(seconds / 3600));
++    }
++    if (seconds % 60 == 0) {
++        return QObject::tr("%n minute(s)", "", static_cast<int>(seconds / 60));
++    }
++    return QObject::tr("%n second(s)", "", static_cast<int>(seconds));
++}
++
++QString ResultText(const Service::BOSS::SpotPassTaskSummary& task) {
++    if (task.last_run == 0) {
++        return QObject::tr("never run");
++    }
++    QString text;
++    switch (task.state) {
++    case 6:
++        text = QObject::tr("done");
++        break;
++    case 7:
++        text = QObject::tr("failed");
++        break;
++    default:
++        text = QObject::tr("state %1").arg(task.state);
++        break;
++    }
++    if (task.http_status != 0 && task.http_status != 0xFFFFFFFF) {
++        text += QStringLiteral(" (HTTP %1)").arg(task.http_status);
++    }
++    return text;
++}
++
++} // namespace
++
++SpotPassTasks::SpotPassTasks(QWidget* parent, GameLookup lookup_)
++    : QDialog(parent), lookup(std::move(lookup_)) {
++    setWindowTitle(tr("SpotPass Tasks"));
++    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
++    resize(1100, 520);
++
++    auto* intro = new QLabel(
++        tr("Every SpotPass task the console's SpotPass module has registered. A task runs every "
++           "\"Every\" after its last run (on a 3DS mostly in sleep mode or on the HOME Menu). "
++           "Run Now downloads the task's file at once, from your SpotPass server, and puts it "
++           "in the game's SpotPass storage; the game reads it the next time it checks its "
++           "SpotPass data. The list refreshes every 10 seconds."));
++    intro->setWordWrap(true);
++
++    tree = new QTreeWidget;
++    tree->setColumnCount(ColumnCount);
++    tree->setHeaderLabels({tr("Game"), tr("Task"), tr("Every"), tr("Last run"), tr("Result"),
++                           tr("Next run"), tr("Runs left"), tr("Address")});
++    tree->setRootIsDecorated(false);
++    tree->setUniformRowHeights(true);
++    tree->setSortingEnabled(true);
++    tree->setIconSize(QSize(24, 24));
++    tree->header()->setStretchLastSection(true);
++
++    status = new QLabel;
++    status->setWordWrap(true);
++    status->setTextInteractionFlags(Qt::TextSelectableByMouse);
++
++    run_button = new QPushButton(tr("Run Now"));
++    auto* refresh_button = new QPushButton(tr("Refresh"));
++    auto* buttons = new QHBoxLayout;
++    buttons->addWidget(run_button);
++    buttons->addStretch();
++    buttons->addWidget(refresh_button);
++
++    auto* close = new QDialogButtonBox(QDialogButtonBox::Close);
++
++    auto* layout = new QVBoxLayout(this);
++    layout->addWidget(intro);
++    layout->addWidget(tree, 1);
++    layout->addWidget(status);
++    layout->addLayout(buttons);
++    layout->addWidget(close);
++
++    connect(close, &QDialogButtonBox::rejected, this, &QDialog::reject);
++    connect(tree, &QTreeWidget::itemSelectionChanged, this, &SpotPassTasks::UpdateButtons);
++    connect(tree, &QTreeWidget::itemDoubleClicked, this, [this] { RunSelected(); });
++    connect(run_button, &QPushButton::clicked, this, &SpotPassTasks::RunSelected);
++    connect(refresh_button, &QPushButton::clicked, this, &SpotPassTasks::Refresh);
++
++    timer = new QTimer(this);
++    timer->setInterval(10000);
++    connect(timer, &QTimer::timeout, this, &SpotPassTasks::Refresh);
++    timer->start();
++
++    Refresh();
++}
++
++SpotPassTasks::~SpotPassTasks() = default;
++
++void SpotPassTasks::Refresh() {
++    QString selected_program;
++    QString selected_task;
++    if (const auto items = tree->selectedItems(); !items.isEmpty()) {
++        selected_program = items.front()->data(ColumnGame, ProgramIdRole).toString();
++        selected_task = items.front()->data(ColumnGame, TaskIdRole).toString();
++    }
++    tree->setSortingEnabled(false);
++    tree->clear();
++
++    const auto tasks = Service::BOSS::OnlineService::ListAllTasks();
++    const qint64 now = NowInConsoleSeconds();
++    int due = 0;
++    QTreeWidgetItem* reselect = nullptr;
++    for (const auto& task : tasks) {
++        auto* item = new QTreeWidgetItem;
++        const QString program = QString::fromStdString(fmt::format("{:016X}", task.program_id));
++        const QString task_id = QString::fromStdString(task.task_id);
++        const bool upload = Service::HTTP::IsSpotPassUploadUrl(task.url);
++        const bool runnable = !task.url.empty() && !upload;
++        item->setData(ColumnGame, ProgramIdRole, program);
++        item->setData(ColumnGame, TaskIdRole, task_id);
++        item->setData(ColumnGame, RunnableRole, runnable);
++
++        GameInfo game = lookup ? lookup(task.program_id) : GameInfo{};
++        item->setText(ColumnGame, game.name.isEmpty() ? program : game.name);
++        item->setIcon(ColumnGame, game.icon);
++        item->setToolTip(ColumnGame, program);
++        item->setText(ColumnTask, task_id);
++        item->setText(ColumnEvery, Interval(task.interval));
++        item->setText(ColumnLastRun,
++                      task.last_run == 0
++                          ? QStringLiteral("–")
++                          : ConsoleTime(task.last_run).toString(QStringLiteral("yyyy-MM-dd HH:mm")));
++        item->setText(ColumnResult, ResultText(task));
++        if (task.last_run != 0 && task.state == 7) {
++            item->setForeground(ColumnResult, QColor(0xC0, 0x50, 0x00));
++        }
++
++        if (task.interval != 0 && task.last_run != 0) {
++            const qint64 next = static_cast<qint64>(task.last_run) + task.interval;
++            if (next <= now) {
++                item->setText(ColumnNextRun, tr("due now"));
++                item->setForeground(ColumnNextRun, QColor(0x20, 0x80, 0x20));
++                ++due;
++            } else {
++                const qint64 left = next - now;
++                item->setText(ColumnNextRun,
++                              tr("%1 (in %2:%3)")
++                                  .arg(ConsoleTime(static_cast<u32>(next))
++                                           .toString(QStringLiteral("HH:mm")))
++                                  .arg(left / 3600)
++                                  .arg((left / 60) % 60, 2, 10, QLatin1Char('0')));
++            }
++            item->setData(ColumnNextRun, SortRole, next);
++        } else {
++            item->setText(ColumnNextRun, QStringLiteral("–"));
++        }
++        item->setText(ColumnRunsLeft, QString::number(task.runs_left));
++        item->setText(ColumnAddress, upload ? tr("(sends data) %1").arg(QString::fromStdString(
++                                                  task.url))
++                                            : QString::fromStdString(task.url));
++        item->setToolTip(ColumnAddress, QString::fromStdString(task.url));
++        tree->addTopLevelItem(item);
++        if (program == selected_program && task_id == selected_task) {
++            reselect = item;
++        }
++    }
++    tree->setSortingEnabled(true);
++    for (int column = 0; column < ColumnAddress; ++column) {
++        tree->resizeColumnToContents(column);
++    }
++    if (reselect) {
++        reselect->setSelected(true);
++        tree->setCurrentItem(reselect);
++    }
++    if (!running) {
++        status->setText(tasks.empty()
++                            ? tr("No SpotPass tasks yet (the SpotPass module's save is empty or "
++                                 "not there).")
++                            : tr("%n task(s), %1 due now.", "", static_cast<int>(tasks.size()))
++                                  .arg(due));
++    }
++    UpdateButtons();
++}
++
++void SpotPassTasks::UpdateButtons() {
++    const auto items = tree->selectedItems();
++    run_button->setEnabled(!running && !items.isEmpty() &&
++                           items.front()->data(ColumnGame, RunnableRole).toBool());
++}
++
++void SpotPassTasks::RunSelected() {
++    const auto items = tree->selectedItems();
++    if (running || items.isEmpty() || !items.front()->data(ColumnGame, RunnableRole).toBool()) {
++        return;
++    }
++    const u64 program_id = items.front()->data(ColumnGame, ProgramIdRole).toString().toULongLong(
++        nullptr, 16);
++    const QString task = items.front()->data(ColumnGame, TaskIdRole).toString();
++    const QString label = QStringLiteral("%1 / %2").arg(items.front()->text(ColumnGame), task);
++    running = true;
++    status->setText(tr("Running %1 ...").arg(label));
++    UpdateButtons();
++
++    // The download can take a while (DOA's costumes are 21 MB): it runs on its own thread.
++    // The result goes back to the UI thread, which checks the window is still open.
++    QPointer<SpotPassTasks> self(this);
++    std::thread([self, program_id, task_id = task.toStdString(), label] {
++        auto service = std::make_shared<Service::BOSS::OnlineService>(program_id, 0);
++        const QString message = QString::fromStdString(service->RunTaskNow(task_id));
++        QMetaObject::invokeMethod(
++            qApp,
++            [self, label, message] {
++                if (self) {
++                    self->OnRunFinished(label, message);
++                }
++            },
++            Qt::QueuedConnection);
++    }).detach();
++}
++
++void SpotPassTasks::OnRunFinished(const QString& task, const QString& message) {
++    running = false;
++    Refresh();
++    status->setText(QStringLiteral("%1: %2").arg(task, message));
++    UpdateButtons();
++}
+diff --git a/src/citra_qt/spotpass_tasks.h b/src/citra_qt/spotpass_tasks.h
+new file mode 100644
+index 0000000..a434671
+--- /dev/null
++++ b/src/citra_qt/spotpass_tasks.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 Tangelo Emulator Project
++// Licensed under GPLv3 or any later version
++// Refer to the LICENSE.txt file included.
++
++#pragma once
++
++#include <functional>
++#include <QDialog>
++#include <QIcon>
++#include <QString>
++#include "common/common_types.h"
++
++class QLabel;
++class QPushButton;
++class QTimer;
++class QTreeWidget;
++
++/// Tools > SpotPass Tasks: every SpotPass task the console's SpotPass module has registered
++/// (from its save, BOSS_SV.db / BOSS_SS.db): the game, how often it runs, when it last ran and
++/// with what result, when it is due next, and a Run Now button that downloads the task's file
++/// at once with Tangelo's own downloader and puts it in the game's SpotPass storage.
++class SpotPassTasks : public QDialog {
++    Q_OBJECT
++
++public:
++    struct GameInfo {
++        QString name;
++        QIcon icon;
++    };
++    /// Looks up a game by title ID in the game list; returns an empty name when it isn't there.
++    using GameLookup = std::function<GameInfo(u64 title_id)>;
++
++    SpotPassTasks(QWidget* parent, GameLookup lookup);
++    ~SpotPassTasks() override;
++
++private:
++    void Refresh();
++    void UpdateButtons();
++    void RunSelected();
++
++public:
++    /// Called on the UI thread when a Run Now download has finished.
++    void OnRunFinished(const QString& task, const QString& message);
++
++private:
++
++    GameLookup lookup;
++    bool running = false;
++
++    QTreeWidget* tree = nullptr;
++    QLabel* status = nullptr;
++    QPushButton* run_button = nullptr;
++    QTimer* timer = nullptr;
++};
+diff --git a/src/core/hle/service/boss/online_service.cpp b/src/core/hle/service/boss/online_service.cpp
+index c77aaf4..f32ca1f 100644
+--- a/src/core/hle/service/boss/online_service.cpp
++++ b/src/core/hle/service/boss/online_service.cpp
+@@ -3,6 +3,7 @@
+ // Refer to the misc/licenses/gplv2.txt file included.
+ 
+ #include <chrono>
++#include <cstring>
+ #include <ctime>
+ #include <thread>
+ #include <boost/serialization/map.hpp>
+@@ -824,6 +825,96 @@ bool OnlineService::StartTask(const std::string& task_id,
+     return true;
+ }
+ 
++std::vector<SpotPassTaskSummary> OnlineService::ListAllTasks() {
++    std::vector<SpotPassTaskSummary> tasks;
++    auto archive = OpenBossSystemSaveData();
++    if (!archive) {
++        return tasks;
++    }
++    const std::vector<u8> sv = ReadWholeFile(*archive, "/BOSS_SV.db");
++    const std::vector<u8> ss = ReadWholeFile(*archive, "/BOSS_SS.db");
++    if (sv.size() <= BOSS_SAVE_HEADER_SIZE || sv.size() != ss.size() ||
++        (sv.size() - BOSS_SAVE_HEADER_SIZE) % BOSS_S_ENTRY_SIZE != 0) {
++        return tasks;
++    }
++    const auto read32 = [&](std::size_t offset) {
++        u32 value;
++        std::memcpy(&value, sv.data() + offset, sizeof(value));
++        return value;
++    };
++    for (std::size_t entry = BOSS_SAVE_HEADER_SIZE; entry + BOSS_S_ENTRY_SIZE <= sv.size();
++         entry += BOSS_S_ENTRY_SIZE) {
++        SpotPassTaskSummary task;
++        std::memcpy(&task.program_id, sv.data() + entry + 0x10, sizeof(task.program_id));
++        if (task.program_id == 0) {
++            continue;
++        }
++        task.task_id = NormalizeTaskId(
++            std::string_view(reinterpret_cast<const char*>(sv.data() + entry + 0x18), TASK_ID_SIZE));
++        const char* url = reinterpret_cast<const char*>(ss.data() + entry + 0x21C);
++        task.url.assign(url, strnlen(url, URL_SIZE));
++        task.interval = read32(entry + 0x28);
++        task.runs_left = read32(entry + 0x2C);
++        task.last_run = read32(entry + 0x30);
++        task.state = sv[entry + 0x40];
++        task.http_status = read32(entry + 0x48);
++        tasks.push_back(std::move(task));
++    }
++    return tasks;
++}
++
++std::string OnlineService::RunTaskNow(const std::string& task_id) {
++    if (InitializeSession(program_id).IsError()) {
++        return "The SpotPass module's save data couldn't be opened.";
++    }
++    std::string url;
++    {
++        std::scoped_lock lock(mutex);
++        const auto task = task_id_list.find(task_id);
++        if (task == task_id_list.end()) {
++            return fmt::format("Task '{}' isn't registered for {:016X}.", task_id, program_id);
++        }
++        url = PropertyString(task->second.properties[PropertyID::Url]);
++    }
++    if (url.empty()) {
++        return fmt::format("Task '{}' has no address to download.", task_id);
++    }
++    if (HTTP::IsSpotPassUploadUrl(url)) {
++        return fmt::format("Task '{}' sends data ({}); only downloads can run here.", task_id, url);
++    }
++    if (!storage) {
++        return fmt::format("{:016X} hasn't set up its SpotPass storage yet; start the game once.",
++                           program_id);
++    }
++
++    LOG_INFO(Service_BOSS, "SpotPass Tasks: running '{}' of {:016X} now: {}", task_id, program_id,
++             url);
++    const std::atomic<bool> cancel{false};
++    const TaskDownload download = DownloadTaskFile(url, {}, cancel);
++    if (download.status != 200) {
++        return fmt::format("{}: {}", url,
++                           download.status != 0 ? fmt::format("HTTP {}", download.status)
++                                                : download.error);
++    }
++    if (!HW::AES::IsNormalKeyAvailable(HW::AES::BOSSDataKey)) {
++        return "The SpotPass key (slot 0x38) is missing.";
++    }
++    const auto payloads =
++        DecodeBossContainer(download.body, HW::AES::GetNormalKey(HW::AES::BOSSDataKey));
++    if (!payloads) {
++        return fmt::format("{}: {} bytes, but not SpotPass data.", url, download.body.size());
++    }
++    const auto written = StoreNsData(*payloads);
++    if (!written) {
++        return "The game's SpotPass storage couldn't be opened.";
++    }
++    LOG_INFO(Service_BOSS, "SpotPass Tasks: '{}' of {:016X}: {} file(s), {} new or updated",
++             task_id, program_id, payloads->size(), written->size());
++    return fmt::format("Downloaded {} bytes: {} SpotPass file(s), {} new or updated. The game "
++                       "reads them the next time it looks at its SpotPass data.",
++                       download.body.size(), payloads->size(), written->size());
++}
++
+ void OnlineService::RunTask(const std::string& task_id, std::string url, std::string last_modified,
+                             std::shared_ptr<SpotPassState> state) {
+     const TaskDownload download = DownloadTaskFile(url, last_modified, state->cancel);
+diff --git a/src/core/hle/service/boss/online_service.h b/src/core/hle/service/boss/online_service.h
+index 3e443b1..faddf63 100644
+--- a/src/core/hle/service/boss/online_service.h
++++ b/src/core/hle/service/boss/online_service.h
+@@ -217,6 +217,22 @@ struct BossTaskProperties {
+     friend class boost::serialization::access;
+ };
+ 
++/// One SpotPass task as the SpotPass module keeps it (BOSS_SV.db / BOSS_SS.db), for Tools >
++/// SpotPass Tasks. Offsets in a BOSS_SV.db record (0xC00 bytes), read from a real console's save
++/// (7 Nov 2026): 0x10 program ID, 0x18 task ID, 0x28 interval in seconds, 0x2C runs left,
++/// 0x30 last run (seconds since 1 Jan 2000, console time), 0x40 state (6 done, 7 failed),
++/// 0x48 HTTP status of the last run. BOSS_SS.db 0x21C: the task's address.
++struct SpotPassTaskSummary {
++    u64 program_id = 0;
++    std::string task_id;
++    std::string url;
++    u32 interval = 0;
++    u32 runs_left = 0;
++    u32 last_run = 0;
++    u8 state = 0;
++    u32 http_status = 0;
++};
++
+ class OnlineService final : public std::enable_shared_from_this<OnlineService> {
+ public:
+     explicit OnlineService(u64 program_id_, u64 extdata_id_);
+@@ -276,6 +292,16 @@ public:
+      */
+     std::optional<std::vector<u32>> StoreNsData(const std::vector<BossPayload>& payloads);
+ 
++    /// Every task the SpotPass module has registered, for all titles (Tools > SpotPass Tasks).
++    static std::vector<SpotPassTaskSummary> ListAllTasks();
++    /**
++     * Tools > SpotPass Tasks > Run Now: downloads the task's file now with Tangelo's own
++     * downloader (the custom SpotPass server applies) and stores its contents in the title's
++     * SpotPass storage, as the SpotPass module does after a run. Blocks until done; returns
++     * what happened, for the window.
++     */
++    std::string RunTaskNow(const std::string& task_id);
++
+ private:
+     void RunTask(const std::string& task_id, std::string url, std::string last_modified,
+                  std::shared_ptr<SpotPassState> state);
+-- 
+2.43.0
+
